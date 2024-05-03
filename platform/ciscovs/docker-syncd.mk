@@ -1,0 +1,41 @@
+# docker image for syncd
+
+DOCKER_SYNCD = docker-syncd-ciscovs.gz
+DOCKER_SYNCD_DBG = docker-syncd-ciscovs-$(DBG_IMAGE_MARK).gz
+$(DOCKER_SYNCD)_PATH = $(PLATFORM_PATH)/docker-syncd-ciscovs
+$(DOCKER_SYNCD)_FILES += $(SUPERVISOR_PROC_EXIT_LISTENER_SCRIPT)
+$(DOCKER_SYNCD)_LOAD_DOCKERS += $(DOCKER_CONFIG_ENGINE_BULLSEYE)
+$(DOCKER_SYNCD)_DBG_DEPENDS += $($(DOCKER_CONFIG_ENGINE_BULLSEYE)_DBG_DEPENDS)
+$(DOCKER_SYNCD)_DBG_IMAGE_PACKAGES += $($(DOCKER_CONFIG_ENGINE_BULLSEYE)_DBG_IMAGE_PACKAGES)
+
+SONIC_DOCKER_IMAGES += $(DOCKER_SYNCD)
+SONIC_BULLSEYE_DOCKERS += $(DOCKER_SYNCD)
+ifneq ($(ENABLE_SYNCD_RPC),y)
+SONIC_INSTALL_DOCKER_IMAGES += $(DOCKER_SYNCD)
+endif
+
+SONIC_DOCKER_DBG_IMAGES += $(DOCKER_SYNCD_DBG)
+SONIC_BULLSEYE_DBG_DOCKERS += $(DOCKER_SYNCD_DBG)
+ifneq ($(ENABLE_SYNCD_RPC),y)
+SONIC_INSTALL_DOCKER_DBG_IMAGES += $(DOCKER_SYNCD_DBG)
+endif
+
+$(DOCKER_SYNCD)_PYTHON_WHEELS += $(SONIC_PLATFORM_PY3)
+$(DOCKER_SYNCD)_DEPENDS += $(SYNCD)
+$(DOCKER_SYNCD)_DBG_DEPENDS += \
+    $(SYNCD_DBG) \
+    $(LIBSWSSCOMMON_DBG) \
+    $(LIBSAIMETADATA_DBG) \
+    $(LIBSAIREDIS_DBG)
+
+$(DOCKER_SYNCD)_CONTAINER_NAME = syncd
+$(DOCKER_SYNCD)_RUN_OPT += --privileged -t
+$(DOCKER_SYNCD)_RUN_OPT += -v /host/machine.conf:/etc/machine.conf
+$(DOCKER_SYNCD)_RUN_OPT += -v /var/run/docker-syncd:/var/run/sswsyncd
+$(DOCKER_SYNCD)_RUN_OPT += -v /etc/sonic:/etc/sonic:ro
+$(DOCKER_SYNCD)_RUN_OPT += -v /host/warmboot:/var/warmboot
+$(DOCKER_SYNCD)_RUN_OPT += -v /var/cache/cisco:/var/cache/cisco
+$(DOCKER_SYNCD)_RUN_OPT += -v /var/run/config_gen:/var/run/config_gen
+$(DOCKER_SYNCD)_RUN_OPT += -e LD_LIBRARY_PATH=/usr/lib/:/usr/lib/cisco/
+
+$(DOCKER_SYNCD)_BASE_IMAGE_FILES += ciscosh:/usr/bin/ciscosh

@@ -237,6 +237,14 @@ RUN apt-get update && apt-get install -y eatmydata && eatmydata apt-get install 
         libpcap-dev \
         dnsutils \
         libusb-dev \
+# For cisco sdk 24.x grpc based cli server build
+{%- if ASIC_MODEL is defined and (ASIC_MODEL == "q200" or ASIC_MODEL == "g200") %}
+        libgrpc10 \
+        libgrpc++-dev \
+        libgrpc++1 \
+        libgrpc-dev \
+        protobuf-compiler-grpc \
+{%- endif %}        
 # For cisco sdk build
         libgrpc++1 \
         libabsl-dev \

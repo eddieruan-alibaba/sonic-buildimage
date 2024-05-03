@@ -1,0 +1,28 @@
+{
+    "board-type": "gr2",
+    "description": "",
+    "cli-server": {
+        "enable": "shell-enable-sai-attr",
+        "address": "/var/run/sdk-cli.sock"
+    },
+    "python-shell-server": {
+        "enable": false
+    },
+    "devices": [
+        {
+            "id": 1,
+            "type": "gr2",
+            "rev": 1,
+            "ports": [
+                {"port-id":246,"port-speed":"100:GIGA","slice":2,"ifg":1,"pif":[16,19]},
+                {"port-id":238,"port-speed":"100:GIGA","slice":2,"ifg":1,"pif":[8,11]},
+                {"port-id":138,"port-speed":"100:GIGA","slice":1,"ifg":1,"pif":[8,11]},
+                {"port-id":108,"port-speed":"100:GIGA","slice":1,"ifg":0,"pif":[8,11]},
+                {"port-id":242,"port-speed":"100:GIGA","slice":2,"ifg":1,"pif":[12,15]},
+                {"port-id":8,  "port-speed":"100:GIGA","slice":0,"ifg":0,"pif":[8,11]}
+            ],
+            "ifg_swap_lists":
+            [ ]
+        }
+    ]
+}

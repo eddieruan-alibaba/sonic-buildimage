@@ -1,0 +1,63 @@
+FROM docker-config-engine-bullseye
+
+ARG docker_container_name
+RUN [ -f /etc/rsyslog.conf ] && sed -ri "s/%syslogtag%/$docker_container_name#%syslogtag%/;" /etc/rsyslog.conf
+
+## Make apt-get non-interactive
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update
+
+# Required for NSIM
+ENV SDK_DEVICE_NAME=/dev/testdev0/socket/127.0.0.1:37561
+ENV PYTHONPATH=/usr/lib/cisco/pylib
+ENV LD_LIBRARY_PATH=/usr/lib/cisco/pylib:/usr/lib/cisco
+ENV BASE_OUTPUT_DIR=/opt/cisco/silicon-one/
+ENV RES_OUTPUT_DIR=/opt/cisco/silicon-one/res/
+
+COPY \
+{% for deb in docker_syncd_ciscovs_debs.split(' ') -%}
+debs/{{ deb }}{{' '}}
+{%- endfor -%}
+debs/
+
+RUN dpkg -i \
+{% for deb in docker_syncd_ciscovs_debs.split(' ') -%}
+debs/{{ deb }}{{' '}}
+{%- endfor %}
+
+## TODO: add kmod into Depends
+RUN apt-get install -yf kmod
+
+COPY ["start.sh", "/usr/bin/"]
+COPY ["supervisord.conf", "/etc/supervisor/conf.d/"]
+COPY ["files/supervisor-proc-exit-listener", "/usr/bin"]
+COPY ["critical_processes", "/etc/supervisor/"]
+
+COPY ["scripts", "/etc/scripts/"]
+
+RUN  apt-get install -y     \
+        gdb                 \
+        python3             \
+        python3-pip         \
+        python3-yaml        \
+        scapy               \
+        python3-pytest      \
+        libgtk-3-dev        \
+        pkg-config          \
+        libprotobuf23       \
+        libgrpc++1          \
+        libgrpc10           \
+        libabsl20200923     \
+        libc-ares-dev       \
+        libc-ares2
+
+## For Cisco debug shell
+RUN pip3 install netaddr
+RUN pip3 install tabulate
+
+## Clean up
+RUN apt-get clean -y; apt-get autoclean -y; apt-get autoremove -y
+RUN rm -rf /debs
+
+ENTRYPOINT ["/usr/local/bin/supervisord"]
