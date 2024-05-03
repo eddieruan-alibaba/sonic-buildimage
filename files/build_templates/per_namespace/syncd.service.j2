@@ -10,6 +10,9 @@ After=topology.service
 {% if sonic_asic_platform == 'broadcom' %}
 Requires=opennsl-modules.service
 After=opennsl-modules.service
+{% elif sonic_asic_platform == 'cisco' %}
+Requires=cisco-gibraltar-kmod.service
+After=cisco-gibraltar-kmod.service
 {% elif sonic_asic_platform == 'nephos' %}
 Requires=nps-modules.service
 After=nps-modules.service
