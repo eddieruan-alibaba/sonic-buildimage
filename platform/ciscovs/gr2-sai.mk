@@ -1,0 +1,33 @@
+ifeq ($(ASIC_MODEL), g200)
+# SAI deb packet for G200
+LEABA_SDK_DEBIAN = dcn/bullseye
+export CISCO_SILICON_ONE_VERSION = 1.67-3cb9dc65
+endif
+
+ARTIFACTORY ?= http://30.57.186.117/libsai/
+CISCO_URL := ${ARTIFACTORY}/cisco
+CISCO_PLATFORM_GR2 = gr2
+
+GR2_SAI = cisco-$(CISCO_PLATFORM_GR2)_$(CISCO_SILICON_ONE_VERSION)_amd64.deb
+$(GR2_SAI)_PLATFORM = $(CISCO_PLATFORM_GR2)
+$(GR2_SAI)_URL = $(CISCO_URL)/$(LEABA_SDK_DEBIAN)/$(GR2_SAI)
+
+GR2_SAI_DEV = cisco-$(CISCO_PLATFORM_GR2)-dev_$(CISCO_SILICON_ONE_VERSION)_amd64.deb
+$(eval $(call add_derived_package,$(GR2_SAI),$(GR2_SAI_DEV)))
+$(GR2_SAI_DEV)_URL = $(CISCO_URL)/$(LEABA_SDK_DEBIAN)/$(GR2_SAI_DEV)
+
+export LEABA_SDK_KMOD_SRC = cisco-$(CISCO_PLATFORM_GR2)-kmod-src_$(CISCO_SILICON_ONE_VERSION)_amd64.deb
+$(eval $(call add_derived_package,$(LEABA_SDK_KMOD_SRC)))
+$(LEABA_SDK_KMOD_SRC)_URL = $(CISCO_URL)/$(LEABA_SDK_DEBIAN)/$(LEABA_SDK_KMOD_SRC)
+SONIC_ONLINE_DEBS += $(LEABA_SDK_KMOD_SRC)
+
+
+# DSIM for simulator platform
+ifeq ($(ASIC_MODEL), g200)
+GR2_DSIM = cisco-$(CISCO_PLATFORM_GR2)-dsim_$(CISCO_SILICON_ONE_VERSION)_amd64.deb
+$(eval $(call add_derived_package,$(GR2_DSIM)))
+$(GR2_DSIM)_URL = $(CISCO_URL)/$(LEABA_SDK_DEBIAN)/$(GR2_DSIM)
+SONIC_ONLINE_DEBS += $(GR2_DSIM)
+endif
+
+SONIC_ONLINE_DEBS += $(GR2_SAI)

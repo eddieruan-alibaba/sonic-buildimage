@@ -1,0 +1,317 @@
+{
+    "board-type": "AS71",
+    "description": "AS71 board with Silicon One Q200",
+    "board-rev": "P0",
+    "devices": [
+         {
+           "id": 0,
+           "type": "gibraltar",
+           "rev": 1,
+           "device_property" : {
+               "enable_ingress_l2_port_counters": false,
+               "enable_ingress_tunnel_counters": false,
+               "enable_ingress_2_acl_counters": true,
+               "enable_acl_sip_dip_compression": true,
+               "enable_overlay_lb": true,
+               "internal_mpls_label_range_lower": 16,
+               "internal_mpls_label_range_upper": 32768
+           },
+           "push_port_qos_to_switch": true,
+           "ifg_swap_lists": [
+                  {"slice":0,"ifg":0,
+                   "swap":[0, 1, 3, 2, 4, 5, 6, 7, 9, 8, 10, 11, 12, 13, 15, 14, 16, 17, 18, 19, 21, 20, 22, 23],
+                   "serdes_polarity_inverse_rx":[0, 4, 7, 8, 9, 10, 14, 15, 16, 19, 21, 23],
+                   "serdes_polarity_inverse_tx":[1, 4, 6, 7, 8, 15, 16, 18, 19, 21]},
+                  {"slice":0,"ifg":1,
+                   "swap":[2, 3, 1, 0, 7, 6, 5, 4, 10, 11, 9, 8, 12, 13, 14, 15, 18, 19, 17, 16, 23, 22, 20, 21],
+                   "serdes_polarity_inverse_rx":[6, 8, 10, 12, 13, 16, 17, 18, 19, 20, 21, 23],
+                   "serdes_polarity_inverse_tx":[0, 2, 3, 4, 5, 6, 7, 8, 9, 11, 15, 17, 20, 22, 23]},
+                  {"slice":1,"ifg":0,
+                   "swap":[3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12, 18, 19, 17, 16, 23, 22, 20, 21],
+                   "serdes_polarity_inverse_rx":[1, 2, 3, 4, 5, 8, 9, 11, 14, 15, 16, 22, 23],
+                   "serdes_polarity_inverse_tx":[0, 1, 3, 4, 6, 8, 15, 17, 18, 20, 21, 22]},
+                  {"slice":1,"ifg":1,
+                   "swap":[1, 0, 3, 2, 4, 5, 7, 6, 11, 10, 8, 9, 13, 12, 15, 14],
+                   "serdes_polarity_inverse_rx":[2, 3, 4, 10, 14],
+                   "serdes_polarity_inverse_tx":[1, 2, 3, 4, 6, 7, 9, 15]},
+                  {"slice":2,"ifg":0,
+                   "swap":[0, 1, 2, 3, 4, 5, 6, 7, 9, 8, 10, 11, 15, 14, 12, 13],
+                   "serdes_polarity_inverse_rx":[2, 3, 4, 8, 10, 11, 12, 15],
+                   "serdes_polarity_inverse_tx":[0, 2, 3, 5, 9, 10, 11, 12]},
+                  {"slice":2,"ifg":1,
+                   "swap":[0, 1, 2, 3, 4, 5, 7, 6, 9, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+                   "serdes_polarity_inverse_rx":[0, 1, 3, 5, 6, 8, 9, 13, 14, 15, 16, 17, 19, 21, 22, 23],
+                   "serdes_polarity_inverse_tx":[2, 4, 5, 6, 10, 14, 15, 16, 17, 20, 21, 23]},
+                  {"slice":3,"ifg":0,
+                   "swap":[0, 1, 2, 3, 4, 5, 7, 6, 9, 8, 11, 10, 15, 14, 13, 12, 16, 17, 19, 18, 20, 21, 22, 23],
+                   "serdes_polarity_inverse_rx":[2, 3, 4, 6, 7, 9, 10, 11, 12, 13, 14, 16, 17, 20, 21, 22, 23],
+                   "serdes_polarity_inverse_tx":[1, 4, 6, 7, 10, 12, 13, 16, 18, 19, 20, 22, 23]},
+                  {"slice":3,"ifg":1,
+                   "swap":[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 10, 15, 14, 13, 12],
+                   "serdes_polarity_inverse_rx":[0, 1, 3, 4, 5, 6, 7, 10, 14, 15],
+                   "serdes_polarity_inverse_tx":[0, 1, 3, 7, 8, 9, 11, 12, 13, 14]},
+                  {"slice":4,"ifg":0,
+                   "swap":[1, 0, 3, 2, 4, 5, 7, 6, 11, 10, 8, 9, 13, 12, 15, 14],
+                   "serdes_polarity_inverse_rx":[2, 3, 4, 10, 11, 14],
+                   "serdes_polarity_inverse_tx":[1, 2, 3, 4, 6, 7, 9, 15]},
+                  {"slice":4,"ifg":1,
+                   "swap":[1, 0, 2, 3, 4, 5, 7, 6, 11, 10, 9, 8, 15, 14, 13, 12, 16, 17, 18, 19, 20, 21, 22, 23],
+                   "serdes_polarity_inverse_rx":[0, 1, 3, 4, 5, 6, 7, 10, 14, 15, 18],
+                   "serdes_polarity_inverse_tx":[0, 1, 3, 4, 6, 8, 15, 17, 18, 20, 21, 22]},
+                  {"slice":5,"ifg":0,
+                   "swap":[1, 0, 2, 3, 6, 7, 5, 4, 9, 8, 10, 11, 12, 13, 15, 14, 16, 17, 18, 19, 20, 21, 22, 23],
+                   "serdes_polarity_inverse_rx":[2, 3, 4, 6, 8, 9, 13, 14, 15, 18, 19, 20],
+                   "serdes_polarity_inverse_tx":[0, 5, 7, 8, 13, 14, 15, 16, 18, 19, 21]},
+                  {"slice":5,"ifg":1,
+                   "swap":[0, 1, 2, 3, 5, 4, 7, 6, 11, 10, 9, 8, 13, 12, 14, 15, 16, 17, 18, 19, 21, 20, 22, 23],
+                   "serdes_polarity_inverse_rx":[2, 3, 6, 7, 9, 17, 18, 20, 22],
+                   "serdes_polarity_inverse_tx":[0, 1, 3, 5, 8, 9, 10, 11, 12, 13, 15, 17, 20, 22, 23]}
+             ],
+           "port_mix":
+            {
+              "init_switch": "PORT_ONLY",
+              "ports": [
+                 {
+                    "pif": ["0xb08","0x900","0x700","0x510",
+                            "0x30c","0x116","0xa16","0x80c",
+                            "0x40e","0x616","0x210","0x008",
+                            "0xb00","0x90a","0x20a","0x000",
+                            "0xb0a","0x902","0x702","0x512",
+                            "0x30e","0x114","0xa14","0x80e",
+                            "0x40c","0x614","0x212","0x00a",
+                            "0xb02","0x908","0x208","0x002",
+                            "0xb0e","0x906","0x706","0x516",
+                            "0x308","0x110","0xa10","0x808",
+                            "0x408","0x610","0x216","0x00e",
+                            "0xa00","0x60c","0x50a","0x10e",
+                            "0xb0c","0x904","0x704","0x514",
+                            "0x30a","0x112","0xa12","0x80a",
+                            "0x40a","0x612","0x214","0x00c",
+                            "0xa02","0x60e","0x508","0x10c",
+                            "0xb12","0x914","0x70c","0x504",
+                            "0x302","0x102","0xa0a","0x802",
+                            "0x602","0x402","0x204","0x012",
+                            "0xb04","0x90c","0x20c","0x006",
+                            "0xb10","0x916","0x70e","0x506",
+                            "0x300","0x100","0xa08","0x800",
+                            "0x600","0x400","0x206","0x010",
+                            "0xb06","0x90e","0x20e","0x004",
+                            "0xb14","0x912","0x70a","0x502",
+                            "0x304","0x104","0xa0c","0x804",
+                            "0x604","0x404","0x202","0x014",
+                            "0xa06","0x60a","0x50c","0x10a",
+                            "0xb16","0x910","0x708","0x500",
+                            "0x306","0x106","0xa0e","0x806",
+                            "0x606","0x406","0x200","0x016",
+                            "0xa04","0x608","0x50e","0x108"],
+                  "Description": "Front panel pifs",
+                  "pif_counts": 2,
+                  "speed": 100000,
+                  "fec": "RS",
+                  "mtu_size": 9100,
+                  "media_type": "FIBER",
+                  "admin_state": false
+                 }
+                  ]
+            },
+           "serdes_params":
+           {
+              "VERSION": "Sample genaration.",
+              "default_pll": {
+              },
+              "0,0,50,FIBER": [
+                {
+                 "serdes":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23],
+                 "slice_id": 0,
+                 "ifg_id": 0,
+                 "speed": 50,
+                 "module_type": "FIBER",
+                 "TX_PRE1": -100,
+                 "TX_MAIN": 900,
+                 "TX_POST": 0,
+                 "RX_CTLE_CODE": 63,
+                 "RX_DSP_MODE": 7,
+                 "RX_AFE_TRIM": 2,
+                 "RX_AC_COUPLING_BYPASS": 0
+                }
+             ],
+             "0,1,50,FIBER": [
+                {
+                 "serdes":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23],
+                 "slice_id": 0,
+                 "ifg_id": 1,
+                 "speed": 50,
+                 "module_type": "FIBER",
+                 "TX_PRE1": -100,
+                 "TX_MAIN": 900,
+                 "TX_POST": 0,
+                 "RX_CTLE_CODE": 63,
+                 "RX_DSP_MODE": 7,
+                 "RX_AFE_TRIM": 2,
+                 "RX_AC_COUPLING_BYPASS": 0
+                }
+             ],
+             "1,0,50,FIBER": [
+                {
+                 "serdes":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23],
+                 "slice_id": 1,
+                 "ifg_id": 0,
+                 "speed": 50,
+                 "module_type": "FIBER",
+                 "TX_PRE1": -100,
+                 "TX_MAIN": 900,
+                 "TX_POST": 0,
+                 "RX_CTLE_CODE": 63,
+                 "RX_DSP_MODE": 7,
+                 "RX_AFE_TRIM": 2,
+                 "RX_AC_COUPLING_BYPASS": 0
+                }
+             ],
+             "1,1,50,FIBER": [
+                {
+                 "serdes":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],
+                 "slice_id": 1,
+                 "ifg_id": 1,
+                 "speed": 50,
+                 "module_type": "FIBER",
+                 "TX_PRE1": -100,
+                 "TX_MAIN": 900,
+                 "TX_POST": 0,
+                 "RX_CTLE_CODE": 63,
+                 "RX_DSP_MODE": 7,
+                 "RX_AFE_TRIM": 2,
+                 "RX_AC_COUPLING_BYPASS": 0
+                }
+             ],
+             "2,0,50,FIBER": [
+                {
+                 "serdes":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],
+                 "slice_id": 2,
+                 "ifg_id": 0,
+                 "speed": 50,
+                 "module_type": "FIBER",
+                 "TX_PRE1": -100,
+                 "TX_MAIN": 900,
+                 "TX_POST": 0,
+                 "RX_CTLE_CODE": 63,
+                 "RX_DSP_MODE": 7,
+                 "RX_AFE_TRIM": 2,
+                 "RX_AC_COUPLING_BYPASS": 0
+                }
+             ],
+             "2,1,50,FIBER": [
+                {
+                 "serdes":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23],
+                 "slice_id": 2,
+                 "ifg_id": 1,
+                 "speed": 50,
+                 "module_type": "FIBER",
+                 "TX_PRE1": -100,
+                 "TX_MAIN": 900,
+                 "TX_POST": 0,
+                 "RX_CTLE_CODE": 63,
+                 "RX_DSP_MODE": 7,
+                 "RX_AFE_TRIM": 2,
+                 "RX_AC_COUPLING_BYPASS": 0
+                }
+             ],
+             "3,0,50,FIBER": [
+                {
+                 "serdes":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23],
+                 "slice_id": 3,
+                 "ifg_id": 0,
+                 "speed": 50,
+                 "module_type": "FIBER",
+                 "TX_PRE1": -100,
+                 "TX_MAIN": 900,
+                 "TX_POST": 0,
+                 "RX_CTLE_CODE": 63,
+                 "RX_DSP_MODE": 7,
+                 "RX_AFE_TRIM": 2,
+                 "RX_AC_COUPLING_BYPASS": 0
+                }
+             ],
+             "3,1,50,FIBER": [
+                {
+                 "serdes":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],
+                 "slice_id": 3,
+                 "ifg_id": 1,
+                 "speed": 50,
+                 "module_type": "FIBER",
+                 "TX_PRE1": -100,
+                 "TX_MAIN": 900,
+                 "TX_POST": 0,
+                 "RX_CTLE_CODE": 63,
+                 "RX_DSP_MODE": 7,
+                 "RX_AFE_TRIM": 2,
+                 "RX_AC_COUPLING_BYPASS": 0
+                }
+             ],
+             "4,0,50,FIBER": [
+                {
+                 "serdes":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],
+                 "slice_id": 4,
+                 "ifg_id": 0,
+                 "speed": 50,
+                 "module_type": "FIBER",
+                 "TX_PRE1": -100,
+                 "TX_MAIN": 900,
+                 "TX_POST": 0,
+                 "RX_CTLE_CODE": 63,
+                 "RX_DSP_MODE": 7,
+                 "RX_AFE_TRIM": 2,
+                 "RX_AC_COUPLING_BYPASS": 0
+                }
+             ],
+             "4,1,50,FIBER": [
+                {
+                 "serdes":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23],
+                 "slice_id": 4,
+                 "ifg_id": 1,
+                 "speed": 50,
+                 "module_type": "FIBER",
+                 "TX_PRE1": -100,
+                 "TX_MAIN": 900,
+                 "TX_POST": 0,
+                 "RX_CTLE_CODE": 63,
+                 "RX_DSP_MODE": 7,
+                 "RX_AFE_TRIM": 2,
+                 "RX_AC_COUPLING_BYPASS": 0
+                }
+             ],
+             "5,0,50,FIBER": [
+                {
+                 "serdes":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23],
+                 "slice_id": 5,
+                 "ifg_id": 0,
+                 "speed": 50,
+                 "module_type": "FIBER",
+                 "TX_PRE1": -100,
+                 "TX_MAIN": 900,
+                 "TX_POST": 0,
+                 "RX_CTLE_CODE": 63,
+                 "RX_DSP_MODE": 7,
+                 "RX_AFE_TRIM": 2,
+                 "RX_AC_COUPLING_BYPASS": 0
+                }
+             ],
+             "5,1,50,FIBER": [
+                {
+                 "serdes":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23],
+                 "slice_id": 5,
+                 "ifg_id": 1,
+                 "speed": 50,
+                 "module_type": "FIBER",
+                 "TX_PRE1": -100,
+                 "TX_MAIN": 900,
+                 "TX_POST": 0,
+                 "RX_CTLE_CODE": 63,
+                 "RX_DSP_MODE": 7,
+                 "RX_AFE_TRIM": 2,
+                 "RX_AC_COUPLING_BYPASS": 0
+                }
+             ]
+           }
+     }
+   ]
+}
