@@ -1,0 +1,31 @@
+#!/bin/bash
+
+if ! pgrep -x syncd > /dev/null; then
+   echo "Error: syncd process is not running."
+   exit 1
+fi
+
+if ! docker exec syncd netstat -lp | grep -q sdk-cli.sock; then
+    docker exec -i swss bash -c 'f=$(mktemp); cat > $f; swssconfig $f; rm $f' <<EOF
+[
+    {
+        "SWITCH_TABLE:switch": {
+           "debug_shell_enable": "1"
+        },
+        "OP": "SET"
+    }
+]
+EOF
+
+for i in 1 2 3; do
+    if docker exec syncd netstat -lp | grep -q sdk-cli.sock; then break; fi
+    if [ $i == 3 ]; then
+        echo "Error: The SDK CLI is not availiable."
+        exit 1
+    fi
+    sleep 1
+done
+
+fi
+
+docker exec -it syncd /usr/bin/app_cli_client -p /opt/cisco/silicon-one/cli/res "$@"
