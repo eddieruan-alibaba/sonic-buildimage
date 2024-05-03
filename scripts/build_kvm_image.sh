@@ -109,7 +109,7 @@ wait_kvm_ready
 
 echo "to kill kvm:  sudo kill $kvm_pid"
 
-./install_sonic.py
+./install_sonic.py -m $ASIC_MODEL
 
 kill $kvm_pid
 
