@@ -80,6 +80,7 @@ export BUILD_TIMESTAMP
 export SONIC_IMAGE_VERSION
 export CONFIGURED_PLATFORM
 export CONFIGURED_ARCH
+export ASIC_MODEL
 export TARGET_BOOTLOADER
 export PYTHON_WHEELS_PATH
 export IMAGE_DISTRO
@@ -404,6 +405,7 @@ $(info "ENABLE_PFCWD_ON_START"           : "$(ENABLE_PFCWD_ON_START)")
 $(info "SONIC_BUFFER_MODEL"              : "$(SONIC_BUFFER_MODEL)")
 $(info "INSTALL_DEBUG_TOOLS"             : "$(INSTALL_DEBUG_TOOLS)")
 $(info "ROUTING_STACK"                   : "$(SONIC_ROUTING_STACK)")
+$(info "ASIC_MODEL"                      : "$(ASIC_MODEL)")
 ifeq ($(SONIC_ROUTING_STACK),frr)
 $(info "FRR_USER_UID"                    : "$(FRR_USER_UID)")
 $(info "FRR_USER_GID"                    : "$(FRR_USER_GID)")
@@ -1461,6 +1463,7 @@ $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : $(TARGET_PATH)/% : \
 				$(addsuffix |$($(package)_DEFAULT_FEATURE_OWNER),\
 				$(addsuffix |$(addprefix $(TARGET_PATH)/, $(package)), $(package)))))"
 	export sonic_py_common_py2_wheel_path="$(addprefix $(PYTHON_WHEELS_PATH)/,$(SONIC_PY_COMMON_PY2))"
+	export asic_model="$(ASIC_MODEL)"
 	export sonic_py_common_py3_wheel_path="$(addprefix $(PYTHON_WHEELS_PATH)/,$(SONIC_PY_COMMON_PY3))"
 	export config_engine_py2_wheel_path="$(addprefix $(PYTHON_WHEELS_PATH)/,$(SONIC_CONFIG_ENGINE_PY2))"
 	export config_engine_py3_wheel_path="$(addprefix $(PYTHON_WHEELS_PATH)/,$(SONIC_CONFIG_ENGINE_PY3))"

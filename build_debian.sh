@@ -649,6 +649,7 @@ fi
 export build_version="${SONIC_IMAGE_VERSION}"
 export debian_version="$(cat $FILESYSTEM_ROOT/etc/debian_version)"
 export kernel_version="${kversion}"
+export asic_model="${ASIC_MODEL}"
 export asic_type="${sonic_asic_platform}"
 export asic_subtype="${TARGET_MACHINE}"
 export commit_id="$(git rev-parse --short HEAD)"

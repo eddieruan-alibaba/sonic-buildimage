@@ -550,6 +550,7 @@ SONIC_BUILD_INSTRUCTION :=  $(MAKE) \
                            DOCKER_USERNAME=$(DOCKER_USERNAME) \
                            DOCKER_USERTAG=$(DOCKER_USERTAG) \
                            DOCKER_LOCKDIR=$(DOCKER_LOCKDIR) \
+                           ASIC_MODEL=$(ASIC_MODEL) \						   
                            DOCKER_LOCKFILE_SAVE=$(DOCKER_LOCKFILE_SAVE) \
                            SONIC_CONFIG_USE_NATIVE_DOCKERD_FOR_BUILD=$(SONIC_CONFIG_USE_NATIVE_DOCKERD_FOR_BUILD) \
                            SONIC_INCLUDE_SYSTEM_TELEMETRY=$(INCLUDE_SYSTEM_TELEMETRY) \
