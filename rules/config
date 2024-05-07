@@ -145,7 +145,7 @@ ENABLE_HOST_SERVICE_ON_START = n
 INCLUDE_RESTAPI = n
 
 # INCLUDE_NAT - build docker-nat for nat support
-INCLUDE_NAT = y
+INCLUDE_NAT = n
 
 # INCLUDE_DHCP_RELAY - build and install dhcp-relay package
 INCLUDE_DHCP_RELAY = y
