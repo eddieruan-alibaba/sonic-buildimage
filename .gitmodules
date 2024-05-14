@@ -9,7 +9,7 @@
 [submodule "sonic-sairedis"]
 	path = src/sonic-sairedis
 	url = https://github.com/sonic-net/sonic-sairedis
-    branch = 202205
+    branch = eruan-2205
 [submodule "sonic-swss"]
 	path = src/sonic-swss
 	url = https://github.com/sonic-net/sonic-swss
