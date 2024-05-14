@@ -13,6 +13,16 @@ if [ "$MAC_ADDRESS" == "None" ] || [ -z "$MAC_ADDRESS" ]; then
     logger "Mac address not found in Device Metadata, Falling back to eth0"
 fi
 
+LAG_MAC=$(sonic-cfggen -d -v 'DEVICE_METADATA["localhost"]["lag_mac"]')
+if [ "$LAG_MAC" == "" -o "$LAG_MAC" == "None" ]; then
+    LAG_MAC=$MAC_ADDRESS
+fi
+
+VLAN_MAC=$(sonic-cfggen -d -v 'DEVICE_METADATA["localhost"]["vlan_mac"]')
+if [ "$VLAN_MAC" == "" -o "$VLAN_MAC" == "None" ]; then
+    VLAN_MAC=$MAC_ADDRESS
+fi
+
 # Create a folder for SwSS record files
 mkdir -p /var/log/swss
 ORCHAGENT_ARGS="-d /var/log/swss "
@@ -64,6 +74,11 @@ elif [ "$platform" == "mellanox" ]; then
     ORCHAGENT_ARGS+=""
 elif [ "$platform" == "innovium" ]; then
     ORCHAGENT_ARGS+="-m $MAC_ADDRESS"
+elif [ "$platform" == "ciscovs" ]; then
+     sonic-cfggen -a '{"DEVICE_METADATA":{"localhost": {"asic": "cisco"}}}'  -w
+     # Set timeout value to be 1000 sec, as ciscovs sometimes takes 12 min to come up.
+     # Give enough buffer zone now
+     ORCHAGENT_ARGS+="-m $MAC_ADDRESS -l $LAG_MAC -v $VLAN_MAC -t 1000" # set long response time
 else
     # Should we use the fallback MAC in case it is not found in Device.Metadata
     ORCHAGENT_ARGS+="-m $MAC_ADDRESS"

@@ -163,6 +163,13 @@ sudo cp {{sonic_yang_mgmt_py3_wheel_path}} $FILESYSTEM_ROOT/$SONIC_YANG_MGMT_PY3
 sudo https_proxy=$https_proxy LANG=C chroot $FILESYSTEM_ROOT pip3 install $SONIC_YANG_MGMT_PY3_WHEEL_NAME
 sudo rm -rf $FILESYSTEM_ROOT/$SONIC_YANG_MGMT_PY3_WHEEL_NAME
 
+{% if sonic_asic_platform == "ciscovs" %}
+# Install sonic_platform Python 3 package
+sudo cp $PYTHON_WHEELS_PATH/$SONIC_PLATFORM_PY3 $FILESYSTEM_ROOT/
+sudo https_proxy=$https_proxy LANG=C chroot $FILESYSTEM_ROOT pip3 install $SONIC_PLATFORM_PY3
+sudo rm -rf $FILESYSTEM_ROOT/$SONIC_PLATFORM_PY3
+{% endif %}
+
 # For sonic-config-engine Python 3 package
 # Install pyangbind here, outside sonic-config-engine dependencies, as pyangbind causes enum34 to be installed.
 # Then immediately uninstall enum34, as enum34 should not be installed for Python >= 3.4, as it causes a

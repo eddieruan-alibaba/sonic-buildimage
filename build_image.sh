@@ -66,6 +66,12 @@ generate_kvm_image()
     echo "The compressed kvm image is in $KVM_IMAGE_DISK.gz"
 }
 
+if [[ -n "$bfn_model" ]] || [[ x$sonic_asic_platform == x"vs" ]] || [[ x$sonic_asic_platform == x"ciscovs" ]]
+then
+    ONIE_IMAGE_PART_SIZE=32768
+    VAR_LOG_FILE_SIZE=4096
+fi
+
 generate_onie_installer_image()
 {
     output_file=$OUTPUT_ONIE_IMAGE
