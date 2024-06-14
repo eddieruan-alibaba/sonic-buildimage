@@ -121,7 +121,9 @@ def read_server_state():
 def docker_action(action, feature, **kwargs):
     """ Execute docker action """
     try:
+        syslog.syslog(syslog.LOG_INFO, "DEBUGME1: docker cmd: {} for {}".format(action, feature))
         client = docker.from_env()
+        syslog.syslog(syslog.LOG_INFO, "DEBUGME2: docker cmd: {} for {}".format(action, feature))
         container = client.containers.get(feature)
         getattr(container, action)(**kwargs)
         syslog.syslog(syslog.LOG_INFO, "docker cmd: {} for {}".format(action, feature))
