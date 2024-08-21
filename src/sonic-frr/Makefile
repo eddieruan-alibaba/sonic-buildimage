@@ -10,11 +10,11 @@ STG_BRANCH = stg_temp.$(SUFFIX)
 $(addprefix $(DEST)/, $(MAIN_TARGET)): $(DEST)/% :
 	# Build the package
 	pushd ./frr
-	git checkout -b $(FRR_BRANCH) origin/$(FRR_BRANCH) || git checkout $(FRR_BRANCH)
+#	git checkout -b $(FRR_BRANCH) origin/$(FRR_BRANCH) || git checkout $(FRR_BRANCH)
 ifeq ($(CROSS_BUILD_ENVIRON), y)
 	git reset --hard
 endif
-	stg branch --create $(STG_BRANCH) $(FRR_TAG)
+#	stg branch --create $(STG_BRANCH) $(FRR_TAG)
 	stg import -s ../patch/series
 	gbp dch --ignore-branch --new-version=$(FRR_VERSION)-sonic-$(FRR_SUBVERSION) --dch-opt="--force-bad-version" --commit --git-author
 
@@ -31,8 +31,8 @@ endif
 ifeq ($(CROSS_BUILD_ENVIRON), y)
 	git reset --hard
 endif
-	git checkout master
-	git branch -D $(FRR_BRANCH)
+#	git checkout master
+#	git branch -D $(FRR_BRANCH)
 	popd
 	mv $(DERIVED_TARGET) $* $(DEST)/
 

@@ -1,7 +1,7 @@
 [submodule "sonic-swss-common"]
 	path = src/sonic-swss-common
 	url = https://github.com/sonic-net/sonic-swss-common
-	branch = 202311
+	branch = project-phoenixwing
 [submodule "sonic-linux-kernel"]
 	path = src/sonic-linux-kernel
 	url = https://github.com/sonic-net/sonic-linux-kernel
@@ -9,11 +9,11 @@
 [submodule "sonic-sairedis"]
 	path = src/sonic-sairedis
 	url = https://github.com/sonic-net/sonic-sairedis
-	branch = 202311
+	branch = project-phoenixwing
 [submodule "sonic-swss"]
 	path = src/sonic-swss
 	url = https://github.com/sonic-net/sonic-swss
-	branch = 202311
+	branch = project-phoenixwing
 [submodule "src/p4c-bm/p4c-bm"]
 	path = platform/p4/p4c-bm/p4c-bm
 	url = https://github.com/krambn/p4c-bm
@@ -56,7 +56,7 @@
 [submodule "src/sonic-frr/frr"]
 	path = src/sonic-frr/frr
 	url = https://github.com/sonic-net/sonic-frr.git
-	branch = frr/8.5
+	branch = project-phoenixwing
 [submodule "platform/p4/p4-hlir/p4-hlir-v1.1"]
 	path = platform/p4/p4-hlir/p4-hlir-v1.1
 	url = https://github.com/p4lang/p4-hlir.git
