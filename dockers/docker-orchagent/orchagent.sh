@@ -69,9 +69,6 @@ else
     ORCHAGENT_ARGS+="-m $MAC_ADDRESS"
 fi
 
-# Enable Ring Buffer
-ORCHAGENT_ARGS+=" -R"
-
 # Enable ZMQ for SmartSwitch
 LOCALHOST_SUBTYPE=`sonic-db-cli CONFIG_DB hget localhost "subtype"`
 if [[ x"${LOCALHOST_SUBTYPE}" == x"SmartSwitch" ]]; then
