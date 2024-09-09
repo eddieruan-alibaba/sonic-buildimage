@@ -1506,7 +1506,7 @@ static ssize_t netlink_srv6_msg_encode(int cmd,
 				cmd, ctx, data, datalen, fpm, force_nhg))
 			return 0;
 	} else if (!sid_zero(&nexthop->nh_srv6->seg6_segs)) {
-		if(fnc->use_nhg){
+		if(force_nhg){
 			if (!netlink_vpn_route_msg_encode(
 				cmd, ctx, data, datalen, fpm, force_nhg))
 			    return 0;
