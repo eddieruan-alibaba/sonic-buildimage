@@ -30,6 +30,8 @@ dependent_startup=true
 
 {% if INSTANCES %}
 {%     for redis_inst, redis_items in INSTANCES.items() %}
+
+
 [program:{{ redis_inst }}]
 {% if redis_items['hostname'] != '127.0.0.1' and redis_inst != 'redis_chassis' %}
 {%- set LOOPBACK_IP = '127.0.0.1' -%}

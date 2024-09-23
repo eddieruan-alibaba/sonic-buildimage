@@ -33,10 +33,27 @@ REDIS_DIR=/var/run/redis$NAMESPACE_ID
 mkdir -p $REDIS_DIR/sonic-db
 mkdir -p /etc/supervisor/conf.d/
 
+multidb_hwsku_check() {
+    local hwsku=$1
+    local hwsku_enable_list="Force10-S6000 cisco-8101-p4-32x100-vs"
+
+    if echo "$hwsku_enable_list" | grep -qw "$hwsku"; then
+        return 0 
+    else
+        return 1 
+    fi
+}
+
+[ -f /usr/share/sonic/platform/default_sku ] && HWSKU=$(head -1 /usr/share/sonic/platform/default_sku | awk '{print $1}')
+
 if [ -f /etc/sonic/database_config$NAMESPACE_ID.json ]; then
     cp /etc/sonic/database_config$NAMESPACE_ID.json $REDIS_DIR/sonic-db/database_config.json
 else
-    HOST_IP=$host_ip REDIS_PORT=$redis_port DATABASE_TYPE=$DATABASE_TYPE j2 /usr/share/sonic/templates/database_config.json.j2 > $REDIS_DIR/sonic-db/database_config.json
+    if multidb_hwsku_check "$HWSKU"; then
+        HOST_IP=$host_ip REDIS_PORT=$redis_port DATABASE_TYPE=$DATABASE_TYPE j2 /usr/share/sonic/templates/multi_database_config.json.j2 > $REDIS_DIR/sonic-db/database_config.json
+    else
+        HOST_IP=$host_ip REDIS_PORT=$redis_port DATABASE_TYPE=$DATABASE_TYPE j2 /usr/share/sonic/templates/database_config.json.j2 > $REDIS_DIR/sonic-db/database_config.json
+    fi
 fi
 
 # on VoQ system, we only publish redis_chassis instance and CHASSIS_APP_DB when
@@ -107,6 +124,7 @@ do
     else
         echo -n > /var/lib/$inst/dump.rdb
     fi
+    chown -R redis:redis /var/lib/$inst
 done
 
 TZ=$(cat /etc/timezone)
