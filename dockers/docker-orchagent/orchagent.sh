@@ -75,4 +75,6 @@ if [[ x"${LOCALHOST_SUBTYPE}" == x"SmartSwitch" ]]; then
     ORCHAGENT_ARGS+=" -q tcp://127.0.0.1:8100"
 fi
 
+ORCHAGENT_ARGS+=" -R"
+
 exec /usr/bin/orchagent ${ORCHAGENT_ARGS}
