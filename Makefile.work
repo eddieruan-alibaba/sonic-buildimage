@@ -63,7 +63,10 @@
 #  *             value to anything will enable it
 #  *             Default: unset
 #  *             Value: y
-#
+#  * ENABLE_MULTIDB: Enable multiple redis database instances.
+#  *                 Default: unset
+#  *                 Values: y
+
 ###############################################################################
 
 SHELL = /bin/bash
@@ -586,7 +589,8 @@ SONIC_BUILD_INSTRUCTION :=  $(MAKE) \
                            SONIC_OS_VERSION=$(SONIC_OS_VERSION) \
                            PIP_HTTP_TIMEOUT=$(PIP_HTTP_TIMEOUT) \
                            LEGACY_SONIC_MGMT_DOCKER=$(LEGACY_SONIC_MGMT_DOCKER) \
-                           $(SONIC_OVERRIDE_BUILD_VARS)
+                           ENABLE_MULTIDB=$(ENABLE_MULTIDB) \
+						   $(SONIC_OVERRIDE_BUILD_VARS)
 
 .PHONY: sonic-slave-build sonic-slave-bash init reset
 

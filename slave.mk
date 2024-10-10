@@ -455,6 +455,7 @@ endif
 $(info "CROSS_BUILD_ENVIRON"             : "$(CROSS_BUILD_ENVIRON)")
 $(info "GZ_COMPRESS_PROGRAM"             : "$(GZ_COMPRESS_PROGRAM)")
 $(info "LEGACY_SONIC_MGMT_DOCKER"        : "$(LEGACY_SONIC_MGMT_DOCKER)")
+$(info "ENABLE_MULTIDB"                  : "$(ENABLE_MULTIDB)")
 $(info )
 else
 $(info SONiC Build System for $(CONFIGURED_PLATFORM):$(CONFIGURED_ARCH))
@@ -1450,6 +1451,7 @@ $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : $(TARGET_PATH)/% : \
 	export include_mux="$(INCLUDE_MUX)"
 	export include_bootchart="$(INCLUDE_BOOTCHART)"
 	export enable_bootchart="$(ENABLE_BOOTCHART)"
+	export enable_multidb="$(ENABLE_MULTIDB)"
 	$(foreach docker, $($*_DOCKERS),\
 		export docker_image="$(docker)"
 		export docker_image_name="$(basename $(docker))"
