@@ -78,12 +78,6 @@
  * Custom Netlink TLVs
 */
 
-struct seg6_iptunnel_encap_pri {
-	int mode;
-	struct in6_addr src;
-	struct ipv6_sr_hdr srh[0];
-};
-
 
 /* Custom Netlink message types */
 enum custom_nlmsg_types {
@@ -92,7 +86,9 @@ enum custom_nlmsg_types {
 	RTM_NEWPICCONTEXT		= 2000,
 	RTM_DELPICCONTEXT		= 2001,
 	RTM_NEWSRV6VPNROUTE		= 3000,
-    RTM_DELSRV6VPNROUTE		= 3001,
+	RTM_DELSRV6VPNROUTE		= 3001,
+	RTM_NEWSIDLIST			= 4000,
+	RTM_DELSIDLIST			= 4001,
 };
 
 /* Custom Netlink attribute types */
@@ -121,6 +117,9 @@ enum custom_rtattr_encap_srv6 {
 	FPM_ROUTE_ENCAP_SRV6_ENCAP_SRC_ADDR		= 2,
 	FPM_ROUTE_ENCAP_SRV6_PIC_ID             = 3,
 	FPM_ROUTE_ENCAP_SRV6_NH_ID              = 4,
+	FPM_ROUTE_ENCAP_SRV6_ENCAP_SIDLIST_NAME	= 5,
+	FPM_ROUTE_ENCAP_SRV6_ENCAP_SIDLIST_LEN	= 6,
+	FPM_ROUTE_ENCAP_SRV6_ENCAP_SIDLIST		= 7,
 };
 
 enum custom_rtattr_srv6_localsid_format {
@@ -1105,6 +1104,10 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 					FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh6,
 					sizeof(struct in6_addr)))
 			return -1;
+        if (!nl_attr_put(&req->n, datalen, 
+                    FPM_SRV6_LOCALSID_IIF, &seg6local_ctx->ifname,
+                    INTERFACE_NAMSIZ))
+            return -1;
 		break;
 	case ZEBRA_SEG6_LOCAL_ACTION_END_T:
 		zvrf = vrf_lookup_by_table_id(seg6local_ctx->table);
@@ -1686,7 +1689,8 @@ static ssize_t fill_seg6ipt_encap(char *buffer, size_t buflen,
 }
 
 static ssize_t fill_seg6ipt_encap_private(char *buffer, size_t buflen,
-				  const struct in6_addr *seg, const struct in6_addr *src)
+				  const struct in6_addr *seg, const struct in6_addr *src,
+				  const char *segment_name)
 {
 	struct seg6_iptunnel_encap_pri *ipt;
 	struct ipv6_sr_hdr *srh;
@@ -1719,6 +1723,8 @@ static ssize_t fill_seg6ipt_encap_private(char *buffer, size_t buflen,
 	if(src != NULL)
 	    memcpy(&ipt->src, src, sizeof(struct in6_addr));
 
+	if (segment_name != NULL)
+		memcpy(ipt->segment_name, segment_name, 64);
 
 	return srhlen + 4;
 }
@@ -1837,6 +1843,7 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 			switch (nh->type) {
 			case NEXTHOP_TYPE_IPV4:
 			case NEXTHOP_TYPE_IPV4_IFINDEX:
+			case NEXTHOP_TYPE_IPV4_SEGMENTLIST:
 				if (!nl_attr_put(&req->n, buflen, NHA_GATEWAY,
 						 &nh->gate.ipv4,
 						 IPV4_MAX_BYTELEN))
@@ -1844,6 +1851,7 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 				break;
 			case NEXTHOP_TYPE_IPV6:
 			case NEXTHOP_TYPE_IPV6_IFINDEX:
+			case NEXTHOP_TYPE_IPV6_SEGMENTLIST:
 				if (!nl_attr_put(&req->n, buflen, NHA_GATEWAY,
 						 &nh->gate.ipv6,
 						 IPV6_MAX_BYTELEN))
@@ -1906,6 +1914,137 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 			}
 
 			if (nh->nh_srv6) {
+				if (nh->nh_srv6->seg6local_action !=
+				    ZEBRA_SEG6_LOCAL_ACTION_UNSPEC) {
+					uint16_t encap;
+					struct rtattr *nest;
+					const struct seg6local_context *seg6local_ctx;
+
+					req->nhm.nh_family = AF_INET6;
+					seg6local_ctx = &nh->nh_srv6->seg6local_ctx;
+					encap = LWTUNNEL_ENCAP_SEG6_LOCAL;
+					if (!nl_attr_put(&req->n, buflen,
+							 NHA_ENCAP_TYPE,
+							 &encap,
+							 sizeof(uint16_t)))
+						return 0;
+
+					nest = nl_attr_nest(&req->n, buflen,
+						NHA_ENCAP | NLA_F_NESTED);
+					if (!nest)
+						return 0;
+
+					switch (nh->nh_srv6->seg6local_action) {
+					case ZEBRA_SEG6_LOCAL_ACTION_END:
+						if (!nl_attr_put32(
+							&req->n, buflen, 
+							FPM_SRV6_LOCALSID_ACTION,
+							FPM_SRV6_LOCALSID_ACTION_END))
+							return -1;
+						break;
+					case ZEBRA_SEG6_LOCAL_ACTION_END_X:
+						if (!nl_attr_put32(
+							&req->n, buflen, 
+							FPM_SRV6_LOCALSID_ACTION,
+							FPM_SRV6_LOCALSID_ACTION_END_X))
+							return -1;
+						if (!nl_attr_put(&req->n, buflen, 
+						    FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh6,
+							sizeof(struct in6_addr)))
+							return -1;
+						break;
+					case ZEBRA_SEG6_LOCAL_ACTION_END_T:
+						zvrf = vrf_lookup_by_table_id(seg6local_ctx->table);
+						if (!zvrf)
+						    return false;
+						if (!nl_attr_put32(
+							&req->n, buflen, 
+							FPM_SRV6_LOCALSID_ACTION,
+							FPM_SRV6_LOCALSID_ACTION_END_T))
+							return -1;
+						if (!nl_attr_put(&req->n, buflen, 
+						    FPM_SRV6_LOCALSID_VRFNAME, 
+							zvrf->vrf->name,
+							strlen(zvrf->vrf->name) + 1))
+							return -1;
+						break;
+					case ZEBRA_SEG6_LOCAL_ACTION_END_DX6:
+						if (!nl_attr_put32(
+							&req->n, buflen, 
+							FPM_SRV6_LOCALSID_ACTION,
+							FPM_SRV6_LOCALSID_ACTION_END_DX6))
+							return -1;
+						if (!nl_attr_put(&req->n, buflen, 
+						    FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh6,
+							sizeof(struct in6_addr)))
+							return -1;
+						break;
+					case ZEBRA_SEG6_LOCAL_ACTION_END_DX4:
+						if (!nl_attr_put32(
+							&req->n, buflen, 
+							FPM_SRV6_LOCALSID_ACTION,
+							FPM_SRV6_LOCALSID_ACTION_END_DX4))
+							return -1;
+						if (!nl_attr_put(&req->n, buflen, 
+						    FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh4,
+							sizeof(struct in6_addr)))
+							return -1;
+						break;
+					case ZEBRA_SEG6_LOCAL_ACTION_END_DT6:
+						zvrf = vrf_lookup_by_table_id(seg6local_ctx->table);
+						if (!zvrf)
+						    return false;
+						if (!nl_attr_put32(
+							&req->n, buflen, 
+							FPM_SRV6_LOCALSID_ACTION,
+							FPM_SRV6_LOCALSID_ACTION_END_DT6))
+							return -1;
+						if (!nl_attr_put(&req->n, buflen, 
+						    FPM_SRV6_LOCALSID_VRFNAME, 
+							zvrf->vrf->name,
+							strlen(zvrf->vrf->name) + 1))
+							return -1;
+						break;
+					case ZEBRA_SEG6_LOCAL_ACTION_END_DT4:
+						zvrf = vrf_lookup_by_table_id(seg6local_ctx->table);
+						if (!zvrf)
+						    return false;
+						if (!nl_attr_put32(
+							&req->n, buflen, 
+							FPM_SRV6_LOCALSID_ACTION,
+							FPM_SRV6_LOCALSID_ACTION_END_DT4))
+							return -1;
+						if (!nl_attr_put(&req->n, buflen, 
+						    FPM_SRV6_LOCALSID_VRFNAME, 
+							zvrf->vrf->name,
+							strlen(zvrf->vrf->name) + 1))
+							return -1;
+						break;
+					case ZEBRA_SEG6_LOCAL_ACTION_END_DT46:
+						zvrf = vrf_lookup_by_table_id(seg6local_ctx->table);
+						if (!zvrf)
+						    return false;
+						if (!nl_attr_put32(
+							&req->n, buflen, 
+							FPM_SRV6_LOCALSID_ACTION,
+							FPM_SRV6_LOCALSID_ACTION_END_DT46))
+							return -1;
+						if (!nl_attr_put(&req->n, buflen, 
+						    FPM_SRV6_LOCALSID_VRFNAME, 
+							zvrf->vrf->name,
+							strlen(zvrf->vrf->name) + 1))
+							return -1;
+						break;
+					default:
+						zlog_err("%s: unsupport seg6local behaviour action=%u",
+							 __func__, nh->nh_srv6->seg6local_action);
+						return 0;
+					}
+
+					nl_attr_nest_end(&req->n, nest);
+				}
+
+
 				if (!sid_zero(&nh->nh_srv6->seg6_segs)) {
 					char tun_buf[4096];
 					ssize_t tun_len;
@@ -1923,13 +2062,13 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 						tun_len = fill_seg6ipt_encap_private(tun_buf,
 						    sizeof(tun_buf),
 						    &nh->nh_srv6->seg6_segs,
-						    &nh->nh_srv6->seg6_src);
+						    &nh->nh_srv6->seg6_src, NULL);
 					}
 					else {
 						tun_len = fill_seg6ipt_encap_private(tun_buf,
 					    sizeof(tun_buf),
 					    &nh->nh_srv6->seg6_segs,
-						NULL);
+						NULL,NULL);
 					}
 					if (tun_len < 0)
 						return 0;
@@ -1962,6 +2101,62 @@ nexthop_done:
 	if (IS_ZEBRA_DEBUG_KERNEL)
 		zlog_debug("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd),
 			   id);
+
+	return NLMSG_ALIGN(req->n.nlmsg_len);
+}
+ 
+static ssize_t netlink_sidlist_msg_encode(int cmd,
+					   struct zebra_dplane_ctx *ctx,
+					   uint8_t *data, size_t datalen)
+{
+	struct rtattr *nest;
+	struct zebra_srv6_sidlist *sidlist;
+
+	struct {
+		struct nlmsghdr n;
+		struct rtmsg r;
+		char buf[];
+	} *req = (void *)data;
+
+	sidlist = dplane_ctx_get_sidlist(ctx);
+
+	if (datalen < sizeof(*req))
+		return 0;
+
+	memset(req, 0, sizeof(*req));
+
+	req->n.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+	req->n.nlmsg_flags = NLM_F_CREATE | NLM_F_REQUEST;
+
+	req->n.nlmsg_type = cmd;
+	req->r.rtm_scope = RT_SCOPE_UNIVERSE;
+	req->r.rtm_type = RTN_UNICAST;
+
+	if (!nl_attr_put32(&req->n, datalen, RTA_TABLE, sidlist->segment_count_))
+		return false;
+
+	nest = nl_attr_nest(&req->n, datalen, RTA_ENCAP);
+	if (!nest)
+		return false;
+
+	char sidlist_name[SRV6_SEGMENTLIST_NAME_MAX_LENGTH];
+	memset(sidlist_name, 0, sizeof(sidlist_name));
+	strcpy(sidlist_name, sidlist->sidlist_name_);
+	if (!nl_attr_put(
+			&req->n, datalen, FPM_ROUTE_ENCAP_SRV6_ENCAP_SIDLIST_NAME,
+			sidlist_name, SRV6_SEGMENTLIST_NAME_MAX_LENGTH * sizeof(*sidlist_name)))
+		return false;
+
+	struct zebra_srv6_segment_entry segments[SRV6_SID_INDEX_MAX_NUM];
+	memset(segments, 0, sizeof(segments));
+	for (uint32_t i = 0; i < sidlist->segment_count_; i++) {
+		segments[i].index_ = sidlist->segments_[i].index_;
+		segments[i].srv6_sid_value_ = sidlist->segments_[i].srv6_sid_value_;
+	}
+	if (!nl_attr_put(&req->n, datalen, FPM_ROUTE_ENCAP_SRV6_ENCAP_SIDLIST,
+				segments, SRV6_SID_INDEX_MAX_NUM * sizeof(*segments)))
+		return false;
+	nl_attr_nest_end(&req->n, nest);
 
 	return NLMSG_ALIGN(req->n.nlmsg_len);
 }
