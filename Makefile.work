@@ -66,7 +66,9 @@
 #  * ENABLE_MULTIDB: Enable multiple redis database instances.
 #  *                 Default: unset
 #  *                 Values: y
-
+#  * ENABLE_SONIC_FPM: Enable SONIC FPM.
+#  *                 Default: unset
+#  *                 Values: y
 ###############################################################################
 
 SHELL = /bin/bash
@@ -590,6 +592,7 @@ SONIC_BUILD_INSTRUCTION :=  $(MAKE) \
                            PIP_HTTP_TIMEOUT=$(PIP_HTTP_TIMEOUT) \
                            LEGACY_SONIC_MGMT_DOCKER=$(LEGACY_SONIC_MGMT_DOCKER) \
                            ENABLE_MULTIDB=$(ENABLE_MULTIDB) \
+                           ENABLE_SONIC_FPM=$(ENABLE_SONIC_FPM) \
 						   $(SONIC_OVERRIDE_BUILD_VARS)
 
 .PHONY: sonic-slave-build sonic-slave-bash init reset
@@ -628,7 +631,7 @@ endif
 
 	$(Q)$(DOCKER_RUN) \
 		$(SLAVE_IMAGE):$(SLAVE_TAG) \
-		bash -c "$(SONIC_BUILD_INSTRUCTION) $@; $(COLLECT_BUILD_VERSION); $(SLAVE_SHELL)" 
+		bash -c "$(SONIC_BUILD_INSTRUCTION) $@; $(COLLECT_BUILD_VERSION); $(SLAVE_SHELL)"
 	$(Q)$(docker-image-cleanup)
 
 docker-cleanup:
