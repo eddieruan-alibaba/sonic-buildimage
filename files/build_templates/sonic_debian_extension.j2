@@ -1010,3 +1010,8 @@ sudo LANG=C DEBIAN_FRONTEND=noninteractive chroot $FILESYSTEM_ROOT apt-get -y in
 {% if ENABLE_MULTIDB == "y" %}
 sudo touch $FILESYSTEM_ROOT_ETC_SONIC/enable_multidb
 {% endif %}
+
+## Enable SONIC FPM
+{% if ENABLE_SONIC_FPM == "y" %}
+sudo touch $FILESYSTEM_ROOT_ETC_SONIC/enable_sonic_fpm
+{% endif %}
