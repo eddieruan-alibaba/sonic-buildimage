@@ -11,7 +11,7 @@ POST_VERSION_PATH=$BUILDINFO_PATH/post-versions
 VERSION_DEB_PREFERENCE=$BUILDINFO_PATH/versions/01-versions-deb
 WEB_VERSION_FILE=$VERSION_PATH/versions-web
 BUILD_WEB_VERSION_FILE=$BUILD_VERSION_PATH/versions-web
-REPR_MIRROR_URL_PATTERN='http:\/\/packages.trafficmanager.net\/'
+REPR_MIRROR_URL_PATTERN='https:\/\/packages.trafficmanager.net\/'
 DPKG_INSTALLTION_LOCK_FILE=/tmp/.dpkg_installation.lock
 GET_RETRY_COUNT=5
 

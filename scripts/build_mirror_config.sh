@@ -9,14 +9,14 @@ export DISTRIBUTION=$3
 [[ -z $APT_RETRIES_COUNT ]] && APT_RETRIES_COUNT=20
 export APT_RETRIES_COUNT
 
-DEFAULT_MIRROR_URL_PREFIX=http://packages.trafficmanager.net
+DEFAULT_MIRROR_URL_PREFIX=https://packages.trafficmanager.net
 MIRROR_VERSION_FILE=
 [[ "$SONIC_VERSION_CONTROL_COMPONENTS" == *deb* || $SONIC_VERSION_CONTROL_COMPONENTS == *all* ]] && MIRROR_VERSION_FILE=files/build/versions/default/versions-mirror && MIRROR_SNAPSHOT=y
 [ -f target/versions/default/versions-mirror ] && MIRROR_VERSION_FILE=target/versions/default/versions-mirror
 
 # The default mirror urls
-DEFAULT_MIRROR_URLS=http://debian-archive.trafficmanager.net/debian/,http://packages.trafficmanager.net/debian/debian/
-DEFAULT_MIRROR_SECURITY_URLS=http://debian-archive.trafficmanager.net/debian-security/,http://packages.trafficmanager.net/debian/debian-security/
+DEFAULT_MIRROR_URLS=http://debian-archive.trafficmanager.net/debian/,https://packages.trafficmanager.net/debian/debian/
+DEFAULT_MIRROR_SECURITY_URLS=http://debian-archive.trafficmanager.net/debian-security/,https://packages.trafficmanager.net/debian/debian-security/
 
 # The debian-archive.trafficmanager.net does not support armhf, use debian.org instead
 if [ "$ARCHITECTURE" == "armhf" ]; then
@@ -37,8 +37,8 @@ if [ "$MIRROR_SNAPSHOT" == y ]; then
         DEBIAN_SECURITY_TIMESTAMP=$(curl $DEFAULT_MIRROR_URL_PREFIX/snapshot/debian-security/latest/timestamp)
     fi
 
-    DEFAULT_MIRROR_URLS=http://deb.debian.org/debian/,http://packages.trafficmanager.net/snapshot/debian/$DEBIAN_TIMESTAMP/
-    DEFAULT_MIRROR_SECURITY_URLS=http://deb.debian.org/debian-security/,http://packages.trafficmanager.net/snapshot/debian-security/$DEBIAN_SECURITY_TIMESTAMP/
+    DEFAULT_MIRROR_URLS=http://deb.debian.org/debian/,https://packages.trafficmanager.net/snapshot/debian/$DEBIAN_TIMESTAMP/
+    DEFAULT_MIRROR_SECURITY_URLS=http://deb.debian.org/debian-security/,https://packages.trafficmanager.net/snapshot/debian-security/$DEBIAN_SECURITY_TIMESTAMP/
 
     mkdir -p target/versions/default
     if [ ! -f target/versions/default/versions-mirror ]; then
