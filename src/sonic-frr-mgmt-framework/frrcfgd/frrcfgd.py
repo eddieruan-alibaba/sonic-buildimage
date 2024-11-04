@@ -75,7 +75,7 @@ def extract_cmd_daemons(cmd_str):
 class BgpdClientMgr(threading.Thread):
     VTYSH_MARK = 'vtysh '
     PROXY_SERVER_ADDR = '/etc/frr/bgpd_client_sock'
-    ALL_DAEMONS = ['bgpd', 'zebra', 'staticd', 'bfdd', 'ospfd', 'pimd']
+    ALL_DAEMONS = ['bgpd', 'zebra', 'staticd', 'bfdd', 'ospfd', 'pimd', 'pathd']
     TABLE_DAEMON = {
             'DEVICE_METADATA': ['bgpd'],
             'BGP_GLOBALS': ['bgpd'],
@@ -118,12 +118,16 @@ class BgpdClientMgr(threading.Thread):
             'PIM_INTERFACE': ['pimd'],
             'IGMP_INTERFACE': ['pimd'],
             'IGMP_INTERFACE_QUERY': ['pimd'],
-            'SRV6_LOCATOR': ['zebra']
+            'SRV6_LOCATOR': ['zebra'],
+            'SRV6_SID_LIST': ['pathd'],
+            'SRV6_POLICY': ['pathd']
     }
     VTYSH_CMD_DAEMON = [(r'show (ip|ipv6) route($|\s+\S+)', ['zebra']),
                         (r'show ip mroute($|\s+\S+)', ['pimd']),
                         (r'show bfd($|\s+\S+)', ['bfdd']),
                         (r'clear bfd($|\s+\S+)', ['bfdd']),
+                        (r'show pathd($|\s+\S+)', ['pathd']),
+                        (r'clear pathd($|\s+\S+)', ['pathd']),
                         (r'clear ip mroute($|\s+\S+)', ['pimd']),
                         (r'clear ip pim($|\s+\S+)', ['pimd']),
                         (r'show ip ospf($|\s+\S+)', ['ospfd']),
@@ -443,6 +447,23 @@ def hdl_srv6_locator(daemon, cmd_str, op, st_idx, vals, bool_values):
         cmd_list.append(cmd_str.format(*cmd_args, no = CommandArgument(daemon, cmd_enable)))
     return cmd_list
 
+def hdl_srv6_sid_list(daemon, cmd_str, op, st_idx, vals, bool_values):
+    chk_val = None
+    if op == CachedDataWithOp.OP_DELETE:
+        cmd_enable = False
+    else:
+        cmd_enable = True
+    cmd_list = []
+    for num in range(len(vals[0])):
+        cmd_args = []
+        valus = vals[0][num].split('|')
+        if len(valus) != 2:
+            syslog.syslog(syslog.LOG_ERR, 'Invalid sid_list %s' % vals[0][num])
+            continue
+        cmd_args.append(CommandArgument(daemon, cmd_enable, valus[0]))
+        cmd_args.append(CommandArgument(daemon, cmd_enable, valus[1]))
+        cmd_list.append(cmd_str.format(*cmd_args, no = CommandArgument(daemon, cmd_enable)))
+    return cmd_list
 def hdl_set_extcomm(daemon, cmd_str, op, st_idx, args, is_inline):
     if is_inline:
         if type(args[0]) is list:
@@ -1483,6 +1504,16 @@ def hdl_static_route(daemon, cmd_str, op, st_idx, args, data):
     daemon.upd_nh_set = ip_nh_set
     return cmd_list
 
+def reformat_srv6_sidlist(data):
+    sid_list=[]
+    for k, v in data.items():
+        if v is None:
+            continue
+        sid_list.append("{}|{}".format(k,v.data))
+    upd_data = {}
+    upd_data['sid_list'] = CachedDataWithOp(sid_list, CachedDataWithOp.OP_ADD)
+    return upd_data
+
 class ExtConfigDBConnector(ConfigDBConnector):
     def __init__(self, ns_attrs = None):
         super(ExtConfigDBConnector, self).__init__()
@@ -2080,6 +2111,7 @@ class BGPConfigDaemon:
                            ]
     srv6_locator_key_map = [(['opcode_prefix', 'opcode_act', 'opcode_vrf'], '{no:no-prefix}opcode {} {} vrf {}', hdl_srv6_locator)]
 
+    srv6_sid_list_key_map = [('sid_list', '{no:no-prefix} index {} ipv6-address {}', hdl_srv6_sid_list)]
 
     tbl_to_key_map = {'BGP_GLOBALS':                    global_key_map,
                       'BGP_GLOBALS_AF':                 global_af_key_map,
@@ -2110,6 +2142,7 @@ class BGPConfigDaemon:
                       'IGMP_INTERFACE':                 igmp_mcast_grp_key_map,
                       'IGMP_INTERFACE_QUERY':           igmp_interface_config_key_map,
                       'SRV6_LOCATOR':                   srv6_locator_key_map,
+                      'SRV6_SID_LIST':                  srv6_sid_list_key_map,
     }
 
     vrf_tables = {'BGP_GLOBALS', 'BGP_GLOBALS_AF',
@@ -2308,6 +2341,9 @@ class BGPConfigDaemon:
             ('IGMP_INTERFACE', self.bgp_table_handler_common),
             ('IGMP_INTERFACE_QUERY', self.bgp_table_handler_common),
             ('SRV6_LOCATOR', self.bgp_table_handler_common),
+            ('SRV6_SID_LIST', self.bgp_table_handler_common),
+            ('SRV6_POLICY', self.bgp_table_handler_common),
+
         ]
         self.bgp_message = queue.Queue(0)
         self.table_data_cache = self.config_db.get_table_data([tbl for tbl, _ in self.table_handler_list])
@@ -2705,7 +2741,32 @@ class BGPConfigDaemon:
                 if not key_map.run_command(self, table, data, cmd_prefix):
                     syslog.syslog(syslog.LOG_ERR, 'failed running SRV6 LOCATOR config command')
                     continue
-            
+            elif table == 'SRV6_POLICY':
+                syslog.syslog(syslog.LOG_INFO, 'Set SRV6 POLICY ')
+                key_list = key.split('|')
+                if len(key_list) != 3:
+                    syslog.syslog(syslog.LOG_ERR, 'invalid key for SRV6 POLICY table')
+                    continue
+                if not del_table :
+                    bfd_str = ""
+                    if 'bfd' in data and data.get("bfd"):
+                       bfd_str = "bfd {}".format(data["bfd"].data)
+                    cmd = "vtysh -c 'configure terminal' -c 'segment-routing' -c 'traffic-eng'"
+                    cmd +="-c 'policy color {} endpoint {}' ".format(prefix,key_list[0])
+                    cmd +="-c 'candidate-path preference {} name {} explicit-srv6 segment-list {} weight {} {}'".\
+                        format(key_list[1],key_list[2],data['seg_name'].data, data['weight'].data,bfd_str)
+                    if not self.__run_command(table, cmd):
+                        syslog.syslog(syslog.LOG_ERR, 'failed running SRV6 POLICY config command')
+                        continue
+            elif table == 'SRV6_SID_LIST':
+                key = prefix
+                if not del_table :
+                    cmd_prefix = ['configure terminal', 'segment-routing', 'traffic-eng',
+                                  'segment-list {}'.format(key)]
+                    reformat_data= reformat_srv6_sidlist(data)
+                    if not key_map.run_command(self, table, reformat_data, cmd_prefix):
+                        syslog.syslog(syslog.LOG_ERR, 'failed running SRV6 SRV6_SID_LIST config command')
+                        continue
             elif table == 'BGP_GLOBALS_AF':
                 af, ip_type = key.lower().split('_')
                 #this is to temporarily make table cache key accessible to key_map handler function
