@@ -2109,7 +2109,7 @@ class BGPConfigDaemon:
                              ('icmo_ttl', 'ttl {}', handle_ip_sla_common),
                              ('icmp_tos', 'tos {}', handle_ip_sla_common),
                            ]
-    srv6_locator_key_map = [(['opcode_prefix', 'opcode_act', 'opcode_vrf'], '{no:no-prefix}opcode {} {} vrf {}', hdl_srv6_locator)]
+    srv6_locator_key_map = [(['opcode_prefix', 'opcode_act', 'opcode_data'], '{no:no-prefix}opcode {} {} {}', hdl_srv6_locator)]
 
     srv6_sid_list_key_map = [('sid_list', '{no:no-prefix} index {} ipv6-address {}', hdl_srv6_sid_list)]
 
