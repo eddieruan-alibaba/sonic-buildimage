@@ -111,11 +111,8 @@ do
     else
         echo -n > /var/lib/$inst/dump.rdb
     fi
+    # the Redis process is operating under the 'redis' user in supervisord and make redis user own /var/lib/$inst inside db container.
     chown -R redis:redis /var/lib/$inst
-    sock_file="$REDIS_DIR/$inst.sock"
-    if [[ -f $sock_file ]]; then
-        chgrp -f redis $sock_file && chmod -f 0760 $sock_file
-    fi
 done
 
 TZ=$(cat /etc/timezone)
