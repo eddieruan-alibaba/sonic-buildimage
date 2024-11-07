@@ -476,12 +476,14 @@ def hdl_set_extcomm(daemon, cmd_str, op, st_idx, args, is_inline):
             syslog.syslog(syslog.LOG_ERR, 'extended community set %s not found or configured' % args[0])
             return None
         com_list = com_set.mbr_list
-    rt_cnt = soo_cnt = 0
+    color_cnt =  rt_cnt = soo_cnt = 0
     for comm in com_list:
         if comm.startswith(CommunityList.RT_TYPE_MARK):
             rt_cnt += 1
         elif comm.startswith(CommunityList.SOO_TYPE_MARK):
             soo_cnt += 1
+        elif comm.startswith(CommunityList.COLOR_MARK):
+            color_cnt += 1
     cmd_list = []
     if op != CachedDataWithOp.OP_DELETE:
         for comm_type in ['rt', 'soo']:
@@ -491,6 +493,9 @@ def hdl_set_extcomm(daemon, cmd_str, op, st_idx, args, is_inline):
         cmd_list += get_command_cmn(daemon, cmd_str, op, st_idx, new_args, None)
     if soo_cnt > 0:
         new_args = ((args[0], False),) + args[1:]
+        cmd_list += get_command_cmn(daemon, cmd_str, op, st_idx, new_args, None)
+    if color_cnt > 0:
+        new_args = ((args[0], None),) + args[1:]
         cmd_list += get_command_cmn(daemon, cmd_str, op, st_idx, new_args, None)
     return cmd_list
 
@@ -856,6 +861,12 @@ class CommandArgument(object):
             com_str = com_str[len(CommunityList.SOO_TYPE_MARK):]
             if is_rt is None:
                 return 'soo %s' % com_str
+            else:
+                return (None if is_rt else com_str)
+        elif com_str.startswith(CommunityList.COLOR_MARK):
+            com_str = com_str[len(CommunityList.COLOR_MARK):]
+            if is_rt is None:
+                return 'color %s' % com_str
             else:
                 return (None if is_rt else com_str)
         return None
@@ -1582,6 +1593,7 @@ class CommunityList:
     MATCH_ANY = 1
     RT_TYPE_MARK = 'route-target:'
     SOO_TYPE_MARK = 'route-origin:'
+    COLOR_MARK = 'color:'
     def __init__(self, name, extended):
         self.name = name
         self.is_ext = extended
