@@ -218,6 +218,7 @@ class BgpdClientMgr(threading.Thread):
                 return False
         return True
     def __init__(self):
+        time.sleep(20)
         super(BgpdClientMgr, self).__init__(name = 'VTYSH sub-process manager')
         if not self.__create_frr_client():
             syslog.syslog(syslog.LOG_ERR, 'failed to create socket to FRR daemon')
