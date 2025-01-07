@@ -1540,7 +1540,34 @@ class ExtConfigDBConnector(ConfigDBConnector):
         for key, val in data.items():
             if type(val) is list and key not in self.nosort_attrs.get(table, set()):
                 val.sort()
+            elif type(val) is list and key in self.nosort_attrs.get(table, set()):
+                syslog.syslog(syslog.LOG_INFO, 'skip sort key {} in table {}'.format(key, table))
         return data
+
+    def get_table(self, table):
+        """Read an entire table from config db.
+        Args:
+            table: Table name.
+        Returns:
+            Table data in a dictionary form of
+            { 'row_key': {'column_key': value, ...}, ...}
+            or { ('l1_key', 'l2_key', ...): {'column_key': value, ...}, ...} for a multi-key table.
+            Empty dictionary if table does not exist.
+        """
+        client = self.get_redis_client(self.db_name)
+        pattern = '{}{}*'.format(table.upper(), self.TABLE_NAME_SEPARATOR)
+        keys = client.keys(pattern)
+        data = {}
+        for key in keys:
+            try:
+                entry = self.raw_to_typed(client.hgetall(key),table)
+                if entry is not None:
+                    (_, row) = key.split(self.TABLE_NAME_SEPARATOR, 1)
+                    data[self.deserialize_key(row)] = entry
+            except ValueError:
+                pass    #Ignore non table-formated redis entries
+        return data
+
     def sub_msg_handler(self, msg_item):
         if msg_item['type'] == 'pmessage':
             key = msg_item['channel'].split(':', 1)[1]
@@ -2179,7 +2206,8 @@ class BGPConfigDaemon:
         return False
 
     def __init__(self):
-        self.config_db = ExtConfigDBConnector({'STATIC_ROUTE': {'nexthop', 'ifname', 'distance', 'nexthop-vrf', 'blackhole', 'track'}})
+        self.config_db = ExtConfigDBConnector({'STATIC_ROUTE': {'nexthop', 'ifname', 'distance', 'nexthop-vrf', 'blackhole', 'track'},
+                                               'SRV6_LOCATOR': {'opcode_prefix','opcode_act', 'opcode_data'}})
         try:
             self.config_db.connect()
         except Exception as e:
@@ -2747,10 +2775,10 @@ class BGPConfigDaemon:
             elif table == 'SRV6_LOCATOR':
                 key = prefix
                 prefix = data['prefix']
-                cmd_prefix = ['configure terminal', 'segment-routing', 'srv6', 'locators', 
-                              'locator {}'.format(key), 
+                cmd_prefix = ['configure terminal', 'segment-routing', 'srv6', 'locators',
+                              'locator {}'.format(key),
                               'prefix {} block-len {} node-len {} func-bits {}'.format(prefix.data, data['block_len'].data, data['node_len'].data, data['func_len'].data)]
-                
+
                 if not key_map.run_command(self, table, data, cmd_prefix):
                     syslog.syslog(syslog.LOG_ERR, 'failed running SRV6 LOCATOR config command')
                     continue
