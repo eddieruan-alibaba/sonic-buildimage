@@ -7,14 +7,14 @@ DERIVED_TARGET = $(FRR_PYTHONTOOLS) $(FRR_DBG) $(FRR_SNMP) $(FRR_SNMP_DBG)
 SUFFIX = $(shell date +%Y%m%d\.%H%M%S)
 STG_BRANCH = stg_temp.$(SUFFIX)
 DPLANE_FPM_SONIC_MODULE = dplane_fpm_sonic/dplane_fpm_sonic.c
-
+CURRENT_BRANCH = $(shell cd ./frr; git branch --show-current)
 # DEBEMAIL required by gpb dch
 export DEBEMAIL := sonicproject@googlegroups.com
 
 $(addprefix $(DEST)/, $(MAIN_TARGET)): $(DEST)/% :
 	# Build the package
 	pushd ./frr
-	git checkout $(FRR_BRANCH)
+	git checkout $(CURRENT_BRANCH)
 	# git checkout -b $(FRR_BRANCH) origin/$(FRR_BRANCH) || git checkout $(FRR_BRANCH)
 ifeq ($(CROSS_BUILD_ENVIRON), y)
 	git reset --hard
@@ -32,7 +32,7 @@ else
 endif
 	stg undo || true
 	git clean -xfdf
-	git checkout $(FRR_BRANCH)
+	git checkout $(CURRENT_BRANCH)
 	stg branch --delete --force $(STG_BRANCH)
 	git rev-parse --short HEAD | xargs git checkout
 ifeq ($(CROSS_BUILD_ENVIRON), y)
