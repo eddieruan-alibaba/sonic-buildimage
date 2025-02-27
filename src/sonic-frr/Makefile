@@ -34,7 +34,7 @@ endif
 	git clean -xfdf
 	git checkout $(CURRENT_BRANCH)
 	stg branch --delete --force $(STG_BRANCH)
-	git rev-parse --short HEAD | xargs git checkout
+	# git rev-parse --short HEAD | xargs git checkout
 ifeq ($(CROSS_BUILD_ENVIRON), y)
 	git reset --hard
 endif
