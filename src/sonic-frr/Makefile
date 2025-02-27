@@ -14,7 +14,7 @@ export DEBEMAIL := sonicproject@googlegroups.com
 $(addprefix $(DEST)/, $(MAIN_TARGET)): $(DEST)/% :
 	# Build the package
 	pushd ./frr
-	CURRENT_BRANCH := $(git branch --show-current)
+	CURRENT_BRANCH = $(git branch --show-current)
 	# git checkout $(FRR_BRANCH)
 	# git checkout -b $(FRR_BRANCH) origin/$(FRR_BRANCH) || git checkout $(FRR_BRANCH)
 ifeq ($(CROSS_BUILD_ENVIRON), y)
