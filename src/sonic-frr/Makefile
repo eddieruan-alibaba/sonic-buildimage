@@ -8,6 +8,9 @@ SUFFIX = $(shell date +%Y%m%d\.%H%M%S)
 STG_BRANCH = stg_temp.$(SUFFIX)
 DPLANE_FPM_SONIC_MODULE = dplane_fpm_sonic/dplane_fpm_sonic.c
 CURRENT_BRANCH = $(shell cd ./frr; git branch --show-current)
+ifeq ($(CURRENT_BRANCH), '')
+CURRENT_BRANCH = $(FRR_BRANCH)
+endif
 # DEBEMAIL required by gpb dch
 export DEBEMAIL := sonicproject@googlegroups.com
 
