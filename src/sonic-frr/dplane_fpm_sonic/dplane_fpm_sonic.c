@@ -208,6 +208,9 @@ struct fpm_nl_ctx {
 		/* Output buffer peak usage. */
 		_Atomic uint32_t obuf_peak;
 
+		_Atomic uint32_t route_msg_sent;
+		_Atomic uint32_t nh_msg_sent;
+
 		/* Amount of connection closes. */
 		_Atomic uint32_t connection_closes;
 		/* Amount of connection errors. */
@@ -440,6 +443,8 @@ DEFUN(fpm_show_counters_json, fpm_show_counters_json_cmd,
 
 	jo = json_object_new_object();
 	json_object_int_add(jo, "use_nhg", (int) gfnc->use_nhg);
+	json_object_int_add(jo, "route_msg_sent", gfnc->counters.route_msg_sent);
+	json_object_int_add(jo, "nh_msg_sent", gfnc->counters.nh_msg_sent;
 
 	json_object_int_add(jo, "bytes-read", gfnc->counters.bytes_read);
 	json_object_int_add(jo, "bytes-sent", gfnc->counters.bytes_sent);
@@ -2149,6 +2154,8 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 	switch (op) {
 	case DPLANE_OP_ROUTE_UPDATE:
 	case DPLANE_OP_ROUTE_DELETE:
+		atomic_fetch_add_explicit(&fnc->counters.route_msg_sent, 1,
+					  memory_order_relaxed);
 		nexthop = dplane_ctx_get_ng(ctx)->nexthop;
 		if (nexthop && nexthop->nh_srv6) {
 			rv = netlink_srv6_msg_encode(RTM_DELROUTE, ctx,
@@ -2171,7 +2178,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 				return 0;
 			}
 		}
-
+		zlog_debug("%s: route pdate / deletemsg size %d", __func__, rv);
 		nl_buf_len = (size_t)rv;
 
 		/* UPDATE operations need a INSTALL, otherwise just quit. */
@@ -2180,6 +2187,8 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 
 		/* FALL THROUGH */
 	case DPLANE_OP_ROUTE_INSTALL:
+		atomic_fetch_add_explicit(&fnc->counters.route_msg_sent, 1,
+					  memory_order_relaxed);
 		nexthop = dplane_ctx_get_ng(ctx)->nexthop;
 		if (nexthop && nexthop->nh_srv6) {
 			rv = netlink_srv6_msg_encode(
@@ -2203,6 +2212,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 			}
 		}
 
+		zlog_debug("%s: route msg size %d", __func__, rv);
 		nl_buf_len += (size_t)rv;
 
 		break;
@@ -2220,6 +2230,8 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		break;
 
 	case DPLANE_OP_NH_DELETE:
+		atomic_fetch_add_explicit(&fnc->counters.nh_msg_sent, 1,
+					  memory_order_relaxed);
 		rv = netlink_nexthop_msg_encode(RTM_DELNEXTHOP, ctx, nl_buf,
 						sizeof(nl_buf), true);
 		if (rv <= 0) {
@@ -2232,6 +2244,8 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		break;
 	case DPLANE_OP_NH_INSTALL:
 	case DPLANE_OP_NH_UPDATE:
+		atomic_fetch_add_explicit(&fnc->counters.nh_msg_sent, 1,
+					  memory_order_relaxed);
 		rv = netlink_nexthop_msg_encode(RTM_NEWNEXTHOP, ctx, nl_buf,
 						sizeof(nl_buf), true);
 		if (rv <= 0) {
