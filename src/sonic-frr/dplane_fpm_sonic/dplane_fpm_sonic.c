@@ -439,8 +439,6 @@ DEFUN(fpm_show_counters_json, fpm_show_counters_json_cmd,
 	struct json_object *jo;
 
 	jo = json_object_new_object();
-	json_object_int_add(jo, "use_nhg", (int) gfnc->use_nhg);
-
 	json_object_int_add(jo, "bytes-read", gfnc->counters.bytes_read);
 	json_object_int_add(jo, "bytes-sent", gfnc->counters.bytes_sent);
 	json_object_int_add(jo, "obuf-bytes", gfnc->counters.obuf_bytes);
@@ -1049,33 +1047,33 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 	seg6local_ctx = &nexthop->nh_srv6->seg6local_ctx;
 
 	nest =
-		nl_attr_nest(&req->n, datalen,
+		nl_attr_nest(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_FORMAT);
 
 	if (nexthop->nh_srv6->seg6local_ctx.block_len)
 		if (!nl_attr_put8(
-				&req->n, datalen,
+				&req->n, datalen, 
 				FPM_SRV6_LOCALSID_FORMAT_BLOCK_LEN,
 				nexthop->nh_srv6->seg6local_ctx.block_len))
 			return -1;
 
 	if (nexthop->nh_srv6->seg6local_ctx.node_len)
 		if (!nl_attr_put8(
-				&req->n, datalen,
+				&req->n, datalen, 
 				FPM_SRV6_LOCALSID_FORMAT_NODE_LEN,
 				nexthop->nh_srv6->seg6local_ctx.node_len))
 			return -1;
 
 	if (nexthop->nh_srv6->seg6local_ctx.function_len)
 		if (!nl_attr_put8(
-				&req->n, datalen,
+				&req->n, datalen, 
 				FPM_SRV6_LOCALSID_FORMAT_FUNC_LEN,
 				nexthop->nh_srv6->seg6local_ctx.function_len))
 			return -1;
 
 	if (nexthop->nh_srv6->seg6local_ctx.argument_len)
 		if (!nl_attr_put8(
-				&req->n, datalen,
+				&req->n, datalen, 
 				FPM_SRV6_LOCALSID_FORMAT_ARG_LEN,
 				nexthop->nh_srv6->seg6local_ctx.argument_len))
 			return -1;
@@ -1095,18 +1093,18 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 	switch (nexthop->nh_srv6->seg6local_action) {
 	case ZEBRA_SEG6_LOCAL_ACTION_END:
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UN : FPM_SRV6_LOCALSID_ACTION_END;
-		if (!nl_attr_put32(&req->n, datalen,
+		if (!nl_attr_put32(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
 		break;
 	case ZEBRA_SEG6_LOCAL_ACTION_END_X:
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UA : FPM_SRV6_LOCALSID_ACTION_END_X;
-		if (!nl_attr_put32(&req->n, datalen,
+		if (!nl_attr_put32(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen,
+		if (!nl_attr_put(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh6,
 					sizeof(struct in6_addr)))
 			return -1;
@@ -1116,11 +1114,11 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 		if (!zvrf)
 			return false;
 
-		if (!nl_attr_put32(&req->n, datalen,
+		if (!nl_attr_put32(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_ACTION,
 					FPM_SRV6_LOCALSID_ACTION_END_T))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen,
+		if (!nl_attr_put(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_VRFNAME,
 					zvrf->vrf->name,
 					strlen(zvrf->vrf->name) + 1))
@@ -1128,22 +1126,22 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 		break;
 	case ZEBRA_SEG6_LOCAL_ACTION_END_DX6:
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UDX6 : FPM_SRV6_LOCALSID_ACTION_END_DX6;
-		if (!nl_attr_put32(&req->n, datalen,
+		if (!nl_attr_put32(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen,
+		if (!nl_attr_put(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh6,
 					sizeof(struct in6_addr)))
 			return -1;
 		break;
 	case ZEBRA_SEG6_LOCAL_ACTION_END_DX4:
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UDX4 : FPM_SRV6_LOCALSID_ACTION_END_DX4;
-		if (!nl_attr_put32(&req->n, datalen,
+		if (!nl_attr_put32(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen,
+		if (!nl_attr_put(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_NH4, &seg6local_ctx->nh4,
 					sizeof(struct in_addr)))
 			return -1;
@@ -1154,11 +1152,11 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 			return false;
 
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UDT6 : FPM_SRV6_LOCALSID_ACTION_END_DT6;
-		if (!nl_attr_put32(&req->n, datalen,
+		if (!nl_attr_put32(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen,
+		if (!nl_attr_put(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_VRFNAME,
 					zvrf->vrf->name,
 					strlen(zvrf->vrf->name) + 1))
@@ -1170,11 +1168,11 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 			return false;
 
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UDT4 : FPM_SRV6_LOCALSID_ACTION_END_DT4;
-		if (!nl_attr_put32(&req->n, datalen,
+		if (!nl_attr_put32(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen,
+		if (!nl_attr_put(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_VRFNAME,
 					zvrf->vrf->name,
 					strlen(zvrf->vrf->name) + 1))
@@ -1186,11 +1184,11 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 			return false;
 
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UDT46 : FPM_SRV6_LOCALSID_ACTION_END_DT46;
-		if (!nl_attr_put32(&req->n, datalen,
+		if (!nl_attr_put32(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen,
+		if (!nl_attr_put(&req->n, datalen, 
 					FPM_SRV6_LOCALSID_VRFNAME,
 					zvrf->vrf->name,
 					strlen(zvrf->vrf->name) + 1))
@@ -2128,11 +2126,9 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 	    && (op == DPLANE_OP_NH_DELETE || op == DPLANE_OP_NH_INSTALL
 		|| op == DPLANE_OP_NH_UPDATE
 		|| op == DPLANE_OP_PIC_NH_DELETE || op == DPLANE_OP_PIC_NH_INSTALL
-		|| op == DPLANE_OP_PIC_NH_UPDATE)) {
-		zlog_debug("%s: use_nhg %s", __func__, fnc->use_nhg?"Enable":"Disable");
-	}
-
-
+		|| op == DPLANE_OP_PIC_NH_UPDATE))
+			return 0;
+ 
 	/*
 	 * Ignore route from default table, because when mgmt port goes down,
 	 * zebra will remove the default route and causing ASIC to blackhole IO.
