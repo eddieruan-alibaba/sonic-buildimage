@@ -444,7 +444,7 @@ DEFUN(fpm_show_counters_json, fpm_show_counters_json_cmd,
 	jo = json_object_new_object();
 	json_object_int_add(jo, "use_nhg", (int) gfnc->use_nhg);
 	json_object_int_add(jo, "route_msg_sent", gfnc->counters.route_msg_sent);
-	json_object_int_add(jo, "nh_msg_sent", gfnc->counters.nh_msg_sent;
+	json_object_int_add(jo, "nh_msg_sent", gfnc->counters.nh_msg_sent);
 
 	json_object_int_add(jo, "bytes-read", gfnc->counters.bytes_read);
 	json_object_int_add(jo, "bytes-sent", gfnc->counters.bytes_sent);
