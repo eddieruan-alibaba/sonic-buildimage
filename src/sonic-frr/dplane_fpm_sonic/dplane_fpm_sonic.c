@@ -1306,7 +1306,7 @@ static ssize_t netlink_vpn_route_msg_encode(int cmd,
 			nl_msg_type_to_str(cmd), p, dplane_ctx_get_vrf(ctx),
 			table_id, pic_id, nhg_id);
 
-	atomic_fetch_add_explicit(gfnc->counters.vpn_msg, 1, memory_order_relaxed);
+	atomic_fetch_add_explicit(&gfnc->counters.vpn_msg, 1, memory_order_relaxed);
 	if (!nl_attr_put16(&req->n, datalen, RTA_ENCAP_TYPE,
 				FPM_ROUTE_ENCAP_SRV6))
 		return false;
@@ -2052,7 +2052,7 @@ nexthop_done:
 		return -1;
 	}
 
-	atomic_fetch_add_explicit(gfnc->counters.pic_nh_msg, 1, memory_order_relaxed);
+	atomic_fetch_add_explicit(&gfnc->counters.pic_nh_msg, 1, memory_order_relaxed);
 
 	if (IS_ZEBRA_DEBUG_KERNEL)
 		zlog_debug("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd),
@@ -2232,7 +2232,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		break;
 
 	case DPLANE_OP_NH_DELETE:
-    	atomic_fetch_add_explicit(gfnc->counters.nh_msg, 1, memory_order_relaxed);
+    	atomic_fetch_add_explicit(&gfnc->counters.nh_msg, 1, memory_order_relaxed);
 		rv = netlink_nexthop_msg_encode(RTM_DELNEXTHOP, ctx, nl_buf,
 						sizeof(nl_buf), true);
 		if (rv <= 0) {
@@ -2245,7 +2245,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		break;
 	case DPLANE_OP_NH_INSTALL:
 	case DPLANE_OP_NH_UPDATE:
-    	atomic_fetch_add_explicit(gfnc->counters.nh_msg, 1, memory_order_relaxed);
+    	atomic_fetch_add_explicit(&gfnc->counters.nh_msg, 1, memory_order_relaxed);
 		rv = netlink_nexthop_msg_encode(RTM_NEWNEXTHOP, ctx, nl_buf,
 						sizeof(nl_buf), true);
 		if (rv <= 0) {
