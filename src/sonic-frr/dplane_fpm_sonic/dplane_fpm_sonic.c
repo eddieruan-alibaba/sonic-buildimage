@@ -200,6 +200,13 @@ struct fpm_nl_ctx {
 	/* Statistic counters. */
 	struct {
 		/* Amount of bytes read into ibuf. */
+		_Atomic uint32_t pic_nh_msg;
+		/* Amount of bytes written from obuf. */
+		_Atomic uint32_t vpn_msg;
+
+		_Atomic uint32_t nh_msg;
+
+		/* Amount of bytes read into ibuf. */
 		_Atomic uint32_t bytes_read;
 		/* Amount of bytes written from obuf. */
 		_Atomic uint32_t bytes_sent;
@@ -408,6 +415,9 @@ DEFUN(fpm_show_counters, fpm_show_counters_cmd,
 #define SHOW_COUNTER(label, counter) \
 	vty_out(vty, "%28s: %u\n", (label), (counter))
 
+	SHOW_COUNTER("PIC NH msg", gfnc->counters.pic_nh_msg);
+	SHOW_COUNTER("NH msg", gfnc->counters.nh_msg);
+	SHOW_COUNTER("VPN msg", gfnc->counters.vpn_msg);
 	SHOW_COUNTER("Input bytes", gfnc->counters.bytes_read);
 	SHOW_COUNTER("Output bytes", gfnc->counters.bytes_sent);
 	SHOW_COUNTER("Output buffer current size", gfnc->counters.obuf_bytes);
@@ -439,6 +449,9 @@ DEFUN(fpm_show_counters_json, fpm_show_counters_json_cmd,
 	struct json_object *jo;
 
 	jo = json_object_new_object();
+	json_object_int_add(jo, "pic_nh_msg", gfnc->counters.pic_nh_msg);
+	json_object_int_add(jo, "nh_msg", gfnc->counters.nh_msg);
+	json_object_int_add(jo, "vpn_msg", gfnc->counters.vpn_msg);
 	json_object_int_add(jo, "bytes-read", gfnc->counters.bytes_read);
 	json_object_int_add(jo, "bytes-sent", gfnc->counters.bytes_sent);
 	json_object_int_add(jo, "obuf-bytes", gfnc->counters.obuf_bytes);
@@ -1293,6 +1306,7 @@ static ssize_t netlink_vpn_route_msg_encode(int cmd,
 			nl_msg_type_to_str(cmd), p, dplane_ctx_get_vrf(ctx),
 			table_id, pic_id, nhg_id);
 
+	atomic_fetch_add_explicit(gfnc->counters.vpn_msg, 1, memory_order_relaxed);
 	if (!nl_attr_put16(&req->n, datalen, RTA_ENCAP_TYPE,
 				FPM_ROUTE_ENCAP_SRV6))
 		return false;
@@ -2038,6 +2052,8 @@ nexthop_done:
 		return -1;
 	}
 
+	atomic_fetch_add_explicit(gfnc->counters.pic_nh_msg, 1, memory_order_relaxed);
+
 	if (IS_ZEBRA_DEBUG_KERNEL)
 		zlog_debug("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd),
 			   id);
@@ -2216,6 +2232,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		break;
 
 	case DPLANE_OP_NH_DELETE:
+    	atomic_fetch_add_explicit(gfnc->counters.nh_msg, 1, memory_order_relaxed);
 		rv = netlink_nexthop_msg_encode(RTM_DELNEXTHOP, ctx, nl_buf,
 						sizeof(nl_buf), true);
 		if (rv <= 0) {
@@ -2228,6 +2245,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		break;
 	case DPLANE_OP_NH_INSTALL:
 	case DPLANE_OP_NH_UPDATE:
+    	atomic_fetch_add_explicit(gfnc->counters.nh_msg, 1, memory_order_relaxed);
 		rv = netlink_nexthop_msg_encode(RTM_NEWNEXTHOP, ctx, nl_buf,
 						sizeof(nl_buf), true);
 		if (rv <= 0) {
