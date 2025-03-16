@@ -1233,8 +1233,10 @@ static ssize_t netlink_vpn_route_msg_encode(int cmd,
 	struct nlsock *nl;
 	int bytelen;
 	vrf_id_t vrf_id;
-	uint32_t pic_id = dplane_ctx_get_nhe_id(ctx);
-	uint32_t nhg_id = dplane_ctx_get_pic_nhe_id(ctx);
+	uint32_t pic_id = dplane_ctx_get_unresolved_nhe_id(ctx);
+	uint32_t nhg_id = dplane_ctx_get_unresolved_pic_nhe_id(ctx);
+	uint32_t r_pic_id = dplane_ctx_get_nhe_id(ctx);
+	uint32_t r_nhg_id = dplane_ctx_get_pic_nhe_id(ctx);
 	uint32_t table_id;
 
 	struct {
@@ -1302,9 +1304,9 @@ static ssize_t netlink_vpn_route_msg_encode(int cmd,
 
 	if (IS_ZEBRA_DEBUG_FPM)
 		zlog_debug(
-			"%s: %s %pFX vrf %u(%u) pic_id %u nhg_id %u", __func__,
+			"%s: %s %pFX vrf %u(%u) pic_id %u nhg_id %u r_pic_id %u r_nhg_id %u", __func__,
 			nl_msg_type_to_str(cmd), p, dplane_ctx_get_vrf(ctx),
-			table_id, pic_id, nhg_id);
+			table_id, pic_id, nhg_id, r_pic_id, r_nhg_id);
 
 	atomic_fetch_add_explicit(&gfnc->counters.vpn_msg, 1, memory_order_relaxed);
 	if (!nl_attr_put16(&req->n, datalen, RTA_ENCAP_TYPE,
