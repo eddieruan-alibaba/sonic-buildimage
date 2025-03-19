@@ -1174,4 +1174,7 @@ sudo LANG=C DEBIAN_FRONTEND=noninteractive chroot $FILESYSTEM_ROOT apt-get -y in
 sudo touch $FILESYSTEM_ROOT_ETC_SONIC/enable_multidb
 {% endif %}
 
+## Copy over  set-vrf-strict-mode.service
+sudo cp $IMAGE_CONFIGS/set-vrf-strict-mode/set-vrf-strict-mode.service $FILESYSTEM_ROOT/etc/systemd/system/set-vrf-strict-mode.service
+
 sudo LANG=C chroot $FILESYSTEM_ROOT systemctl enable set-vrf-strict-mode

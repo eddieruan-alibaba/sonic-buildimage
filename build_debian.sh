@@ -819,9 +819,6 @@ sudo mkdir -p $FILESYSTEM_ROOT/var/lib/docker
 sudo rm -f $FILESYSTEM_ROOT/etc/resolvconf/resolv.conf.d/original
 sudo cp files/image_config/resolv-config/resolv.conf.head $FILESYSTEM_ROOT/etc/resolvconf/resolv.conf.d/head
 
-## Copy over  set-vrf-strict-mode.service
-sudo cp files/image_config/set-vrf-strict-mode/set-vrf-strict-mode.service $FILESYSTEM_ROOT/etc/systemd/system/set-vrf-strict-mode.service
-
 ## Optimize filesystem size
 if [ "$BUILD_REDUCE_IMAGE_SIZE" = "y" ]; then
    sudo scripts/build-optimize-fs-size.py "$FILESYSTEM_ROOT" \
