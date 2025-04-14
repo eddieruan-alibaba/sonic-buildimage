@@ -1697,6 +1697,8 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 	struct nlsock *nl =
 		kernel_netlink_nlsock_lookup(dplane_ctx_get_ns_sock(ctx));
 
+	zlog_info("Update PIC context for id %d", id);
+
 	if (!id) {
 		zlog_err(
 			"Failed trying to update a nexthop group in the kernel that does not have an ID");
@@ -1809,12 +1811,11 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 				break;
 			}
 
-			if (!nh->ifindex && !nh->nh_srv6)) {
+			if (!nh->ifindex && !nh->nh_srv6) {
 				zlog_info(
 					"Context received for kernel nexthop update without an interface");
 				return -1;
 			}
-
 			if (!nl_attr_put32(&req->n, buflen, NHA_OIF,
 					   nh->ifindex))
 				return 0;
