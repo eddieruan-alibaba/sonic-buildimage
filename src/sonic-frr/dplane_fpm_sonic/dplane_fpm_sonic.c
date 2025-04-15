@@ -1630,6 +1630,42 @@ static bool is_proto_nhg(uint32_t id, int type)
 	return false;
 }
 
+static void zlog_hexdump(const char *tag, const void *data, size_t len)
+{
+    const unsigned char *p = (const unsigned char *)data;
+    char line[MAX_HEX_LINE];
+    size_t i, j;
+
+    zlog_info("%s: Hex dump (%zu bytes)", tag, len);
+
+    for (i = 0; i < len; i += 16) {
+        char *ptr = line;
+        ptr += sprintf(ptr, "%04zx: ", i);
+
+        // Hex section
+        for (j = 0; j < 16; j++) {
+            if (i + j < len)
+                ptr += sprintf(ptr, "%02x ", p[i + j]);
+            else
+                ptr += sprintf(ptr, "   ");
+        }
+
+        // Spacer
+        ptr += sprintf(ptr, " |");
+
+        // ASCII section
+        for (j = 0; j < 16; j++) {
+            if (i + j < len) {
+                unsigned char c = p[i + j];
+                ptr += sprintf(ptr, "%c", isprint(c) ? c : '.');
+            }
+        }
+
+        *ptr = '\0';
+        zlog_info("%s", line);
+    }
+}
+
 static ssize_t fill_seg6ipt_encap_private(char *buffer, size_t buflen,
 				  const struct seg6_seg_stack *segs, const struct in6_addr *src,
 				  const char *segment_name)
@@ -1669,6 +1705,9 @@ static ssize_t fill_seg6ipt_encap_private(char *buffer, size_t buflen,
 
 	if (segment_name != NULL)
 		memcpy(ipt->segment_name, segment_name, 64);
+
+	ssize_t total_len = sizeof(struct seg6_iptunnel_encap_pri) + srhlen;
+	zlog_hexdump("fill_seg6ipt_encap_private", buffer, total_len);
 
 	return sizeof(struct seg6_iptunnel_encap_pri) + srhlen;
 }
@@ -2004,6 +2043,7 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 						    sizeof(tun_buf),
 						    nh->nh_srv6->seg6_segs,
 						    &nh->nh_srv6->seg6_src, NULL);
+						zlog_info("%s: ID (%u): tun_len %d at location 1", __func__, id, tun_len);
 					}
 					else {
 						tun_len = fill_seg6ipt_encap_private(tun_buf,
@@ -2047,7 +2087,7 @@ nexthop_done:
 		return -1;
 	}
 
-	zlog_info("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd),
+	zlog_info("%s: cmd %d, id=%u", __func__, cmd,
 			   id);
 	if (IS_ZEBRA_DEBUG_KERNEL)
 		zlog_debug("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd),
