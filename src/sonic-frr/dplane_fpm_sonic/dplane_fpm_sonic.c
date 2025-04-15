@@ -1875,12 +1875,6 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 				break;
 			}
 
-			if (!nh->ifindex) {
-				zlog_info(
-					"Context received for kernel nexthop update without an interface");
-				return -1;
-			}
-
 			if (!nl_attr_put32(&req->n, buflen, NHA_OIF,
 					   nh->ifindex))
 				return 0;
