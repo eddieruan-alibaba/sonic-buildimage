@@ -1630,6 +1630,7 @@ static bool is_proto_nhg(uint32_t id, int type)
 	return false;
 }
 
+define MAX_HEX_LINE 8000
 static void zlog_hexdump(const char *tag, const void *data, size_t len)
 {
     const unsigned char *p = (const unsigned char *)data;
