@@ -1631,7 +1631,7 @@ static bool is_proto_nhg(uint32_t id, int type)
 }
 
 #define MAX_HEX_LINE 8000
-static void zlog_hexdump(const char *tag, const void *data, size_t len)
+static void zlog_user_hexdump(const char *tag, const void *data, size_t len)
 {
     const unsigned char *p = (const unsigned char *)data;
     char line[MAX_HEX_LINE];
@@ -1708,7 +1708,7 @@ static ssize_t fill_seg6ipt_encap_private(char *buffer, size_t buflen,
 		memcpy(ipt->segment_name, segment_name, 64);
 
 	ssize_t total_len = sizeof(struct seg6_iptunnel_encap_pri) + srhlen;
-	zlog_hexdump("fill_seg6ipt_encap_private", buffer, total_len);
+	zlog_user_hexdump("fill_seg6ipt_encap_private", buffer, total_len);
 
 	return sizeof(struct seg6_iptunnel_encap_pri) + srhlen;
 }
