@@ -2011,6 +2011,9 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 					    nh->nh_srv6->seg6_segs,
 						NULL,NULL);
 					}
+
+					zlog_info("%s: ID (%u): tun_len %d", __func__, id, tun_len);
+
 					if (tun_len < 0)
 						return 0;
 					if (!nl_attr_put(&req->n, buflen,
@@ -2022,6 +2025,11 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 			}
 
 nexthop_done:
+
+			zlog_info("%s: ID (%u): %pNHv(%d) vrf %s(%u) %s ",
+						__func__, id, nh, nh->ifindex,
+						vrf_id_to_name(nh->vrf_id),
+						nh->vrf_id, label_buf);
 
 			if (IS_ZEBRA_DEBUG_KERNEL)
 				zlog_debug("%s: ID (%u): %pNHv(%d) vrf %s(%u) %s ",
@@ -2039,6 +2047,8 @@ nexthop_done:
 		return -1;
 	}
 
+	zlog_info("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd),
+			   id);
 	if (IS_ZEBRA_DEBUG_KERNEL)
 		zlog_debug("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd),
 			   id);
