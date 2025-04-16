@@ -1572,6 +1572,7 @@ static ssize_t netlink_srv6_msg_encode(int cmd,
 }
 
 static int build_label_stack(struct mpls_label_stack *nh_label,
+			     enum lsp_types_t nh_label_type,
 			     mpls_lse_t *out_lse, char *label_buf,
 			     size_t label_buf_size)
 {
@@ -1579,7 +1580,8 @@ static int build_label_stack(struct mpls_label_stack *nh_label,
 	int num_labels = 0;
 
 	for (int i = 0; nh_label && i < nh_label->num_labels; i++) {
-		if (nh_label->label[i] == MPLS_LABEL_IMPLICIT_NULL)
+		if (nh_label_type != ZEBRA_LSP_EVPN &&
+		    nh_label->label[i] == MPLS_LABEL_IMPLICIT_NULL)
 			continue;
 
 		if (IS_ZEBRA_DEBUG_KERNEL) {
@@ -1593,8 +1595,11 @@ static int build_label_stack(struct mpls_label_stack *nh_label,
 			}
 		}
 
-		out_lse[num_labels] =
-			mpls_lse_encode(nh_label->label[i], 0, 0, 0);
+		if (nh_label_type == ZEBRA_LSP_EVPN)
+			out_lse[num_labels] = label2vni(&nh_label->label[i]);
+		else
+			out_lse[num_labels] =
+				mpls_lse_encode(nh_label->label[i], 0, 0, 0);
 		num_labels++;
 	}
 
@@ -1695,13 +1700,13 @@ static bool is_proto_nhg(uint32_t id, int type)
 }
 
 static ssize_t fill_seg6ipt_encap_private(char *buffer, size_t buflen,
-				  const struct seg6_seg_stack *segs, const struct in6_addr *src,
-				  const char *segment_name)
+				  const struct seg6_seg_stack *segs, const char *segment_name)
 {
 	struct seg6_iptunnel_encap_pri *ipt;
 	struct ipv6_sr_hdr *srh;
 	size_t srhlen;
 	int i;
+	struct zebra_srv6 *srv6 = zebra_srv6_get_default();
 
 	if (segs->num_segs > SRV6_MAX_SEGS) {
 		/* Exceeding maximum supported SIDs */
@@ -1730,13 +1735,243 @@ static ssize_t fill_seg6ipt_encap_private(char *buffer, size_t buflen,
 		       sizeof(struct in6_addr));
 	}
 
-	if(src != NULL)
-	    memcpy(&ipt->src, src, sizeof(struct in6_addr));
+	if(srv6 != NULL)
+	    memcpy(&ipt->src, &srv6->encap_src_addr, sizeof(struct in6_addr));
 
 	if (segment_name != NULL)
 		memcpy(ipt->segment_name, segment_name, SEG6_SEGMENT_NAME_LEN);
 
 	return sizeof(struct seg6_iptunnel_encap_pri) + srhlen;
+}
+/**
+ * Next hop packet encoding helper function.
+ *
+ * \param[in] cmd netlink command.
+ * \param[in] ctx dataplane context (information snapshot).
+ * \param[out] buf buffer to hold the packet.
+ * \param[in] buflen amount of buffer bytes.
+ *
+ * \returns -1 on failure, 0 when the msg doesn't fit entirely in the buffer
+ * otherwise the number of bytes written to buf.
+ */
+ssize_t netlink_nexthop_msg_encode_sonic(uint16_t cmd,
+				   const struct zebra_dplane_ctx *ctx,
+				   void *buf, size_t buflen)
+{
+	struct {
+		struct nlmsghdr n;
+		struct nhmsg nhm;
+		char buf[];
+	} *req = buf;
+
+	mpls_lse_t out_lse[MPLS_MAX_LABELS];
+	char label_buf[256];
+	int num_labels = 0;
+	uint32_t id = dplane_ctx_get_nhe_id(ctx);
+	int type = dplane_ctx_get_nhe_type(ctx);
+	struct rtattr *nest;
+	uint16_t encap;
+	struct nlsock *nl =
+		kernel_netlink_nlsock_lookup(dplane_ctx_get_ns_sock(ctx));
+
+	if (!id) {
+		zlog_err("Failed trying to update a nexthop group in the kernel that does not have an ID");
+		return -1;
+	}
+
+	if (proto_nexthops_only() && !is_proto_nhg(id, type)) {
+		if (IS_ZEBRA_DEBUG_KERNEL || IS_ZEBRA_DEBUG_NHG)
+			zlog_debug(
+				"%s: nhg_id %u (%s): proto-based nexthops only, ignoring",
+				__func__, id, zebra_route_string(type));
+		return 0;
+	}
+
+	label_buf[0] = '\0';
+
+	if (buflen < sizeof(*req))
+		return 0;
+
+	memset(req, 0, sizeof(*req));
+
+	req->n.nlmsg_len = NLMSG_LENGTH(sizeof(struct nhmsg));
+	req->n.nlmsg_flags = NLM_F_CREATE | NLM_F_REQUEST;
+
+	if (cmd == RTM_NEWNEXTHOP)
+		req->n.nlmsg_flags |= NLM_F_REPLACE;
+
+	req->n.nlmsg_type = cmd;
+	req->n.nlmsg_pid = nl->snl.nl_pid;
+
+	req->nhm.nh_family = AF_UNSPEC;
+	/* TODO: Scope? */
+
+	if (!nl_attr_put32(&req->n, buflen, NHA_ID, id))
+		return 0;
+
+	if (cmd == RTM_NEWNEXTHOP) {
+		/*
+		 * We distinguish between a "group", which is a collection
+		 * of ids, and a singleton nexthop with an id. The
+		 * group is installed as an id that just refers to a list of
+		 * other ids.
+		 */
+		if (dplane_ctx_get_nhe_nh_grp_count(ctx)) {
+			const struct nexthop_group *nhg;
+			const struct nhg_resilience *nhgr;
+
+			nhg = dplane_ctx_get_nhe_ng(ctx);
+			nhgr = &nhg->nhgr;
+			if (!_netlink_nexthop_build_group(
+				    &req->n, buflen, id,
+				    dplane_ctx_get_nhe_nh_grp(ctx),
+				    dplane_ctx_get_nhe_nh_grp_count(ctx),
+				    !!nhgr->buckets, nhgr))
+				return 0;
+		} else {
+			const struct nexthop *nh =
+				dplane_ctx_get_nhe_ng(ctx)->nexthop;
+			afi_t afi = dplane_ctx_get_nhe_afi(ctx);
+
+			if (afi == AFI_IP)
+				req->nhm.nh_family = AF_INET;
+			else if (afi == AFI_IP6)
+				req->nhm.nh_family = AF_INET6;
+
+			switch (nh->type) {
+			case NEXTHOP_TYPE_IPV4:
+			case NEXTHOP_TYPE_IPV4_IFINDEX:
+				if (!nl_attr_put(&req->n, buflen, NHA_GATEWAY,
+						 &nh->gate.ipv4,
+						 IPV4_MAX_BYTELEN))
+					return 0;
+				break;
+			case NEXTHOP_TYPE_IPV6:
+			case NEXTHOP_TYPE_IPV6_IFINDEX:
+				if (!nl_attr_put(&req->n, buflen, NHA_GATEWAY,
+						 &nh->gate.ipv6,
+						 IPV6_MAX_BYTELEN))
+					return 0;
+				break;
+			case NEXTHOP_TYPE_BLACKHOLE:
+				if (!nl_attr_put(&req->n, buflen, NHA_BLACKHOLE,
+						 NULL, 0))
+					return 0;
+				/* Blackhole shouldn't have anymore attributes
+				 */
+				goto nexthop_done;
+			case NEXTHOP_TYPE_IFINDEX:
+				/* Don't need anymore info for this */
+				break;
+			}
+
+			if (!nl_attr_put32(&req->n, buflen, NHA_OIF,
+					   nh->ifindex))
+				return 0;
+
+			if (CHECK_FLAG(nh->flags, NEXTHOP_FLAG_ONLINK))
+				req->nhm.nh_flags |= RTNH_F_ONLINK;
+
+			num_labels = build_label_stack(
+				nh->nh_label, nh->nh_label_type, out_lse,
+				label_buf, sizeof(label_buf));
+
+			if (num_labels && nh->nh_label_type == ZEBRA_LSP_EVPN) {
+				if (!nl_attr_put16(&req->n, buflen,
+						   NHA_ENCAP_TYPE,
+						   LWTUNNEL_ENCAP_IP))
+					return 0;
+
+				nest = nl_attr_nest(&req->n, buflen, NHA_ENCAP);
+				if (!nest)
+					return 0;
+
+				if (_netlink_nexthop_encode_dvni_label(
+					    nh, &req->n, out_lse, buflen,
+					    label_buf) == false)
+					return 0;
+
+				nl_attr_nest_end(&req->n, nest);
+
+			} else if (num_labels) {
+				/* Set the BoS bit */
+				out_lse[num_labels - 1] |=
+					htonl(1 << MPLS_LS_S_SHIFT);
+
+				/*
+				 * TODO: MPLS unsupported for now in kernel.
+				 */
+				if (req->nhm.nh_family == AF_MPLS)
+					goto nexthop_done;
+
+				encap = LWTUNNEL_ENCAP_MPLS;
+				if (!nl_attr_put16(&req->n, buflen,
+						   NHA_ENCAP_TYPE, encap))
+					return 0;
+				nest = nl_attr_nest(&req->n, buflen, NHA_ENCAP);
+				if (!nest)
+					return 0;
+				if (!nl_attr_put(
+					    &req->n, buflen, MPLS_IPTUNNEL_DST,
+					    &out_lse,
+					    num_labels * sizeof(mpls_lse_t)))
+					return 0;
+
+				nl_attr_nest_end(&req->n, nest);
+			}
+
+			if (nh->nh_srv6) {
+				if (nh->nh_srv6->seg6_segs &&
+				    nh->nh_srv6->seg6_segs->num_segs &&
+				    !sid_zero(nh->nh_srv6->seg6_segs)) {
+					char tun_buf[4096];
+					ssize_t tun_len;
+					struct rtattr *nest;
+
+					if (!nl_attr_put16(&req->n, buflen,
+					    NHA_ENCAP_TYPE,
+					    LWTUNNEL_ENCAP_SEG6))
+						return 0;
+					nest = nl_attr_nest(&req->n, buflen,
+					    NHA_ENCAP | NLA_F_NESTED);
+					if (!nest)
+						return 0;
+					tun_len = fill_seg6ipt_encap_private(tun_buf,
+					    sizeof(tun_buf),
+					    nh->nh_srv6->seg6_segs, NULL);
+					if (tun_len < 0)
+						return 0;
+					if (!nl_attr_put(&req->n, buflen,
+							 SEG6_IPTUNNEL_SRH,
+							 tun_buf, tun_len))
+						return 0;
+					nl_attr_nest_end(&req->n, nest);
+				}
+			}
+
+nexthop_done:
+
+			if (IS_ZEBRA_DEBUG_KERNEL)
+				zlog_debug("%s: ID (%u): %pNHv(%d) vrf %s(%u) %s ",
+					   __func__, id, nh, nh->ifindex,
+					   vrf_id_to_name(nh->vrf_id),
+					   nh->vrf_id, label_buf);
+		}
+
+		req->nhm.nh_protocol = zebra2proto(type);
+
+	} else if (cmd != RTM_DELNEXTHOP) {
+		zlog_err(
+			"Nexthop group kernel update command (%d) does not exist",
+			cmd);
+		return -1;
+	}
+
+	if (IS_ZEBRA_DEBUG_KERNEL)
+		zlog_debug("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd),
+			   id);
+
+	return NLMSG_ALIGN(req->n.nlmsg_len);
 }
 
 /*
@@ -1883,8 +2118,9 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 				req->nhm.nh_flags |= RTNH_F_ONLINK;
 
 			num_labels =
-				build_label_stack(nh->nh_label, out_lse,
-						  label_buf, sizeof(label_buf));
+				build_label_stack(
+				nh->nh_label, nh->nh_label_type, out_lse,
+				label_buf, sizeof(label_buf));
 
 			if (num_labels) {
 				/* Set the BoS bit */
@@ -2058,18 +2294,9 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 					    NHA_ENCAP | NLA_F_NESTED);
 					if (!nest)
 						return 0;
-					if (!sid_zero_ipv6(&nh->nh_srv6->seg6_src)) {
-						tun_len = fill_seg6ipt_encap_private(tun_buf,
-						    sizeof(tun_buf),
-						    nh->nh_srv6->seg6_segs,
-						    &nh->nh_srv6->seg6_src, NULL);
-					}
-					else {
-						tun_len = fill_seg6ipt_encap_private(tun_buf,
+					tun_len = fill_seg6ipt_encap_private(tun_buf,
 					    sizeof(tun_buf),
-					    nh->nh_srv6->seg6_segs,
-						NULL,NULL);
-					}
+					    nh->nh_srv6->seg6_segs, NULL);
 					if (tun_len < 0)
 						return 0;
 					if (!nl_attr_put(&req->n, buflen,
@@ -2275,8 +2502,8 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		break;
 
 	case DPLANE_OP_NH_DELETE:
-		rv = netlink_nexthop_msg_encode(RTM_DELNEXTHOP, ctx, nl_buf,
-						sizeof(nl_buf), true);
+		rv = netlink_nexthop_msg_encode_sonic(RTM_DELNEXTHOP, ctx, nl_buf,
+						sizeof(nl_buf));
 		if (rv <= 0) {
 			zlog_err("%s: netlink_nexthop_msg_encode failed",
 				 __func__);
@@ -2287,8 +2514,8 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		break;
 	case DPLANE_OP_NH_INSTALL:
 	case DPLANE_OP_NH_UPDATE:
-		rv = netlink_nexthop_msg_encode(RTM_NEWNEXTHOP, ctx, nl_buf,
-						sizeof(nl_buf), true);
+		rv = netlink_nexthop_msg_encode_sonic(RTM_NEWNEXTHOP, ctx, nl_buf,
+						sizeof(nl_buf));
 		if (rv <= 0) {
 			zlog_err("%s: netlink_nexthop_msg_encode failed",
 				 __func__);
