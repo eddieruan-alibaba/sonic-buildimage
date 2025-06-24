@@ -44,6 +44,7 @@
 #include "lib/network.h"
 #include "lib/ns.h"
 #include "lib/frr_pthread.h"
+#include "lib/srv6.h"
 #include "zebra/debug.h"
 #include "zebra/interface.h"
 #include "zebra/zebra_dplane.h"
@@ -960,6 +961,7 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 	vrf_id_t vrf_id;
 	uint32_t table_id;
 	uint32_t action;
+	char buf[MPLS_LABEL_STRLEN];
 
 	struct {
 		struct nlmsghdr n;
@@ -1100,14 +1102,20 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
+		if (seg6local_ctx->family == AF_INET6)
+			if (!nl_attr_put(&req->n, datalen, 
+						FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh6,
+						sizeof(struct in6_addr)))
+				return -1;
+		if (seg6local_ctx->family == AF_INET)
+			if (!nl_attr_put(&req->n, datalen, 
+						FPM_SRV6_LOCALSID_NH4, &seg6local_ctx->nh4,
+						sizeof(struct in_addr)))
+				return -1;
 		if (!nl_attr_put(&req->n, datalen, 
-					FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh6,
-					sizeof(struct in6_addr)))
+					FPM_SRV6_LOCALSID_IIF, &seg6local_ctx->ifname,
+					INTERFACE_NAMSIZ))
 			return -1;
-        if (!nl_attr_put(&req->n, datalen, 
-                    FPM_SRV6_LOCALSID_IIF, &seg6local_ctx->ifname,
-                    INTERFACE_NAMSIZ))
-            return -1;
 		break;
 	case ZEBRA_SEG6_LOCAL_ACTION_END_T:
 		zvrf = vrf_lookup_by_table_id(seg6local_ctx->table);
@@ -1199,6 +1207,15 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 				__func__,
 				nexthop->nh_srv6->seg6local_action);
 		return -1;
+	}
+
+	if (IS_ZEBRA_DEBUG_FPM) {
+		seg6local_context2str(buf, sizeof(buf),
+				&nexthop->nh_srv6->seg6local_ctx,
+				nexthop->nh_srv6->seg6local_action);
+		zlog_debug(
+			"%s: action %u vrf %u family %u %s", __func__, action,
+			dplane_ctx_get_vrf(ctx),  seg6local_ctx->family, buf);
 	}
 
 	return NLMSG_ALIGN(req->n.nlmsg_len);
@@ -1987,7 +2004,7 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 							return -1;
 						if (!nl_attr_put(&req->n, buflen, 
 						    FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh4,
-							sizeof(struct in6_addr)))
+							sizeof(struct in_addr)))
 							return -1;
 						break;
 					case ZEBRA_SEG6_LOCAL_ACTION_END_DT6:
