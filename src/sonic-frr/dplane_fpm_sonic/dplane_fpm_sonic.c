@@ -574,8 +574,8 @@ static void fpm_reconnect(struct fpm_nl_ctx *fnc)
 
 	stream_reset(fnc->ibuf);
 	stream_reset(fnc->obuf);
-	EVENT_OFF(fnc->t_read);
-	EVENT_OFF(fnc->t_write);
+	event_cancel(&fnc->t_read);
+	event_cancel(&fnc->t_write);
 
 	/* Reset the barrier value */
 	cleaning_p = true;
@@ -743,7 +743,7 @@ static void fpm_read(struct event *t)
 				dplane_ctx_set_vrf(ctx, ival);
 				dplane_ctx_set_table(ctx,
 								ZEBRA_ROUTE_TABLE_UNKNOWN);
-	
+
 					dplane_provider_enqueue_to_zebra(ctx);
 			} else {
 				/*
@@ -1099,7 +1099,7 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 	seg6local_ctx = &nexthop->nh_srv6->seg6local_ctx;
 
 	nest =
-		nl_attr_nest(&req->n, datalen, 
+		nl_attr_nest(&req->n, datalen,
 					FPM_SRV6_LOCALSID_FORMAT);
 
 	block_len = nexthop->nh_srv6->seg6local_ctx.block_len;
@@ -1119,25 +1119,25 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 	}
 
 	if (!nl_attr_put8(
-			&req->n, datalen, 
+			&req->n, datalen,
 			FPM_SRV6_LOCALSID_FORMAT_BLOCK_LEN,
 			block_len))
 		return -1;
 
 	if (!nl_attr_put8(
-			&req->n, datalen, 
+			&req->n, datalen,
 			FPM_SRV6_LOCALSID_FORMAT_NODE_LEN,
 			node_len))
 		return -1;
 
 	if (!nl_attr_put8(
-			&req->n, datalen, 
+			&req->n, datalen,
 			FPM_SRV6_LOCALSID_FORMAT_FUNC_LEN,
 			func_len))
 		return -1;
 
 	if (!nl_attr_put8(
-			&req->n, datalen, 
+			&req->n, datalen,
 			FPM_SRV6_LOCALSID_FORMAT_ARG_LEN,
 			arg_len))
 		return -1;
@@ -1157,18 +1157,18 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 	switch (nexthop->nh_srv6->seg6local_action) {
 	case ZEBRA_SEG6_LOCAL_ACTION_END:
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UN : FPM_SRV6_LOCALSID_ACTION_END;
-		if (!nl_attr_put32(&req->n, datalen, 
+		if (!nl_attr_put32(&req->n, datalen,
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
 		break;
 	case ZEBRA_SEG6_LOCAL_ACTION_END_X:
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UA : FPM_SRV6_LOCALSID_ACTION_END_X;
-		if (!nl_attr_put32(&req->n, datalen, 
+		if (!nl_attr_put32(&req->n, datalen,
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen, 
+		if (!nl_attr_put(&req->n, datalen,
 					FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh6,
 					sizeof(struct in6_addr)))
 			return -1;
@@ -1178,11 +1178,11 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 		if (!zvrf)
 			return false;
 
-		if (!nl_attr_put32(&req->n, datalen, 
+		if (!nl_attr_put32(&req->n, datalen,
 					FPM_SRV6_LOCALSID_ACTION,
 					FPM_SRV6_LOCALSID_ACTION_END_T))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen, 
+		if (!nl_attr_put(&req->n, datalen,
 					FPM_SRV6_LOCALSID_VRFNAME,
 					zvrf->vrf->name,
 					strlen(zvrf->vrf->name) + 1))
@@ -1190,22 +1190,22 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 		break;
 	case ZEBRA_SEG6_LOCAL_ACTION_END_DX6:
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UDX6 : FPM_SRV6_LOCALSID_ACTION_END_DX6;
-		if (!nl_attr_put32(&req->n, datalen, 
+		if (!nl_attr_put32(&req->n, datalen,
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen, 
+		if (!nl_attr_put(&req->n, datalen,
 					FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh6,
 					sizeof(struct in6_addr)))
 			return -1;
 		break;
 	case ZEBRA_SEG6_LOCAL_ACTION_END_DX4:
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UDX4 : FPM_SRV6_LOCALSID_ACTION_END_DX4;
-		if (!nl_attr_put32(&req->n, datalen, 
+		if (!nl_attr_put32(&req->n, datalen,
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen, 
+		if (!nl_attr_put(&req->n, datalen,
 					FPM_SRV6_LOCALSID_NH4, &seg6local_ctx->nh4,
 					sizeof(struct in_addr)))
 			return -1;
@@ -1216,11 +1216,11 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 			return false;
 
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UDT6 : FPM_SRV6_LOCALSID_ACTION_END_DT6;
-		if (!nl_attr_put32(&req->n, datalen, 
+		if (!nl_attr_put32(&req->n, datalen,
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen, 
+		if (!nl_attr_put(&req->n, datalen,
 					FPM_SRV6_LOCALSID_VRFNAME,
 					zvrf->vrf->name,
 					strlen(zvrf->vrf->name) + 1))
@@ -1232,11 +1232,11 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 			return false;
 
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UDT4 : FPM_SRV6_LOCALSID_ACTION_END_DT4;
-		if (!nl_attr_put32(&req->n, datalen, 
+		if (!nl_attr_put32(&req->n, datalen,
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen, 
+		if (!nl_attr_put(&req->n, datalen,
 					FPM_SRV6_LOCALSID_VRFNAME,
 					zvrf->vrf->name,
 					strlen(zvrf->vrf->name) + 1))
@@ -1248,11 +1248,11 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 			return false;
 
 		action = (locator && CHECK_FLAG(locator->flags, SRV6_LOCATOR_USID)) ? FPM_SRV6_LOCALSID_ACTION_UDT46 : FPM_SRV6_LOCALSID_ACTION_END_DT46;
-		if (!nl_attr_put32(&req->n, datalen, 
+		if (!nl_attr_put32(&req->n, datalen,
 					FPM_SRV6_LOCALSID_ACTION,
 					action))
 			return -1;
-		if (!nl_attr_put(&req->n, datalen, 
+		if (!nl_attr_put(&req->n, datalen,
 					FPM_SRV6_LOCALSID_VRFNAME,
 					zvrf->vrf->name,
 					strlen(zvrf->vrf->name) + 1))
@@ -2195,7 +2195,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		|| op == DPLANE_OP_PIC_CONTEXT_DELETE || op == DPLANE_OP_PIC_CONTEXT_INSTALL
 		|| op == DPLANE_OP_PIC_CONTEXT_UPDATE))
 			return 0;
- 
+
 	/*
 	 * Ignore route from default table, because when mgmt port goes down,
 	 * zebra will remove the default route and causing ASIC to blackhole IO.
@@ -2879,7 +2879,7 @@ static void fpm_process_queue(struct event *t)
 		event_add_timer(fnc->fthread->master, fpm_process_wedged, fnc,
 				DPLANE_FPM_NL_WEDGIE_TIME, &fnc->t_wedged);
 	} else
-		EVENT_OFF(fnc->t_wedged);
+		event_cancel(&fnc->t_wedged);
 
 	/*
 	 * Let the dataplane thread know if there are items in the
@@ -2991,16 +2991,16 @@ static int fpm_nl_finish_early(struct fpm_nl_ctx *fnc)
 		return 0;
 
 	/* Disable all events and close socket. */
-	EVENT_OFF(fnc->t_lspreset);
-	EVENT_OFF(fnc->t_lspwalk);
-	EVENT_OFF(fnc->t_nhgreset);
-	EVENT_OFF(fnc->t_nhgwalk);
-	EVENT_OFF(fnc->t_ribreset);
-	EVENT_OFF(fnc->t_ribwalk);
-	EVENT_OFF(fnc->t_rmacreset);
-	EVENT_OFF(fnc->t_rmacwalk);
-	EVENT_OFF(fnc->t_event);
-	EVENT_OFF(fnc->t_nhg);
+	event_cancel(&fnc->t_lspreset);
+	event_cancel(&fnc->t_lspwalk);
+	event_cancel(&fnc->t_nhgreset);
+	event_cancel(&fnc->t_nhgwalk);
+	event_cancel(&fnc->t_ribreset);
+	event_cancel(&fnc->t_ribwalk);
+	event_cancel(&fnc->t_rmacreset);
+	event_cancel(&fnc->t_rmacwalk);
+	event_cancel(&fnc->t_event);
+	event_cancel(&fnc->t_nhg);
 	event_cancel_async(fnc->fthread->master, &fnc->t_read, NULL);
 	event_cancel_async(fnc->fthread->master, &fnc->t_write, NULL);
 	event_cancel_async(fnc->fthread->master, &fnc->t_connect, NULL);
