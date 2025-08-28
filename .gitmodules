@@ -11,7 +11,7 @@
 [submodule "sonic-swss"]
 	path = src/sonic-swss
 	url = https://github.com/eddieruan-alibaba/sonic-swss.git
-	branch = rib_fib
+	branch = phoenixwing_08192025
 [submodule "src/p4c-bm/p4c-bm"]
 	path = platform/p4/p4c-bm/p4c-bm
 	url = https://github.com/krambn/p4c-bm
@@ -48,7 +48,7 @@
 [submodule "src/sonic-frr/frr"]
 	path = src/sonic-frr/frr
 	url = https://github.com/eddieruan-alibaba/sonic-frr.git
-	branch = rib_fib
+	branch = phoenixwing_08192025
 [submodule "platform/p4/p4-hlir/p4-hlir-v1.1"]
 	path = platform/p4/p4-hlir/p4-hlir-v1.1
 	url = https://github.com/p4lang/p4-hlir.git
