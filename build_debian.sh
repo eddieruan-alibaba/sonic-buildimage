@@ -518,7 +518,6 @@ set /files/etc/sysctl.conf/kernel.panic 10
 set /files/etc/sysctl.conf/kernel.hung_task_timeout_secs 300
 set /files/etc/sysctl.conf/vm.panic_on_oom 2
 set /files/etc/sysctl.conf/fs.suid_dumpable 2
-set /files/etc/sysctl.conf/net.vrf.strict_mode 1
 " -r $FILESYSTEM_ROOT
 
 sysctl_net_cmd_string=""
