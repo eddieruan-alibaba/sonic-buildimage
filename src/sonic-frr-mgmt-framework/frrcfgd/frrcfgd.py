@@ -2718,15 +2718,11 @@ class BGPConfigDaemon:
                 else:
                     self.__delete_vrf_asn(vrf, table, data)
             elif table == 'SRV6_MY_LOCATORS':
-                if key is None:
-                    syslog.syslog(syslog.LOG_ERR, 'invalid key for SRV6_MY_LOCATORS table')
-                    continue
                 if not del_table:
                     key = prefix
-                    prefix = data['prefix']
                     cmd =  "vtysh -c 'configure terminal' -c 'segment-routing' -c 'srv6' -c 'locators' "
                     cmd += " -c 'locator {}' ".format(key)
-                    cmd += " -c 'prefix {} block-len {} node-len {} func-bits {}' ".format(prefix.data, data['block_len'].data, data['node_len'].data, data['func_len'].data)
+                    cmd += " -c 'prefix {} block-len {} node-len {} func-bits {}' ".format(data['prefix'].data, data['block_len'].data, data['node_len'].data, data['func_len'].data)
                     if not self.__run_command(table, cmd):
                         syslog.syslog(syslog.LOG_ERR, 'failed running SRV6 POLICY config command')
                         continue
