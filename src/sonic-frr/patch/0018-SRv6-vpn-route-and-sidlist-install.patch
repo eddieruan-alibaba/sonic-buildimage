@@ -68,6 +68,18 @@ diff --git a/zebra/zebra_dplane.h b/zebra/zebra_dplane.h
 index cabc70c23..4862f94e6 100644
 --- a/zebra/zebra_dplane.h
 +++ b/zebra/zebra_dplane.h
+@@ -125,6 +125,16 @@ enum dplane_op_e {
+	DPLANE_OP_PIC_NH_UPDATE,
+	DPLANE_OP_PIC_NH_DELETE,
++
++	/* sid list update */
++	DPLANE_OP_SID_LIST_INSTALL,
++	DPLANE_OP_SID_LIST_UPDATE,
++	DPLANE_OP_SID_LIST_DELETE,
++
+ 	/* LSP update */
+ 	DPLANE_OP_LSP_INSTALL,
+ 	DPLANE_OP_LSP_UPDATE,
 @@ -594,6 +604,9 @@ const struct nexthop_group *dplane_ctx_get_ng(
  const struct nexthop_group *dplane_ctx_get_old_ng(
  	const struct zebra_dplane_ctx *ctx);
