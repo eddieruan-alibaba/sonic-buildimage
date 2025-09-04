@@ -55,12 +55,7 @@ index 92b571c68..8a3f99ffa 100644
 +	return &(ctx->u.sidlist);
 +}
 +
-+uint32_t dplane_ctx_get_pic_nhe_id(const struct zebra_dplane_ctx *ctx)
-+{
-+	DPLANE_CTX_VALID(ctx);
-+	return ctx->u.rinfo.nhe.pic_nhe_id;
-+}
-+
+
  /* Accessors for nexthop information */
  uint32_t dplane_ctx_get_nhe_id(const struct zebra_dplane_ctx *ctx)
  {
