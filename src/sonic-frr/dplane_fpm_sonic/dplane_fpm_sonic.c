@@ -1353,9 +1353,13 @@ static ssize_t netlink_vpn_route_msg_encode(int cmd,
 
 	if (IS_ZEBRA_DEBUG_FPM)
 		zlog_debug(
-			"%s: %s %pFX vrf %u(%u)", __func__,
+			"%s: %s %pFX vrf %u(%u), pic %u nhgid %u", __func__,
 			nl_msg_type_to_str(cmd), p, dplane_ctx_get_vrf(ctx),
-			table_id);
+			table_id, pic_id, nhg_id);
+	zlog_err(
+			"%s: %s %pFX vrf %u(%u), pic %u nhgid %u", __func__,
+			nl_msg_type_to_str(cmd), p, dplane_ctx_get_vrf(ctx),
+			table_id, pic_id, nhg_id);
 
 	if (!nl_attr_put16(&req->n, datalen, RTA_ENCAP_TYPE,
 				FPM_ROUTE_ENCAP_SRV6))
@@ -1999,6 +2003,9 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 	struct nlsock *nl =
 		kernel_netlink_nlsock_lookup(dplane_ctx_get_ns_sock(ctx));
 
+	zlog_err("%s: cmd %u id %u, buflen %u, grp_count %u",
+				 __func__, cmd, id , buflen,
+				dplane_ctx_get_nhe_nh_grp_count(ctx));
 	if (!id) {
 		zlog_err(
 			"Failed trying to update a nexthop group in the kernel that does not have an ID");
@@ -2151,6 +2158,7 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 			}
 
 			if (nh->nh_srv6) {
+				zlog_err("%s:  in nh_srv6", __func__);
 				if (nh->nh_srv6->seg6local_action !=
 				    ZEBRA_SEG6_LOCAL_ACTION_UNSPEC) {
 					uint16_t encap;
@@ -2170,6 +2178,9 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 						NHA_ENCAP | NLA_F_NESTED);
 					if (!nest)
 						return 0;
+
+					zlog_err("%s:  in nh_srv6, action %d",
+						__func__, nh->nh_srv6->seg6local_action);
 
 					switch (nh->nh_srv6->seg6local_action) {
 					case ZEBRA_SEG6_LOCAL_ACTION_END:
@@ -2315,12 +2326,16 @@ nexthop_done:
 					   __func__, id, nh, nh->ifindex,
 					   vrf_id_to_name(nh->vrf_id),
 					   nh->vrf_id, label_buf);
+			zlog_err("%s: ID (%u): %pNHv(%d) vrf %s(%u) %s ",
+					   __func__, id, nh, nh->ifindex,
+					   vrf_id_to_name(nh->vrf_id),
+					   nh->vrf_id, label_buf);
 		}
 
 		req->nhm.nh_protocol = zebra2proto(type);
 
 	} else if (cmd != RTM_DELPICCONTEXT) {
-		zlog_debug(
+		zlog_err(
 			"Nexthop group kernel update command (%d) does not exist",
 			cmd);
 		return -1;
@@ -2328,6 +2343,8 @@ nexthop_done:
 
 	if (IS_ZEBRA_DEBUG_KERNEL)
 		zlog_debug("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd),
+			   id);
+	zlog_err("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd),
 			   id);
 
 	return NLMSG_ALIGN(req->n.nlmsg_len);
