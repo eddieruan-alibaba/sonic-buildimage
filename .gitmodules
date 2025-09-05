@@ -11,7 +11,7 @@
 [submodule "sonic-swss"]
 	path = src/sonic-swss
 	url = https://github.com/eddieruan-alibaba/sonic-swss.git
-	branch = phoenixwing_08192025
+	branch = eruan-0819fix
 [submodule "src/p4c-bm/p4c-bm"]
 	path = platform/p4/p4c-bm/p4c-bm
 	url = https://github.com/krambn/p4c-bm

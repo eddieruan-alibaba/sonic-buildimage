@@ -1778,6 +1778,10 @@ ssize_t netlink_nexthop_msg_encode_sonic(uint16_t cmd,
 	struct nlsock *nl =
 		kernel_netlink_nlsock_lookup(dplane_ctx_get_ns_sock(ctx));
 
+	zlog_err("%s: cmd %u id %u, buflen %u, grp_count %u",
+				 __func__, cmd, id , buflen,
+				dplane_ctx_get_nhe_nh_grp_count(ctx));
+
 	if (!id) {
 		zlog_err("Failed trying to update a nexthop group in the kernel that does not have an ID");
 		return -1;
