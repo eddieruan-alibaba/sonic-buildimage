@@ -1885,11 +1885,12 @@ ssize_t netlink_nexthop_msg_encode_sonic(uint16_t cmd,
 				nest = nl_attr_nest(&req->n, buflen, NHA_ENCAP);
 				if (!nest)
 					return 0;
-
+#ifdef HAVE_DVNI
 				if (_netlink_nexthop_encode_dvni_label(
 					    nh, &req->n, out_lse, buflen,
 					    label_buf) == false)
 					return 0;
+#endif
 
 				nl_attr_nest_end(&req->n, nest);
 
