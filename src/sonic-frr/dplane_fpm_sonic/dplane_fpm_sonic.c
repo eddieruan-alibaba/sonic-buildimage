@@ -2302,24 +2302,31 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 					ssize_t tun_len;
 					struct rtattr *nest;
 
+					zlog_err("%s:  in nh_srv6 copy seg6_segs buflen %u", __func__, buflen);
+
 					if (!nl_attr_put16(&req->n, buflen,
 					    NHA_ENCAP_TYPE,
 					    LWTUNNEL_ENCAP_SEG6))
 						return 0;
+					zlog_err("%s:  in nh_srv6 copy seg6_segs 2", __func__);
 					nest = nl_attr_nest(&req->n, buflen,
 					    NHA_ENCAP | NLA_F_NESTED);
 					if (!nest)
 						return 0;
+					zlog_err("%s:  in nh_srv6 copy seg6_segs 3", __func__);
 					tun_len = fill_seg6ipt_encap_private(tun_buf,
 					    sizeof(tun_buf),
 					    nh->nh_srv6->seg6_segs, NULL);
 					if (tun_len < 0)
 						return 0;
+					zlog_err("%s:  in nh_srv6 copy seg6_segs 4, tun_len %u", __func__, tun_len);
 					if (!nl_attr_put(&req->n, buflen,
 							 SEG6_IPTUNNEL_SRH,
 							 tun_buf, tun_len))
 						return 0;
 					nl_attr_nest_end(&req->n, nest);
+
+					zlog_err("%s:  End of in nh_srv6 copy seg6_segs", __func__);
 				}
 			}
 
