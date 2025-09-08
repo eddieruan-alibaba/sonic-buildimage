@@ -1712,6 +1712,7 @@ static ssize_t fill_seg6ipt_encap_private(char *buffer, size_t buflen,
 	int i;
 	struct zebra_srv6 *srv6 = zebra_srv6_get_default();
 
+	zlog_err("%s: buf_len %u", __func__, buflen);
 	if (segs->num_segs > SRV6_MAX_SEGS) {
 		/* Exceeding maximum supported SIDs */
 		zlog_err("%s: Exceeding maximum supported SIDs", __func__);
@@ -1724,6 +1725,7 @@ static ssize_t fill_seg6ipt_encap_private(char *buffer, size_t buflen,
 		zlog_err("%s: Buffer too small", __func__);
 		return -1;
 
+	zlog_err("%s: 2 buf_len %u", __func__, buflen);
 	memset(buffer, 0, buflen);
 
 	ipt = (struct seg6_iptunnel_encap_pri *)buffer;
@@ -2317,9 +2319,11 @@ static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
 					tun_len = fill_seg6ipt_encap_private(tun_buf,
 					    sizeof(tun_buf),
 					    nh->nh_srv6->seg6_segs, NULL);
+
+					zlog_err("%s:  in nh_srv6 copy seg6_segs 4, tun_len %u", __func__, tun_len);
 					if (tun_len < 0)
 						return 0;
-					zlog_err("%s:  in nh_srv6 copy seg6_segs 4, tun_len %u", __func__, tun_len);
+					zlog_err("%s:  in nh_srv6 copy seg6_segs 5, tun_len %u", __func__, tun_len);
 					if (!nl_attr_put(&req->n, buflen,
 							 SEG6_IPTUNNEL_SRH,
 							 tun_buf, tun_len))
