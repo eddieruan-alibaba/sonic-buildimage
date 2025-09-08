@@ -1712,7 +1712,7 @@ static ssize_t fill_seg6ipt_encap_private(char *buffer, size_t buflen,
 	int i;
 	struct zebra_srv6 *srv6 = zebra_srv6_get_default();
 
-	zlog_err("%s: buf_len %u", __func__, buflen);
+	zlog_err("%s: buf_len %u segs->num_segs %d", __func__, buflen, segs->num_segs);
 	if (segs->num_segs > SRV6_MAX_SEGS) {
 		/* Exceeding maximum supported SIDs */
 		zlog_err("%s: Exceeding maximum supported SIDs", __func__);
@@ -1720,10 +1720,12 @@ static ssize_t fill_seg6ipt_encap_private(char *buffer, size_t buflen,
 	}
 
 	srhlen = SRH_BASE_HEADER_LENGTH + SRH_SEGMENT_LENGTH * segs->num_segs;
+	zlog_err("%s: srhlen %u segs->num_segs %d", __func__, srhlen, segs->num_segs);
 
-	if (buflen < (sizeof(struct seg6_iptunnel_encap_pri) + srhlen))
+	if (buflen < (sizeof(struct seg6_iptunnel_encap_pri) + srhlen)) {
 		zlog_err("%s: Buffer too small", __func__);
 		return -1;
+	}
 
 	zlog_err("%s: 2 buf_len %u", __func__, buflen);
 	memset(buffer, 0, buflen);
