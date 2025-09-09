@@ -86,6 +86,9 @@
  */
 #define DPLANE_FPM_NL_WEDGIE_TIME 15
 
+/* Limit nexthop group recursion levels less than 10 */
+#define MAX_NHG_RECURSION 10
+
 /**
  * Custom Netlink TLVs
 */
@@ -100,6 +103,8 @@ enum custom_nlmsg_types {
 	RTM_DELSRV6VPNROUTE		= 3001,
 	RTM_NEWSIDLIST			= 4000,
 	RTM_DELSIDLIST			= 4001,
+	RTM_NEWNEXTHOPFULL		= 5000,
+	RTM_DELNEXTHOPFULL		= 5001,
 };
 
 /* Custom Netlink attribute types */
@@ -164,6 +169,22 @@ enum custom_rtattr_srv6_localsid_action {
 	FPM_SRV6_LOCALSID_ACTION_UDT6				= 19,
 	FPM_SRV6_LOCALSID_ACTION_UDT4				= 20,
 	FPM_SRV6_LOCALSID_ACTION_UDT46				= 21,
+};
+
+enum custom_rtattr_nexthop {
+	NHA_TYPE					= 1000,
+	NHA_VRF_ID					= 1001,
+	NHA_LABEL_TYPE				= 1002,
+	NHA_SRC						= 1003,
+	NHA_RMAP_SRC				= 1004,
+	NHA_WEIGHT					= 1005,
+	NHA_SRV6_CTX				= 1006,
+	NHA_SRV6_ENCAP_BEHAVIOR		= 1007,
+	NHA_SRV6_NUM_SEGS			= 1008,
+	NHA_SRV6_SEGS				= 1009,
+	NHA_GROUP_DEPENDS			= 1010;
+	NHA_GROUP_DEPENDENTS		= 1011;
+	NHA_GROUP_HASH_KEY			= 1012;
 };
 
 static const char *prov_name = "dplane_fpm_sonic";
@@ -2167,6 +2188,381 @@ static ssize_t netlink_sidlist_msg_encode(int cmd,
 	return NLMSG_ALIGN(req->n.nlmsg_len);
 }
 
+/**
+ * To encode depends' ids of a group which contains
+ * more than one nexthop.
+ *
+ * In order to encode full relations between the nhg
+ * and its nexthops, we encode the id array
+ * built from all depends, including the recursive ones.
+ */
+static bool _netlink_nexthop_build_group_full(struct nlmsghdr *n, size_t req_size, uint32_t id,
+						 const struct nh_grp_full *z_grp_full_depends, const uint32_t count_depends,
+						 const struct nh_grp_full *z_grp_full_dependents, const uint32_t count_dependents,
+						 bool resilient, const struct nhg_resilience *nhgr)
+{
+	struct nh_grp_full grp_full_depends[count_depends];
+	struct nh_grp_full grp_full_dependents[count_dependents];
+	/* Need space for max group size, "/", and null term */
+	char buf_depends[(MULTIPATH_NUM * MAX_NHG_RECURSION) * (ID_LENGTH + 1) + 1];
+	char buf_dependents[(MULTIPATH_NUM * MAX_NHG_RECURSION) * (ID_LENGTH + 1) + 1];
+	char buf1_depends[ID_LENGTH + 2];
+	char buf1_dependents[ID_LENGTH + 2];
+
+	buf_depends[0] = '\0';
+	buf_dependents[0] = '\0';
+
+	memset(grp_full_depends, 0, sizeof(grp_full_depends));
+	memset(grp_full_dependents, 0, sizeof(grp_full_dependents));
+
+	if (count_depends || count_dependents) {
+		/* Put in depends id array */
+		for (int i = 0; i < count_depends; i++) {
+			grp_full_depends[i].id = z_grp_full_depends[i].id;
+			grp_full_depends[i].weight = z_grp_full_depends[i].weight;
+			grp_full_depends[i].num_direct = z_grp_full_depends[i].num_direct;
+
+			if (IS_ZEBRA_DEBUG_DETAIL) {
+				if (grp_full_depends[i].num_direct != 0)
+					snprintf(buf_depends, sizeof(buf_depends), "group %u (num_direct(depends): %u)",
+						 grp_full_depends[i].id, grp_full_depends[i].num_direct);
+				else {
+					snprintf(buf1_depends, sizeof(buf1_depends), "/%u",
+						 grp_full_depends[i].id);
+					strlcat(buf_depends, buf1_depends, sizeof(buf_depends));
+				}
+			}
+		}
+
+		/* Put in dependents id array */
+		for (int i=0; i < count_dependents; i++) {
+			grp_full_dependents[i].id = z_grp_full_dependents[i].id;
+			grp_full_dependents[i].weight = z_grp_full_dependents[i].weight;
+			grp_full_dependents[i].num_direct = z_grp_full_dependents[i].num_direct;
+
+			if (IS_ZEBRA_DEBUG_DETAIL) {
+				if (grp_full_dependents[i].num_direct != 0)
+					snprintf(buf_dependents, sizeof(buf_dependents), "group %u (num_direct(dependents): %u)",
+						 grp_full_dependents[i].id, grp_full_dependents[i].num_direct);
+				else {
+					snprintf(buf1_dependents, sizeof(buf1_dependents), "/%u",
+						 grp_full_dependents[i].id);
+					strlcat(buf_dependents, buf1_dependents, sizeof(buf_dependents));
+				}
+			}
+		}
+
+		if (!nl_attr_put(n, req_size, NHA_GROUP_DEPENDS, grp_full_depends,
+				 count_depends * sizeof(*grp_full_depends)))
+			return false;
+
+		if (!nl_attr_put(n, req_size, NHA_GROUP_DEPENDENTS, grp_full_dependents,
+				 count_dependents * sizeof(*grp_full_dependents)))
+			return false;
+
+		if (resilient) {
+			struct rtattr *nest;
+
+			nest = nl_attr_nest(n, req_size, NHA_RES_GROUP);
+
+			nl_attr_put16(n, req_size, NHA_RES_GROUP_BUCKETS,
+				      nhgr->buckets);
+			nl_attr_put32(n, req_size, NHA_RES_GROUP_IDLE_TIMER,
+				      nhgr->idle_timer * 1000);
+			nl_attr_put32(n, req_size,
+				      NHA_RES_GROUP_UNBALANCED_TIMER,
+				      nhgr->unbalanced_timer * 1000);
+			nl_attr_nest_end(n, nest);
+
+			nl_attr_put16(n, req_size, NHA_GROUP_TYPE,
+				      NEXTHOP_GRP_TYPE_RES);
+		}
+	}
+
+	if (IS_ZEBRA_DEBUG_KERNEL)
+		zlog_debug("%s: ID (%u): %s", __func__, id, buf);
+
+	return true;
+}
+
+
+
+/**
+ * Next hop (group) packet with full info encoding helper function.
+ *
+ * \param[in] cmd netlink command
+ * \param[in] ctx dataplane context (information snapshot).
+ * \param[out] buf buffer to hold the packet.
+ * \param[in] buflen amount of buffer bytes
+ * \param[in] fpm whether for fpm
+ *
+ * \returns -1 on failure, 0 when the msg doesn't fit entirely in the buffer
+ * otherwise the number of bytes written to buf.
+ */
+static ssize_t netlink_nhg_full_msg_encode(uint16_t cmd,
+					   const struct zebra_dplane_ctx *ctx,
+					   void *buf, size_t buflen, bool fpm)
+{
+	struct {
+		struct nlmsghdr n;
+		struct nhmsg nhm;
+		char buf[];
+	} *req = buf;
+
+	/*
+	 * Currently we are not considering the labels and backup info,
+	 * let's add later.
+	 */
+	uint32_t id = dplane_ctx_get_nhe_id(ctx);
+	int type = dplane_ctx_get_nhe_type(ctx);
+	struct rtattr *nest;
+	struct seg6local_context seg6local_ctx;
+	uint16_t encap;
+	struct nlsock *nl =
+		kernel_netlink_nlsock_lookup(dplane_ctx_get_ns_sock(ctx));
+
+	if (!id) {
+		flog_err(
+			EC_ZEBRA_NHG_FIB_UPDATE,
+			"Failed trying to update a nexthop group in the kernel does not have an ID");
+		return -1;
+	}
+
+	/*
+	 * Nothing to do if the kernel doesn't support nexthop objects or 
+	 * we dont want to install this type of NHG, but FPM may possible to
+	 * handle this.
+	 */
+	if (!fpm && !kernel_nexthops_supported()) {
+		if (IS_ZEBRA_DEBUG_KERNEL || IS_ZEBRA_DEBUG_NHG)
+			zlog_debug(
+				"%s: nhg_id %u (%s): kernel nexthops not supported, ignoring",
+				__func__, id, zebra_route_string(type));
+		return 0;
+	}
+
+	if (proto_nexthops_only() && !is_proto_nhg(id, type)) {
+		if (IS_ZEBRA_DEBUG_KERNEL || is_ZEBRA_DEBUG_NHG)
+			zlog_debug(
+				"%s: nhg_id %u (%s): proto-based nexthops only, ignoring",
+				__func__, id, zebra_route_string(type));
+		return 0;
+	}
+
+	if (buflen < sizeof(*req))
+		return 0;
+
+	memset(req, 0, sizeof(*req));
+
+	req->n.nlmsg_len = NLMSG_LENGTH(sizeof(struct nhmsg));
+	req->n.nlmsg_flags = NLM_F_CREATE | NLM_F_REQUEST;
+
+	if (cmd == RTM_NEWNEXTHOPFULL)
+		req->n.nlmsg_flags |= NLM_F_REPLACE;
+
+	req->n.nlmsg_type = cmd;
+	req->n.nlmsg_pid = nl->snl.nl_pid;
+
+	req->nhm.nh_family = AF_UNSPEC;
+
+	if (!nl_attr_put32(&req->n, buflen, NHA_ID, id))
+		return 0;
+
+	if (cmd == RTM_NEWNEXTHOPFULL) {
+		/*
+		 * We distinguish between a "group", which is a collection
+		 * of ids, and a singlton nexthop with an id. The
+		 * group is installed as an id that just refers to a list of
+		 * other ids.
+		 * The ids of a group contain every nexthop too with its
+		 * resolved list.
+		 */
+		if (dplane_ctx_get_nhe_nh_grp_count(ctx)) {
+			const struct nexthop_group *nhg;
+			const struct nhg_resilience *nhgr;
+
+			nhg = dplane_ctx_get_nhe_ng(ctx);
+			nhgr = &nhg->nhgr;
+
+			/* encode hash value of nhg */
+			/* Currently we just use the no_recurse one and we can change later */
+			uint32_t key = nexthop_group_hash_no_recurse(nhg);
+			if (!nl_attr_put32(&req->n, buflen, NHA_GROUP_HASH_KEY, key))
+				return 0;
+
+			/* encode depends and dependents compressed nhg array */
+			if (!_netlink_nexthop_build_group_full(
+				    &req->n, buflen, id,
+				    dplane_ctx_get_nhe_nh_grp_full(ctx),
+				    dplane_ctx_get_nhe_nh_grp_count_full(ctx),
+				    !!nhgr->buckets, nhgr))
+				return 0;
+		} else {
+			/* When nhg's nexthop is a singleton, encode nexthop info */
+			const struct nexthop *nh =
+				dplane_ctx_get_nhe_ng(ctx)->nexthop;
+			afi_t afi = dplane_ctx_get_nhe_afi(ctx);
+
+			/* set nhm's family */
+			if (afi == AFI_IP)
+				req->nhm.nh_family = AF_INET;
+			else if (afi == AFI_IP6)
+				req->nhm.nh_family = AF_INET6;
+
+			/* encode hash value of this singleton */
+			uint32_t key = nexthop_hash(nh);
+			if (!nl_attr_put32(&req->n, buflen, NHA_GROUP_HASH_KEY, key))
+				return 0;
+
+			/* encode nexthop type */
+			if (!nl_attr_put32(&req->n, buflen, NHA_TYPE,
+					   nh->type))
+				return 0;
+
+			/* encode nexthop vrf id */
+			if (!nl_attr_put32(&req->n, buflen, NHA_VRF_ID,
+					   nh->vrf_id))
+				return 0;
+
+			/* encode nexthop interface info */
+			if (!nh->ifindex) {
+				flog_err(
+					EC_ZEBRA_NHG_FIB_UPDATE,
+					"Context received for kernel nexthop update without an interface");
+				return -1;
+			}
+
+			if (!nl_attr_put32(&req->n, buflen, NHA_OIF,
+					   nh->ifindex))
+				return 0;
+
+			/* encode nexthop label type */
+			if (!nl_attr_put32(&req->n, buflen, NHA_LABEL_TYPE,
+					   nh->nh_label_type))
+				return 0;
+
+			/* encode nexthop gateway info */
+			switch (nh->type) {
+				case NEXTHOP_TYPE_IPV4:
+				case NEXTHOP_TYPE_IPV4_IFINDEX:
+					if (!nl_attr_put(&req->n, buflen, NHA_GATEWAY,
+							 &nh->gate.ipv4,
+							 IPV4_MAX_BYTELEN))
+						return 0;
+					break;
+				case NEXTHOP_TYPE_IPV6:
+				case NEXTHOP_TYPE_IPV6_IFINDEX:
+					if (!nl_attr_put(&req->n, buflen, NHA_GATEWAY,
+							 &nh->gate.ipv6,
+							 IPV6_MAX_BYTELEN))
+						return 0;
+					break;
+				case NEXTHOP_TYPE_BLACKHOLE:
+					if (!nl_attr_put(&req->n, buflen, NHA_BLACKHOLE,
+							 NULL, 0))
+						return 0;
+					/* Blackhole shouldn't have anymore attribuites
+					 */
+					goto nexthop_done;
+				case NEXTHOP_TYPE_IFINDEX:
+					/* Don't need anymore info for this */
+					break;
+			}
+
+			/* encode nexthop src and rmap_src info */
+			if (afi == AFI_IP) {
+				if (!nl_attr_put(&req->n, buflen, NHA_SRC,
+						 &nh->src.ipv4, IPV4_MAX_BYTELEN))
+					return 0;
+				if (!nl_attr_put(&req->n, buflen, NHA_RMAP_SRC,
+						 &nh->rmap_src.ipv4, IPV4_MAX_BYTELEN))
+					return 0;
+			} else if (afi == AFI_IP6) {
+				if (!nl_attr_put(&req->n, buflen, NHA_SRC,
+						 &nh->src.ipv6, IPV6_MAX_BYTELEN))
+					return 0;
+				if (!nl_attr_put(&req->n, buflen, NHA_RMAP_SRC,
+						 &nh->rmap_src.ipv6, IPV6_MAX_BYTELEN))
+					return 0;
+			}
+
+			/* encode nexthop weight */
+			if (!nl_attr_put8(&req->n, buflen, NHA_WEIGHT,
+					 &nh->weight))
+				return 0;
+
+			/* set onlink flag */
+			if (CHECK_FLAG(nh->flags, NEXTHOP_FLAG_ONLINK))
+				req->nhm.nh_flags |= RTNH_F_ONLINK;
+
+			/* encode nexthop srv6 info if exists, as plain attr */
+			if (nh->nh_srv6) {
+				req->nhm.nh_family = AF_INET6;
+				action = nh->nh_srv6->seg6local_action;
+				ctx6 = &nh->nh_srv6->seg6local_ctx;
+
+				/* SRv6 localsid info for Encpoint-behavior */
+				/* encode srv6 action*/
+				if (!nl_attr_put32(&req->n, buflen, SEG6_LOCAL_ACTION,
+						 nh->nh_srv6->seg6local_action))
+					return 0;
+
+				/* encode srv6 context */
+				memset(&seg6local_ctx, 0, sizeof(seg6local_ctx));
+				memcpy(&seg6local_ctx, nh->nh_srv6->seg6local_ctx, sizeof(seg6local_ctx));
+				if (!nl_attr_put(&req->n, buflen, NHA_SRV6_CTX,
+							   &seg6local_ctx, sizeof(seg6local_ctx)))
+					return 0;
+
+				/* Encode SRv6 Headend-behaviour */
+				/* encode srv6 segments if exists */
+				if (nh->nh_srv6->seg6_segs) {
+					/* encode srv6 headend behavior */
+					if (!nl_attr_put32(&req->n, buflen, NHA_SRV6_ENCAP_BEHAVIOR,
+							 nh->nh_srv6->seg6_segs->encap_behavior))
+						return 0;
+
+					/* encode number of srv6 segs */
+					if (!nl_attr_put8(&req->n, buflen, NHA_SRV6_NUM_SEGS,
+							 nh->nh_srv6->seg6_segs->num_segs))
+						return 0;
+
+					/* encode srv6 segs */
+					if (nh->nh_srv6->seg6_segs->num_segs > 0) {
+						size_t segs_len =
+							nh->nh_srv6->seg6_segs->num_segs * sizeof(struct in6_addr);
+						if (!nl_attr_put(&req->n, buflen, NHA_SRV6_SEGS,
+								nh->nh_srv6->seg6_segs->seg, segs_len))
+							return 0;
+					}
+				}
+			}
+
+nexthop_done:
+
+			if (IS_ZEBRA_DEBUG_KERNEL)
+				zlog_debug("%s: ID (%u): %pNHv(%d) vrf %u",
+					   __func__, id, nh, nh->ifindex,
+					   nh->vrf_id);
+		}
+
+		req->nhm.nh_protocol = zebra2proto(type);
+
+	} else if (cmd != RTM_DELNEXTHOPFULL) {
+		flog_err(
+			EC_ZEBRA_NHG_FIB_UPDATE,
+			"Nexthop group kernel update command (%d) does not exist",
+			cmd);
+		return -1;
+	}
+
+	if (IS_ZEBRA_DEBUG_KERNEL)
+		zlog_debug("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd),
+			   id);
+
+	return NLMSG_ALIGN(req->n.nlmsg_len);
+}
+
 #define DPLANE_FPM_NL_BUF_SIZE 65536
 /**
  * Encode data plane operation context into netlink and enqueue it in the FPM
@@ -2297,6 +2693,29 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 						sizeof(nl_buf), true);
 		if (rv <= 0) {
 			zlog_err("%s: netlink_nexthop_msg_encode failed",
+				 __func__);
+			return 0;
+		}
+
+		nl_buf_len = (size_t)rv;
+		break;
+	case DPLANE_OP_FULL_NHG_DELETE:
+		rv = netlink_nhg_full_msg_encode(RTM_DELNEXTHOPFULL, ctx, nl_buf,
+							sizeof(nl_buf), true);
+		if (rv <= 0) {
+			zlog_err("%s: netlink_nhg_full_msg_encode failed",
+				 __func__);
+			return 0;
+		}
+
+		nl_buf_len = (size_t)rv;
+		break;
+	case DPLANE_OP_FULL_NHG_INSTALL:
+	case DPLANE_OP_FULL_NHG_UPDATE:
+		rv = netlink_nhg_full_msg_encode(RTM_NEWNEXTHOPFULL, ctx, nl_buf,
+							sizeof(nl_buf), true);
+		if (rv <= 0) {
+			zlog_err("%s: netlink_nhg_full_msg_encode failed",
 				 __func__);
 			return 0;
 		}
