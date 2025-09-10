@@ -1716,9 +1716,10 @@ static ssize_t fill_seg6ipt_encap_private(char *buffer, size_t buflen,
 
 	srhlen = SRH_BASE_HEADER_LENGTH + SRH_SEGMENT_LENGTH * segs->num_segs;
 
-	if (buflen < (sizeof(struct seg6_iptunnel_encap_pri) + srhlen))
+	if (buflen < (sizeof(struct seg6_iptunnel_encap_pri) + srhlen)) {
 		zlog_err("%s: Buffer too small", __func__);
 		return -1;
+	}
 
 	memset(buffer, 0, buflen);
 
@@ -1885,11 +1886,12 @@ ssize_t netlink_nexthop_msg_encode_sonic(uint16_t cmd,
 				nest = nl_attr_nest(&req->n, buflen, NHA_ENCAP);
 				if (!nest)
 					return 0;
-
+#ifdef HAVE_DVNI
 				if (_netlink_nexthop_encode_dvni_label(
 					    nh, &req->n, out_lse, buflen,
 					    label_buf) == false)
 					return 0;
+#endif
 
 				nl_attr_nest_end(&req->n, nest);
 
@@ -2413,8 +2415,8 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 	if ((!fnc->use_nhg)
 	    && (op == DPLANE_OP_NH_DELETE || op == DPLANE_OP_NH_INSTALL
 		|| op == DPLANE_OP_NH_UPDATE
-		|| op == DPLANE_OP_PIC_CONTEXT_DELETE || op == DPLANE_OP_PIC_CONTEXT_INSTALL
-		|| op == DPLANE_OP_PIC_CONTEXT_UPDATE))
+		|| op == DPLANE_OP_PIC_NH_DELETE || op == DPLANE_OP_PIC_NH_INSTALL
+		|| op == DPLANE_OP_PIC_NH_UPDATE))
 			return 0;
 
 	/*
@@ -2548,7 +2550,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		nl_buf_len += (size_t)rv;
 		break;
 
-	case DPLANE_OP_PIC_CONTEXT_DELETE:
+	case DPLANE_OP_PIC_NH_DELETE:
 		rv = netlink_pic_context_msg_encode(RTM_DELNEXTHOP, ctx, nl_buf,
 						sizeof(nl_buf));
 		if (rv <= 0) {
@@ -2559,8 +2561,8 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 
 		nl_buf_len = (size_t)rv;
 		break;
-	case DPLANE_OP_PIC_CONTEXT_INSTALL:
-	case DPLANE_OP_PIC_CONTEXT_UPDATE:
+	case DPLANE_OP_PIC_NH_INSTALL:
+	case DPLANE_OP_PIC_NH_UPDATE:
 		rv = netlink_pic_context_msg_encode(RTM_NEWNEXTHOP, ctx, nl_buf,
 						sizeof(nl_buf));
 		if (rv <= 0) {

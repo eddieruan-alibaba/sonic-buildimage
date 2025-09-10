@@ -328,6 +328,7 @@ sudo LANG=C DEBIAN_FRONTEND=noninteractive chroot $FILESYSTEM_ROOT apt-get -y in
     isc-dhcp-client         \
     sudo                    \
     vim                     \
+    gdb                     \
     tcpdump                 \
     dbus                    \
     openssh-server          \
