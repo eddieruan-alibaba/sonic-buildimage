@@ -327,6 +327,7 @@ sudo LANG=C DEBIAN_FRONTEND=noninteractive chroot $FILESYSTEM_ROOT apt-get -y in
     bridge-utils            \
     isc-dhcp-client         \
     sudo                    \
+    gdb                     \
     vim                     \
     tcpdump                 \
     dbus                    \
