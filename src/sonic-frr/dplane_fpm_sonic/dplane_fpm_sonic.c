@@ -182,9 +182,9 @@ enum custom_rtattr_nexthop {
 	NHA_SRV6_ENCAP_BEHAVIOR		= 1007,
 	NHA_SRV6_NUM_SEGS			= 1008,
 	NHA_SRV6_SEGS				= 1009,
-	NHA_GROUP_DEPENDS			= 1010;
-	NHA_GROUP_DEPENDENTS		= 1011;
-	NHA_GROUP_HASH_KEY			= 1012;
+	NHA_GROUP_DEPENDS			= 1010,
+	NHA_GROUP_DEPENDENTS		= 1011,
+	NHA_GROUP_HASH_KEY			= 1012,
 };
 
 static const char *prov_name = "dplane_fpm_sonic";
@@ -2279,8 +2279,11 @@ static bool _netlink_nexthop_build_group_full(struct nlmsghdr *n, size_t req_siz
 		}
 	}
 
-	if (IS_ZEBRA_DEBUG_KERNEL)
-		zlog_debug("%s: ID (%u): %s", __func__, id, buf);
+	if (IS_ZEBRA_DEBUG_KERNEL) {
+		zlog_debug("%s: Depends ID (%u): %s", __func__, id, buf_depends);
+		zlog_debug("%s: Dependents ID (%u): %s", __func__, id, buf_dependents);
+	}
+		
 
 	return true;
 }
@@ -2342,7 +2345,7 @@ static ssize_t netlink_nhg_full_msg_encode(uint16_t cmd,
 	}
 
 	if (proto_nexthops_only() && !is_proto_nhg(id, type)) {
-		if (IS_ZEBRA_DEBUG_KERNEL || is_ZEBRA_DEBUG_NHG)
+		if (IS_ZEBRA_DEBUG_KERNEL || IS_ZEBRA_DEBUG_NHG)
 			zlog_debug(
 				"%s: nhg_id %u (%s): proto-based nexthops only, ignoring",
 				__func__, id, zebra_route_string(type));
@@ -2393,8 +2396,10 @@ static ssize_t netlink_nhg_full_msg_encode(uint16_t cmd,
 			/* encode depends and dependents compressed nhg array */
 			if (!_netlink_nexthop_build_group_full(
 				    &req->n, buflen, id,
-				    dplane_ctx_get_nhe_nh_grp_full(ctx),
-				    dplane_ctx_get_nhe_nh_grp_count_full(ctx),
+				    dplane_ctx_get_nhe_nh_grp_full_depends(ctx),
+				    dplane_ctx_get_nhe_nh_grp_count_full_depends(ctx),
+					dplane_ctx_get_nhe_nh_grp_full_dependents(ctx),
+					dplane_ctx_get_nhe_nh_grp_count_full_dependents(ctx),
 				    !!nhgr->buckets, nhgr))
 				return 0;
 		} else {
@@ -2498,8 +2503,6 @@ static ssize_t netlink_nhg_full_msg_encode(uint16_t cmd,
 			/* encode nexthop srv6 info if exists, as plain attr */
 			if (nh->nh_srv6) {
 				req->nhm.nh_family = AF_INET6;
-				action = nh->nh_srv6->seg6local_action;
-				ctx6 = &nh->nh_srv6->seg6local_ctx;
 
 				/* SRv6 localsid info for Encpoint-behavior */
 				/* encode srv6 action*/
@@ -2509,7 +2512,7 @@ static ssize_t netlink_nhg_full_msg_encode(uint16_t cmd,
 
 				/* encode srv6 context */
 				memset(&seg6local_ctx, 0, sizeof(seg6local_ctx));
-				memcpy(&seg6local_ctx, nh->nh_srv6->seg6local_ctx, sizeof(seg6local_ctx));
+				memcpy(&seg6local_ctx,  &nh->nh_srv6->seg6local_ctx, sizeof(seg6local_ctx));
 				if (!nl_attr_put(&req->n, buflen, NHA_SRV6_CTX,
 							   &seg6local_ctx, sizeof(seg6local_ctx)))
 					return 0;
