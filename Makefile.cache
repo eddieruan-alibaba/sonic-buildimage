@@ -300,7 +300,7 @@ define SAVE_INTO_CACHE
 		1>>$($(1)_DST_PATH)/$(1).log
 	sudo chmod 777 $($(1)_CACHE_DIR)/$(MOD_CACHE_FILE)
 	rm -f $($(1)_DST_PATH)/$(1).cached.log
-	
+
 	echo "File $($(1)_CACHE_DIR)/$(MOD_CACHE_FILE) saved in cache " >> $($(1)_DST_PATH)/$(1).log
 	echo "[ CACHE::SAVED ] $($(1)_CACHE_DIR)/$(MOD_CACHE_FILE)" >> $($(1)_DST_PATH)/$(1).log
 
@@ -722,5 +722,5 @@ cprune:
 
 # Invoke DPKG dependency only if DPKG cache is enabled.
 define dpkg_depend
-	$(if $(filter-out none,$(SONIC_DPKG_CACHE_METHOD)),$(1))
+# $(if $(filter-out none,$(SONIC_DPKG_CACHE_METHOD)),$(1))
 endef
