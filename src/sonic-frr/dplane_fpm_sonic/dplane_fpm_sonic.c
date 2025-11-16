@@ -57,7 +57,7 @@
 #include "zebra/zebra_srv6.h"
 #include "fpm/fpm.h"
 #include "lib/srv6.h"
-#include "common/c-api/nexthopgroup_capi.h"
+#include <swss/c-api/nexthopgroup_capi.h>
 
 #define SOUTHBOUND_DEFAULT_ADDR INADDR_LOOPBACK
 #define SOUTHBOUND_DEFAULT_PORT 2620
