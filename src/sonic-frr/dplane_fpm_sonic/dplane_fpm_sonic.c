@@ -57,6 +57,7 @@
 #include "zebra/zebra_srv6.h"
 #include "fpm/fpm.h"
 #include "lib/srv6.h"
+#include "common/c-api/nexthopgroup_capi.h"
 
 #define SOUTHBOUND_DEFAULT_ADDR INADDR_LOOPBACK
 #define SOUTHBOUND_DEFAULT_PORT 2620
@@ -3141,6 +3142,17 @@ static int fpm_nl_new(struct event_loop *tm)
 	install_element(CONFIG_NODE, &no_fpm_use_nhg_cmd);
 
 	return 0;
+}
+
+void test_nexthopgroup() {
+	NextHopGroupFull *nexthop_obj_ptr  = nexthopgroup_create();
+    char *ret_str = nexthopgroup_to_json(nexthop_obj_ptr);
+
+	if (IS_ZEBRA_DEBUG_DPLANE)
+    	zlog_debug("Convert NextHopGroupFull to string: %s\n", ret_str);
+
+    free(ret_str);
+    nexthopgroup_free(nexthop_obj_ptr);
 }
 
 static int fpm_nl_init(void)
