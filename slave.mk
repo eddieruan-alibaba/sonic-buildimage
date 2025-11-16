@@ -1743,13 +1743,19 @@ jessie : $$(addprefix $(TARGET_PATH)/,$$(JESSIE_DOCKER_IMAGES)) \
 
 .INTERMEDIATE : $(SONIC_INSTALL_DEBS) $(SONIC_INSTALL_WHEELS) $(DOCKER_LOAD_TARGETS) docker-start .platform
 
-# Auto-generate .flags files after .deb is built
-# These act as build-completion markers for dependency resolution
-$(DEBS_PATH)/%.deb.flags: $(DEBS_PATH)/%.deb
+# Placeholder metadata files required by dpkg_depend
+# These must exist before make finishes dependency resolution
+$(DEBS_PATH)/%.deb.flags:
 	@touch $@
 
-# Prevent make from treating .flags as intermediate/temporary files
-.SECONDARY: $(DEBS_PATH)/%.deb.flags
+$(DEBS_PATH)/%.deb.dep.sha:
+	@touch $@
+
+$(DEBS_PATH)/%.deb.smdep.smsha:
+	@touch $@
+
+# Prevent make from deleting these as intermediate files
+.SECONDARY: $(DEBS_PATH)/%.deb.flags $(DEBS_PATH)/%.deb.dep.sha $(DEBS_PATH)/%.deb.smdep.smsha
 
 ## To build some commonly used libs. Some submodules depend on these libs.
 ## It is used in component pipelines. For example: swss needs libnl, libyang
