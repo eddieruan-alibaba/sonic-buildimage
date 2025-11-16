@@ -722,5 +722,4 @@ cprune:
 
 # Invoke DPKG dependency only if DPKG cache is enabled.
 define dpkg_depend
-# $(if $(filter-out none,$(SONIC_DPKG_CACHE_METHOD)),$(1))
 endef
