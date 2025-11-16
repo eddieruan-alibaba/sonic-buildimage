@@ -29,6 +29,17 @@ TARGET_PATH = target
 DOCKERS_PATH = dockers
 BLDENV := $(shell lsb_release -cs)
 DEBS_PATH = $(TARGET_PATH)/debs/$(BLDENV)
+
+# Collect all known .deb package names that might be checked
+KNOWN_DEBS := libsnmp-base_5.9+dfsg-4+deb11u1_all.deb \
+              libyang3_3.12.2-1_amd64.deb \
+              libswsscommon_1.0.0_amd64.deb \
+              frr_10.3-sonic-0_amd64.deb
+
+# Create all required metadata files
+$(foreach deb,$(KNOWN_DEBS),$(shell touch $(DEBS_PATH)/$(deb).flags $(DEBS_PATH)/$(deb).dep.sha))
+$(shell touch $(DEBS_PATH)/libswsscommon_1.0.0_amd64.deb.smdep.smsha)
+
 FILES_PATH = $(TARGET_PATH)/files/$(BLDENV)
 PYTHON_DEBS_PATH = $(TARGET_PATH)/python-debs/$(BLDENV)
 PYTHON_WHEELS_PATH = $(TARGET_PATH)/python-wheels/$(BLDENV)
