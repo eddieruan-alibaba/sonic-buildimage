@@ -13,6 +13,10 @@
 	path = src/sonic-swss
 	url = https://github.com/eddieruan-alibaba/sonic-swss.git
 	branch = rib_fib
+[submodule "sonic-fib"]
+	path = src/sonic-fib
+	url = https://github.com/eddieruan-alibaba/sonic-fib.git
+	branch = main
 [submodule "src/p4c-bm/p4c-bm"]
 	path = platform/p4/p4c-bm/p4c-bm
 	url = https://github.com/krambn/p4c-bm
@@ -145,3 +149,6 @@
 [submodule "platform/marvell-teralynx/mrvl-teralynx"]
 	path = platform/marvell-teralynx/mrvl-teralynx
 	url = https://github.com/Marvell-switching/mrvl-teralynx.git
+[submodule "src/sonic-fib"]
+	path = src/sonic-fib
+	url = https://github.com/eddieruan-alibaba/sonic-fib.git
