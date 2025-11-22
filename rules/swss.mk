@@ -14,8 +14,8 @@ $(SWSS)_RDEPENDS += $(LIBSAIREDIS) $(LIBSAIMETADATA) $(LIBTEAM) \
 SONIC_DPKG_DEBS += $(SWSS)
 
 SWSS_DBG = swss-dbg_1.0.0_$(CONFIGURED_ARCH).deb
-$(SWSS_DBG)_DEPENDS += $(SWSS)
-$(SWSS_DBG)_RDEPENDS += $(SWSS)
+$(SWSS_DBG)_DEPENDS += $(SWSS) $(LIBFIB_DEV)
+$(SWSS_DBG)_RDEPENDS += $(SWSS) $(LIBFIB)
 $(eval $(call add_derived_package,$(SWSS),$(SWSS_DBG)))
 
 # The .c, .cpp, .h & .hpp files under src/{$DBG_SRC_ARCHIVE list}
