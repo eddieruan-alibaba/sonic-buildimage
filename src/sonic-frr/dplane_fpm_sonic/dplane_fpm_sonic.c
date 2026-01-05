@@ -58,6 +58,7 @@
 #include "fpm/fpm.h"
 #include "lib/srv6.h"
 #include <nexthopgroup/c-api/nexthopgroup_capi.h>
+#include <nexthopgroup/c_nexthopgroupfull.h>
 
 #define SOUTHBOUND_DEFAULT_ADDR INADDR_LOOPBACK
 #define SOUTHBOUND_DEFAULT_PORT 2620
@@ -956,6 +957,152 @@ static struct zebra_vrf *vrf_lookup_by_table_id(uint32_t table_id)
 
  	return NULL;
  }
+
+/**
+ * Construct C_NextHopGroupFull Object for nexthop group
+ * with multiple nexthops based on zebra information.
+ *
+ * @param c_nhg pointer of the object we're going to construct
+ * @param ctx pointer of zebra_dplane_ctx, we get zebra information from it
+ */
+static void build_c_nexthopgroupfull_multi(struct C_NextHopGroupFull *c_nhg,
+					   struct zebra_dplane_ctx *ctx)
+{
+	memset(c_nhg, 0, sizeof(struct C_NextHopGroupFull));
+	const struct nexthop_group *nhg;
+
+	/* set id */
+	c_nhg->id = ctx->rinfo.nhe.id;
+
+	/* set hash value */
+	nhg = dplane_ctx_get_nhe_ng(ctx);
+	uint32_t key = nexthop_group_hash_no_recurse(nhg);
+	c_nhg->key = key;
+
+	/* set nh_grp_full_list */
+	for (uint32_t i = 0; i < ctx->rinfo.nhe.nh_grp_full_count; i++) {
+		c_nhg->nh_grp_full_list[i].id = ctx->rinfo.nhe.nh_grp_full_list[i].id;
+		c_nhg->nh_grp_full_list[i].weight = ctx->rinfo.nhe.nh_grp_full_list[i].weight;
+		c_nhg->nh_grp_full_list[i].num_direct = ctx->rinfo.nhe.nh_grp_full_list[i].num_direct;
+	}
+
+	/* set depends list */
+	for (uint32_t i = 0; i < ctx->rinfo.nhe.depends_count; i++) {
+		c_nhg->depends[i] = ctx->rinfo.nhe.depends[i];
+	}
+
+	/* set dependents list */
+	for (uint32_t i = 0; i < ctx->rinfo.nhe.dependents_count; i++) {
+		c_nhg->dependents[i] = ctx->rinfo.nhe.dependents[i];
+	}
+}
+
+/**
+ * Construct C_NextHopGroupFull Object for nexthop group
+ * with singleton based on zebra information.
+ *
+ * @param c_nhg pointer of the object we're going to construct
+ * @param ctx pointer of zebra_dplane_ctx, we get zebra information from it
+ */
+static void build_c_nexthopgroupfull_singleton(struct C_NextHopGroupFull *c_nhg,
+					   struct zebra_dplane_ctx *ctx)
+{
+	memset(c_nhg, 0, sizeof(struct C_NextHopGroupFull));
+	const struct nexthop_group *nhg;
+
+	/* set id */
+	c_nhg->id = ctx->rinfo.nhe.id;
+
+	/* set hash value */
+	nhg = dplane_ctx_get_nhe_ng(ctx);
+	uint32_t key = nexthop_group_hash_no_recurse(nhg);
+	c_nhg->key = key;
+
+	/* set nexthop type */
+	c_nhg->type = nhg->nexthop->type;
+
+	/* set nexthop vrf_id */
+	c_nhg->vrf_id = nhg->nexthop->vrf_id;
+
+	/* set nexthop interface index */
+	c_nhg->ifindex = nhg->nexthop->ifindex;
+
+	/* set nexthop label type, if any */
+	c_nhg->nh_label_type = nhg->nexthop->nh_label_type;
+
+	/* set nexthop bh_type or gateway address based on type */
+	if (c_nhg->type == NEXTHOP_TYPE_BLACKHOLE) {
+		c_nhg->bh_type = nhg->nexthop->bh_type;
+	} else {
+		memcpy(&c_nhg->gate, &nhg->nexthop->gate, sizeof(union g_addr));
+	}
+
+	/* set nexthop src */
+	memcpy(&c_nhg->src, &nhg->nexthop->src, sizeof(union g_addr));
+
+	/* set nexthop rmap src */
+	memcpy(&c_nhg->rmap_src, &nhg->nexthop->rmap_src, sizeof(union g_addr));
+
+	/* set nexthop weight */
+	c_nhg->weight = nhg->nexthop->weight;
+
+	/* set nexthop flags */
+	c_nhg->flags = nhg->nexthop->flags;
+
+	/* set depends list */
+	for (uint32_t i = 0; i < ctx->rinfo.nhe.depends_count; i++) {
+		c_nhg->depends[i] = ctx->rinfo.nhe.depends[i];
+	}
+
+	/* set dependents list */
+	for (uint32_t i = 0; i < ctx->rinfo.nhe.dependents_count; i++) {
+		c_nhg->dependents[i] = ctx->rinfo.nhe.dependents[i];
+	}
+
+	/* set nexthop srv6 information if present */
+	if (nhg->nexthop->nh_srv6 != NULL) {
+		c_nhg->nh_srv6 = (struct nexthop_srv6 *)malloc(sizeof(struct nexthop_srv6));
+		if (c_nhg->nh_srv6) {
+			memcpy(c_nhg->nh_srv6, nhg->nexthop->nh_srv6, sizeof(struct nexthop_srv6));
+			c_nhg->nh_srv6->seg6_segs = NULL;  // clear the pointer to avoid pointing to old address
+
+			/* set nexthop_srv6 seg6_segs if present */
+			if (nhg->nexthop->nh_srv6->seg6_segs != NULL) {
+				size_t total_size = sizeof(struct seg6_seg_stack) +
+							nhg->nexthop->nh_srv6->seg6_segs->num_segs * sizeof(struct in6_addr);
+				c_nhg->nh_srv6->seg6_segs = (struct seg6_seg_stack *)malloc(total_size);
+				if (c_nhg->nh_srv6->seg6_segs) {
+					memcpy(c_nhg->nh_srv6->seg6_segs, nhg->nexthop->nh_srv6->seg6_segs, total_size);
+				}
+			}
+		}
+	}
+}
+
+/**
+ * Free C_NextHopGroupFull Object.
+ *
+ * \param[in] c_nhg pointer of C_NextHopGroupFull Object.
+ */
+static void free_c_nexthopgroupfull(struct C_NextHopGroupFull *c_nhg)
+{
+	if (!c_nhg) {
+		return;
+	}
+
+	/* Free srv6 related memory if present */
+	if (c_nhg->nh_srv6) {
+		/* Free seg6_segs if present */
+		if (c_nhg->nh_srv6->seg6_segs) {
+			free(c_nhg->nh_srv6->seg6_segs);
+			c_nhg->nh_srv6->seg6_segs = NULL;
+		}
+
+		/* Free nh_srv6 itself */
+		free(c_nhg->nh_srv6);
+		c_nhg->nh_srv6 = NULL;
+	}
+}
 
 /**
  * Resets the SRv6 routes FPM flags so we send all SRv6 routes again.
@@ -2112,6 +2259,141 @@ nexthop_done:
 	return NLMSG_ALIGN(req->n.nlmsg_len);
 }
 
+/**
+ * Next hop packet (full message) encoding helper function.
+ * This function is modified from function netlink_nexthop_msg_encode to
+ * encode the nexthopgroupfull JSON string to fpmsyncd.
+ *
+ * \param[in] cmd netlink command.
+ * \param[in] ctx dataplane context (information snapshot).
+ * \param[out] buf buffer to hold the packet.
+ * \param[in] buflen amount of buffer bytes.
+ * \param[in] fpm whether the message is for fpmsyncd.
+ *
+ * \returns -1 on failure, 0 when the msg doesn't fit entirely in the buffer
+ * otherwise the number of bytes written to buf.
+ */
+static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
+					   const struct zebra_dplane_ctx *ctx,
+					   void *buf, size_t buflen, bool fpm)
+{
+	struct {
+		struct nlmsghdr n;
+		struct nhmsg nhm;
+		char buf[];
+	} *req = buf;
+
+	uint32_t id = dplane_ctx_get_nhe_id(ctx);
+	int type = dplane_ctx_get_nhe_type(ctx);
+	struct nlsock *nl =
+        kernel_netlink_nlsock_lookup(dplane_ctx_get_ns_sock(ctx));
+	char* json_str = NULL;
+	ssize_t ret = -1;
+
+	if (!id) {
+		zlog_err(
+			"%s: Failed trying to update a nexthop group in the kernel that does not have an ID",
+			__func__);
+		return -1;
+	}
+
+	/*
+	 * Nothing to do if the kernel doesn't support nexthop objects or
+	 * we dont want to install this type of NHG, but FPM may possible to
+	 * handle this.
+	 */
+	if (!fpm && !kernel_nexthops_supported()) {
+		if (IS_ZEBRA_DEBUG_KERNEL || IS_ZEBRA_DEBUG_NHG)
+			zlog_debug(
+				"%s: nhg_id %u (%s): kernel nexthops not supported, ignoring",
+				__func__, id, zebra_route_string(type));
+		return 0;
+	}
+
+	if (buflen < sizeof(*req))
+		return 0;
+
+	memset(req, 0, sizeof(*req));
+
+	req->n.nlmsg_len = NLMSG_LENGTH(sizeof(struct nhmsg));
+	req->n.nlmsg_flags = NLM_F_CREATE | NLM_F_REQUEST;
+
+	if (cmd == RTM_NEWNEXTHOP)
+		req->n.nlmsg_flags |= NLM_F_REPLACE;
+
+	req->n.nlmsg_type = cmd;
+	req->n.nlmsg_pid = nl->snl.nl_pid;
+
+	req->nhm.nh_family = AF_UNSPEC;
+
+	/* Put the nhe ID */
+	if (!nl_attr_put32(&req->n, buflen, NHA_ID, id))
+		return 0;
+
+	if (cmd == RTM_NEWNEXTHOP) {
+		/* Build C_NextHopGroupFull Object */
+		struct C_NextHopGroupFull c_nhg;
+
+		/*
+		 * We also distinguish between a "group" and a singleton similar
+		 * as what is done in netlink_nexthop_msg_encode.
+		 * For each case, we create C_NextHopGroupFull Object,
+		 * then convert it to C++ NextHopGroupFull Object and return its JSON string.
+		 */
+		if (dplane_ctx_get_nh_grp_count(ctx)) {
+			/* multi nexthops case */
+			build_c_nexthopgroupfull_multi(&c_nhg, ctx);
+			json_str = nexthopgroupfull_json_from_c_nhg_multi(&c_nhg, MULTIPATH_NUM);
+
+			if (!json_str) {
+				zlog_err(
+					"%s:Failed to convert C_NextHopGroupFull to JSON string in multi-nexthop case",
+					__func__);
+				free_c_nexthopgroupfull(&c_nhg);
+				return -1;
+			}
+		} else {
+			/* singleton case */
+			build_c_nexthopgroupfull_singleton(&c_nhg, ctx);
+			json_str = nexthopgroupfull_json_from_c_nhg_singleton(&c_nhg, MULTIPATH_NUM);
+
+			if (!json_str) {
+				zlog_err(
+					"%s: Failed to convert C_NextHopGroupFull to JSON string in singleton case",
+					__func__);
+				free_c_nexthopgroupfull(&c_nhg);
+				return -1;
+			}
+		}
+
+		/* Encode JSON string as attribute in message */
+		if (!nl_attr_put(&req->n, buflen, NHA_NEXTHOP_JSON,
+					json_str, strlen(json_str) + 1)) {
+			zlog_err(
+				"%s: Failed to put nexthop group JSON into netlink message",
+				__func__);
+			goto cleanup;
+		}
+
+		ret = NLMSG_ALIGN(req->n.nlmsg_len);
+
+cleanup:
+		free(json_str);
+		free_c_nexthopgroupfull(&c_nhg);
+
+	} else if (cmd != RTM_DELNEXTHOP) {
+		zlog_err(
+			"%s: Nexthop group kernel update command (%d) does not exist",
+			__func__, cmd);
+		return -1;
+	}
+
+	if (IS_ZEBRA_DEBUG_KERNEL)
+		zlog_debug("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd), id);
+
+	return ret;
+}
+
 static ssize_t netlink_sidlist_msg_encode(int cmd,
 					   struct zebra_dplane_ctx *ctx,
 					   uint8_t *data, size_t datalen)
@@ -2282,10 +2564,10 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		break;
 
 	case DPLANE_OP_NH_DELETE:
-		rv = netlink_nexthop_msg_encode(RTM_DELNEXTHOP, ctx, nl_buf,
+		rv = netlink_nexthopgroupfull_msg_encode(RTM_DELNEXTHOP, ctx, nl_buf,
 						sizeof(nl_buf), true);
 		if (rv <= 0) {
-			zlog_err("%s: netlink_nexthop_msg_encode failed",
+			zlog_err("%s: netlink_nexthopgroupfull_msg_encode failed",
 				 __func__);
 			return 0;
 		}
@@ -2294,10 +2576,10 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		break;
 	case DPLANE_OP_NH_INSTALL:
 	case DPLANE_OP_NH_UPDATE:
-		rv = netlink_nexthop_msg_encode(RTM_NEWNEXTHOP, ctx, nl_buf,
+		rv = netlink_nexthopgroupfull_msg_encode(RTM_NEWNEXTHOP, ctx, nl_buf,
 						sizeof(nl_buf), true);
 		if (rv <= 0) {
-			zlog_err("%s: netlink_nexthop_msg_encode failed",
+			zlog_err("%s: netlink_nexthopgroupfull_msg_encode failed",
 				 __func__);
 			return 0;
 		}
