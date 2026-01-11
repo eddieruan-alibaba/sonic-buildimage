@@ -168,6 +168,10 @@ enum custom_rtattr_srv6_localsid_action {
 	FPM_SRV6_LOCALSID_ACTION_UDT46				= 21,
 };
 
+enum custoem_rtattr_nexthop_group {
+	FPM_NHA_JSON_STR				= 2,
+};
+
 static const char *prov_name = "dplane_fpm_sonic";
 
 static atomic_bool fpm_cleaning_up;
@@ -2367,7 +2371,7 @@ static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
 		}
 
 		/* Encode JSON string as attribute in message */
-		if (!nl_attr_put(&req->n, buflen, NHA_NEXTHOP_JSON,
+		if (!nl_attr_put(&req->n, buflen, FPM_NHA_JSON_STR,
 					json_str, strlen(json_str) + 1)) {
 			zlog_err(
 				"%s: Failed to put nexthop group JSON into netlink message",
