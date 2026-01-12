@@ -976,7 +976,7 @@ static void build_c_nexthopgroupfull_multi(struct C_NextHopGroupFull *c_nhg,
 	const struct nexthop_group *nhg;
 
 	/* set id */
-	c_nhg->id = ctx->rinfo.nhe.id;
+	c_nhg->id = dplane_ctx_get_nhe_id(ctx);
 
 	/* set hash value */
 	nhg = dplane_ctx_get_nhe_ng(ctx);
@@ -984,20 +984,23 @@ static void build_c_nexthopgroupfull_multi(struct C_NextHopGroupFull *c_nhg,
 	c_nhg->key = key;
 
 	/* set nh_grp_full_list */
-	for (uint32_t i = 0; i < ctx->rinfo.nhe.nh_grp_full_count; i++) {
-		c_nhg->nh_grp_full_list[i].id = ctx->rinfo.nhe.nh_grp_full_list[i].id;
-		c_nhg->nh_grp_full_list[i].weight = ctx->rinfo.nhe.nh_grp_full_list[i].weight;
-		c_nhg->nh_grp_full_list[i].num_direct = ctx->rinfo.nhe.nh_grp_full_list[i].num_direct;
+	const struct nh_grp_full *nh_grp_full_list = dplane_ctx_get_nhe_nh_grp_full(ctx);
+	for (uint32_t i = 0; i < dplane_ctx_get_nhe_nh_grp_full_count(ctx); i++) {
+		c_nhg->nh_grp_full_list[i].id = nh_grp_full_list[i].id;
+		c_nhg->nh_grp_full_list[i].weight = nh_grp_full_list[i].weight;
+		c_nhg->nh_grp_full_list[i].num_direct = nh_grp_full_list[i].num_direct;
 	}
 
 	/* set depends list */
-	for (uint32_t i = 0; i < ctx->rinfo.nhe.depends_count; i++) {
-		c_nhg->depends[i] = ctx->rinfo.nhe.depends[i];
+	const uint32_t *depends = dplane_ctx_get_nhe_depends(ctx);
+	for (uint32_t i = 0; i < dplane_ctx_get_nhe_depends_count(ctx); i++) {
+		c_nhg->depends[i] = depends[i];
 	}
 
 	/* set dependents list */
-	for (uint32_t i = 0; i < ctx->rinfo.nhe.dependents_count; i++) {
-		c_nhg->dependents[i] = ctx->rinfo.nhe.dependents[i];
+	const uint32_t *dependents = dplane_ctx_get_nhe_dependents(ctx);
+	for (uint32_t i = 0; i < dplane_ctx_get_nhe_dependents_count(ctx); i++) {
+		c_nhg->dependents[i] = dependents[i];
 	}
 }
 
@@ -1012,71 +1015,73 @@ static void build_c_nexthopgroupfull_singleton(struct C_NextHopGroupFull *c_nhg,
 					   struct zebra_dplane_ctx *ctx)
 {
 	memset(c_nhg, 0, sizeof(struct C_NextHopGroupFull));
-	const struct nexthop_group *nhg;
 
 	/* set id */
-	c_nhg->id = ctx->rinfo.nhe.id;
+	c_nhg->id = dplane_ctx_get_nhe_id(ctx);
 
 	/* set hash value */
-	nhg = dplane_ctx_get_nhe_ng(ctx);
+	const struct nexthop_group *nhg = dplane_ctx_get_nhe_ng(ctx);
 	uint32_t key = nexthop_group_hash_no_recurse(nhg);
 	c_nhg->key = key;
 
+	const struct nexthop *nh = nhg->nexthop;
 	/* set nexthop type */
-	c_nhg->type = nhg->nexthop->type;
+	c_nhg->type = nh->type;
 
 	/* set nexthop vrf_id */
-	c_nhg->vrf_id = nhg->nexthop->vrf_id;
+	c_nhg->vrf_id = nh->vrf_id;
 
 	/* set nexthop interface index */
-	c_nhg->ifindex = nhg->nexthop->ifindex;
+	c_nhg->ifindex = nh->ifindex;
 
 	/* set nexthop label type, if any */
-	c_nhg->nh_label_type = nhg->nexthop->nh_label_type;
+	c_nhg->nh_label_type = nh->nh_label_type;
 
 	/* set nexthop bh_type or gateway address based on type */
 	if (c_nhg->type == NEXTHOP_TYPE_BLACKHOLE) {
-		c_nhg->bh_type = nhg->nexthop->bh_type;
+		c_nhg->bh_type = nh->bh_type;
 	} else {
-		memcpy(&c_nhg->gate, &nhg->nexthop->gate, sizeof(union g_addr));
+		memcpy(&c_nhg->gate, &nh->gate, sizeof(union g_addr));
 	}
 
 	/* set nexthop src */
-	memcpy(&c_nhg->src, &nhg->nexthop->src, sizeof(union g_addr));
+	memcpy(&c_nhg->src, &nh->src, sizeof(union g_addr));
 
 	/* set nexthop rmap src */
-	memcpy(&c_nhg->rmap_src, &nhg->nexthop->rmap_src, sizeof(union g_addr));
+	memcpy(&c_nhg->rmap_src, &nh->rmap_src, sizeof(union g_addr));
 
 	/* set nexthop weight */
-	c_nhg->weight = nhg->nexthop->weight;
+	c_nhg->weight = nh->weight;
 
 	/* set nexthop flags */
-	c_nhg->flags = nhg->nexthop->flags;
+	c_nhg->flags = nh->flags;
 
 	/* set depends list */
-	for (uint32_t i = 0; i < ctx->rinfo.nhe.depends_count; i++) {
-		c_nhg->depends[i] = ctx->rinfo.nhe.depends[i];
+	const uint32_t *depends = dplane_ctx_get_nhe_depends(ctx);
+	for (uint32_t i = 0; i < dplane_ctx_get_nhe_depends_count(ctx); i++) {
+		c_nhg->depends[i] = depends[i];
 	}
 
 	/* set dependents list */
-	for (uint32_t i = 0; i < ctx->rinfo.nhe.dependents_count; i++) {
-		c_nhg->dependents[i] = ctx->rinfo.nhe.dependents[i];
+	const uint32_t *dependents = dplane_ctx_get_nhe_dependents(ctx);
+	for (uint32_t i = 0; i < dplane_ctx_get_nhe_dependents_count(ctx); i++) {
+		c_nhg->dependents[i] = dependents[i];
 	}
 
 	/* set nexthop srv6 information if present */
-	if (nhg->nexthop->nh_srv6 != NULL) {
+	if (nh->nh_srv6 != NULL) {
 		c_nhg->nh_srv6 = (struct nexthop_srv6 *)malloc(sizeof(struct nexthop_srv6));
 		if (c_nhg->nh_srv6) {
-			memcpy(c_nhg->nh_srv6, nhg->nexthop->nh_srv6, sizeof(struct nexthop_srv6));
+			memcpy(c_nhg->nh_srv6, nh->nh_srv6, sizeof(struct nexthop_srv6));
 			c_nhg->nh_srv6->seg6_segs = NULL;  // clear the pointer to avoid pointing to old address
 
 			/* set nexthop_srv6 seg6_segs if present */
-			if (nhg->nexthop->nh_srv6->seg6_segs != NULL) {
+			if (nh->nh_srv6->seg6_segs != NULL) {
 				size_t total_size = sizeof(struct seg6_seg_stack) +
-							nhg->nexthop->nh_srv6->seg6_segs->num_segs * sizeof(struct in6_addr);
+							nh->nh_srv6->seg6_segs->num_segs * sizeof(struct in6_addr);
 				c_nhg->nh_srv6->seg6_segs = (struct seg6_seg_stack *)malloc(total_size);
 				if (c_nhg->nh_srv6->seg6_segs) {
-					memcpy(c_nhg->nh_srv6->seg6_segs, nhg->nexthop->nh_srv6->seg6_segs, total_size);
+					memcpy(c_nhg->nh_srv6->seg6_segs, nh->nh_srv6->seg6_segs, total_size);
 				}
 			}
 		}
