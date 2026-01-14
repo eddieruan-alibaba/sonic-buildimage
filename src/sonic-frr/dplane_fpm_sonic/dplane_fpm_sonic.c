@@ -2349,7 +2349,7 @@ static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
 		 * For each case, we create C_NextHopGroupFull Object,
 		 * then convert it to C++ NextHopGroupFull Object and return its JSON string.
 		 */
-		if (dplane_ctx_get_nh_grp_count(ctx)) {
+		if (dplane_ctx_get_nhe_nh_grp_full_count(ctx)) {
 			/* multi nexthops case */
 			build_c_nexthopgroupfull_multi(&c_nhg, ctx);
 			json_str = nexthopgroupfull_json_from_c_nhg_multi(&c_nhg, MULTIPATH_NUM);
