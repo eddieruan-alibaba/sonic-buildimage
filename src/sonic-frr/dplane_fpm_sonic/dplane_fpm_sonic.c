@@ -2363,6 +2363,13 @@ static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
 			}
 		} else {
 			/* singleton case */
+			// Set nh_family of nhm
+			afi_t afi = dplane_ctx_get_nhe_afi(ctx);
+			if (afi == AFI_IP)
+				req->nhm.nh_family = AF_INET;
+			else if (afi == AFI_IP6)
+				req->nhm.nh_family = AF_INET6;
+
 			build_c_nexthopgroupfull_singleton(&c_nhg, ctx);
 			json_str = nexthopgroupfull_json_from_c_nhg_singleton(&c_nhg, MULTIPATH_NUM);
 
