@@ -2299,6 +2299,9 @@ static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
 	char* json_str = NULL;
 	ssize_t ret = -1;
 
+	zlog_err("%s: START encode nhg_id=%u cmd=%s type=%s",
+		 __func__, id, nl_msg_type_to_str(cmd), zebra_route_string(type));
+
 	if (!id) {
 		zlog_err(
 			"%s: Failed trying to update a nexthop group in the kernel that does not have an ID",
@@ -2351,6 +2354,9 @@ static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
 		 */
 		if (dplane_ctx_get_nhe_nh_grp_full_count(ctx)) {
 			/* multi nexthops case */
+			zlog_err("%s: nhg_id=%u multi-nexthop case, count=%u",
+				 __func__, id, dplane_ctx_get_nhe_nh_grp_full_count(ctx));
+
 			build_c_nexthopgroupfull_multi(&c_nhg, ctx);
 			json_str = nexthopgroupfull_json_from_c_nhg_multi(&c_nhg, MULTIPATH_NUM);
 
@@ -2363,6 +2369,8 @@ static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
 			}
 		} else {
 			/* singleton case */
+			zlog_err("%s: nhg_id=%u singleton case", __func__, id);
+
 			// Set nh_family of nhm
 			afi_t afi = dplane_ctx_get_nhe_afi(ctx);
 			if (afi == AFI_IP)
@@ -2406,6 +2414,8 @@ cleanup:
 
 	if (IS_ZEBRA_DEBUG_KERNEL)
 		zlog_debug("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd), id);
+
+	zlog_err("%s: COMPLETE encode nhg_id=%u ret=%zd", __func__, id, ret);
 
 	return ret;
 }
@@ -2588,6 +2598,8 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 			return 0;
 		}
 
+		zlog_err("%s: NHG DELETE id=%u", __func__, dplane_ctx_get_nhe_id(ctx));
+
 		nl_buf_len = (size_t)rv;
 		break;
 	case DPLANE_OP_NH_INSTALL:
@@ -2599,6 +2611,10 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 				 __func__);
 			return 0;
 		}
+
+		zlog_err("%s: NHG %s id=%u", __func__,
+			  op == DPLANE_OP_NH_INSTALL ? "INSTALL" : "UPDATE",
+			  dplane_ctx_get_nhe_id(ctx));
 
 		nl_buf_len = (size_t)rv;
 		break;
