@@ -57,6 +57,7 @@
 #include "zebra/zebra_srv6.h"
 #include "fpm/fpm.h"
 #include "lib/srv6.h"
+#include "lib/zlog.h"   // Provides vzlog()
 #include <nexthopgroup/c-api/nexthopgroup_capi.h>
 #include <nexthopgroup/c_nexthopgroupfull.h>
 
@@ -3458,9 +3459,45 @@ static int fpm_nl_new(struct event_loop *tm)
 	return 0;
 }
 
+/* Map fib-sonic levels (0-7) to syslog priorities used by FRR */
+static int fib_level_to_syslog(int level)
+{
+    switch (level) {
+    case 0: return LOG_DEBUG;    // DEBUG
+    case 1: return LOG_INFO;     // INFO
+    case 2: return LOG_WARNING;  // WARN
+    case 3: return LOG_ERR;      // ERROR
+    default: return LOG_DEBUG;
+    }
+}
+
+/* FRR-compatible callback using vzlog() (accepts va_list directly) */
+static void frr_log_forwarder(int level,
+                              const char *file,
+                              int line,
+                              const char *func,
+                              const char *fmt,
+                              va_list args)
+{
+    int syslog_prio = fib_level_to_syslog(level);
+
+    /* irect forwarding (preserves FRR's formatting/escaping) */
+    vzlog(syslog_prio, fmt, args);
+}
+
+/* Called during FRR daemon initialization */
+void fib_init_logging(void) {
+    /* Register callback BEFORE any fib_LOG() calls */
+    fib_frr_register_callback(frr_log_forwarder);
+
+    fib_frr_set_log_level(0);  // DEBUG
+
+}
+
 static int fpm_nl_init(void)
 {
 	hook_register(frr_late_init, fpm_nl_new);
+	fib_init_logging();
 	return 0;
 }
 
