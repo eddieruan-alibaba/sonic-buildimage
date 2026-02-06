@@ -3481,17 +3481,23 @@ static void frr_log_forwarder(int level,
 {
     int syslog_prio = fib_level_to_syslog(level);
 
-    /* Direct forwarding (preserves FRR's formatting/escaping) */
-    vzlog(syslog_prio, fmt, args);
+    int current_log_level = fib_frr_get_log_level();
+	// Print to stderr first 
+    if (level < current_log_level) {
+        return; // Skip messages below current log level
+    }
+    fprintf(stderr, "[LVL=%d %s:%d %s] ", syslog_prio, file, line, func);
+    // Core: print formatted message to stderr using va_list
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");  // Add newline (vfprintf does not add one automatically)
 }
 
 /* Called during FRR daemon initialization */
 void fib_init_logging(void) {
     /* Register callback BEFORE any fib_LOG() calls */
     fib_frr_register_callback(frr_log_forwarder);
-
     fib_frr_set_log_level(0);  // DEBUG
-
+	frr_log_forwarder(0, __FILE__, __LINE__, __func__, "FIB logging initialized and forwarding to FRR");
 }
 
 static int fpm_nl_init(void)
