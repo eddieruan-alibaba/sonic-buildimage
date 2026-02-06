@@ -3481,7 +3481,7 @@ static void frr_log_forwarder(int level,
 {
     int syslog_prio = fib_level_to_syslog(level);
 
-    /* irect forwarding (preserves FRR's formatting/escaping) */
+    /* Direct forwarding (preserves FRR's formatting/escaping) */
     vzlog(syslog_prio, fmt, args);
 }
 
