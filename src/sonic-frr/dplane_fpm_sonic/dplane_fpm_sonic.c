@@ -3497,7 +3497,10 @@ void fib_init_logging(void) {
     /* Register callback BEFORE any fib_LOG() calls */
     fib_frr_register_callback(frr_log_forwarder);
     fib_frr_set_log_level(0);  // DEBUG
-	frr_log_forwarder(0, __FILE__, __LINE__, __func__, "FIB logging initialized and forwarding to FRR");
+	frr_log_forwarder(0, 
+		__FILE__, __LINE__, __func__, 
+		"FIB logging initialized and forwarding to FRR, log level set to %d",
+		fib_frr_get_log_level());
 }
 
 static int fpm_nl_init(void)
