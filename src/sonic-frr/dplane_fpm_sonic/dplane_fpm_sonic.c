@@ -3482,27 +3482,20 @@ static void frr_log_forwarder(int level,
     int syslog_prio = fib_level_to_syslog(level);
 
     int current_log_level = fib_frr_get_log_level();
-	// Print to stderr first 
+
+	// Skip messages below the current log level  based on FIB DEBUG level
     if (level < current_log_level) {
         return; // Skip messages below current log level
     }
 
     if (syslog_prio == LOG_DEBUG && !IS_ZEBRA_DEBUG_FPM) {
-        //return;  // Skip debug messages unless 'debug zebra fpm' is enabled
-		fprintf(stderr, "Plan to skip debug messages unless 'debug zebra fpm' is enabled %d %s:%d %s\n",
-			syslog_prio, file, line, func);
+        return;  // Skip debug messages unless 'debug zebra fpm' is enabled
     }
 
     fprintf(stderr, "[LVL=%d %s:%d %s] ", syslog_prio, file, line, func);
     // Core: print formatted message to stderr using va_list
     vfprintf(stderr, fmt, args);
     fprintf(stderr, "\n");  // Add newline (vfprintf does not add one automatically)
-
-    /* Forward to FRR's logging system (not raw stderr) */
-    va_list args_copy;
-    va_copy(args_copy, args);
-    zlog(file, line, func, syslog_prio, fmt, args_copy);
-    va_end(args_copy);
 }
 
 /* Called during FRR daemon initialization */
