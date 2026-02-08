@@ -3458,9 +3458,58 @@ static int fpm_nl_new(struct event_loop *tm)
 	return 0;
 }
 
+/*
+ * FRR-compatible callback to forward logs from FIB to FRR's logging system.
+ */
+static void frr_log_forwarder(int level,
+                              const char *file,
+                              int line,
+                              const char *func,
+                              const char *fmt,
+                              va_list args)
+{
+    int current_log_level = fib_frr_get_log_level();
+
+    /*
+     * We would skip logging message if
+     * level is below current log level and debug zebra fpm is not enabled
+     */
+    if (level < current_log_level &&  !IS_ZEBRA_DEBUG_FPM) {
+        return;
+    }
+
+    /*
+     * Direct stderr — FRR convention for FIB path debugging
+     * We can't use FRR's zlog here because no API for forwarding va_list, and
+     * we want to preserve the original log level and formatting as much as possible.
+     */
+    fprintf(stderr, "[ZEBRA:FIB] %s:%d (%s) ", file, line, func);
+    va_list args_copy;
+    va_copy(args_copy, args);
+    vfprintf(stderr, fmt, args_copy);
+    va_end(args_copy);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+/* Called during FRR daemon initialization */
+static void fib_init_logging(void) {
+    /* Register callback BEFORE any fib_LOG() calls */
+    fib_frr_register_callback(frr_log_forwarder);
+
+    /*
+     * TODO set to DEBUG for now to capture all logs, but may want to make this configurable
+     */
+    fib_frr_set_log_level(0);  // DEBUG
+
+    zlog_info("%s : FIB logging initialized and forwarding to FRR, log level set to %d",
+			  __func__, fib_frr_get_log_level());
+}
+
 static int fpm_nl_init(void)
 {
 	hook_register(frr_late_init, fpm_nl_new);
+	fib_init_logging();
 	return 0;
 }
 
