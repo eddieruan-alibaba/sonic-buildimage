@@ -3477,7 +3477,11 @@ static void frr_log_forwarder(int level,
         return;
     }
 
-    /* Direct stderr — FRR convention for FIB path debugging */
+    /*
+	 * Direct stderr — FRR convention for FIB path debugging
+	 * We can't use FRR's zlog here because no API for forwarding va_list, and 
+	 * we want to preserve the original log level and formatting as much as possible.
+	 */
     fprintf(stderr, "[ZEBRA:FIB] %s:%d (%s) ", file, line, func);
     va_list args_copy;
     va_copy(args_copy, args);
