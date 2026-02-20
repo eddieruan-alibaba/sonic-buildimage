@@ -73,15 +73,3 @@ if [ -n "$SSH_TARGET_CONSOLE_LINE" ]; then
         exit
     fi
 fi
-
-# Aliases for redis-cli with correct database and port for each SONiC DB
-alias redis-appdb="redis-cli $(python -c 'import swsssdk; print(" -n "+str(swsssdk.SonicDBConfig.get_dbid("APPL_DB"))+" -p "+str(swsssdk.SonicDBConfig.get_port("APPL_DB")))')"
-alias redis-asicdb="redis-cli $(python -c 'import swsssdk; print(" -n "+str(swsssdk.SonicDBConfig.get_dbid("ASIC_DB"))+" -p "+str(swsssdk.SonicDBConfig.get_port("ASIC_DB")))')"
-alias redis-counterdb="redis-cli $(python -c 'import swsssdk; print(" -n "+str(swsssdk.SonicDBConfig.get_dbid("COUNTERS_DB"))+" -p "+str(swsssdk.SonicDBConfig.get_port("COUNTERS_DB")))')"
-alias redis-logleveldb="redis-cli $(python -c 'import swsssdk; print(" -n "+str(swsssdk.SonicDBConfig.get_dbid("LOGLEVEL_DB"))+" -p "+str(swsssdk.SonicDBConfig.get_port("LOGLEVEL_DB")))')"
-alias redis-configdb="redis-cli $(python -c 'import swsssdk; print(" -n "+str(swsssdk.SonicDBConfig.get_dbid("CONFIG_DB"))+" -p "+str(swsssdk.SonicDBConfig.get_port("CONFIG_DB")))')"
-alias redis-flexcounterdb="redis-cli $(python -c 'import swsssdk; print(" -n "+str(swsssdk.SonicDBConfig.get_dbid("FLEX_COUNTER_DB"))+" -p "+str(swsssdk.SonicDBConfig.get_port("FLEX_COUNTER_DB")))')"
-alias redis-statedb="redis-cli $(python -c 'import swsssdk; print(" -n "+str(swsssdk.SonicDBConfig.get_dbid("STATE_DB"))+" -p "+str(swsssdk.SonicDBConfig.get_port("STATE_DB")))')"
-alias redis-sysmondb="redis-cli $(python -c 'import swsssdk; print(" -n "+str(swsssdk.SonicDBConfig.get_dbid("SYSMON_DB"))+" -p "+str(swsssdk.SonicDBConfig.get_port("SYSMON_DB")))')"
-alias redis-appstatedb="redis-cli $(python -c 'import swsssdk; print(" -n "+str(swsssdk.SonicDBConfig.get_dbid("APPL_STATE_DB"))+" -p "+str(swsssdk.SonicDBConfig.get_port("APPL_STATE_DB")))')"
-
