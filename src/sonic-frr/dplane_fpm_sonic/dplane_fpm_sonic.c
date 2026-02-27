@@ -128,7 +128,7 @@ enum custom_rtattr_encap_srv6 {
 	FPM_ROUTE_ENCAP_SRV6_ENCAP_UNSPEC		= 0,
 	FPM_ROUTE_ENCAP_SRV6_VPN_SID			= 1,
 	FPM_ROUTE_ENCAP_SRV6_ENCAP_SRC_ADDR		= 2,
-	FPM_ROUTE_ENCAP_SRV6_PIC_ID			= 3,
+	FPM_ROUTE_ENCAP_SRV6_NH_RECEIVED_ID		= 3,
 	FPM_ROUTE_ENCAP_SRV6_NH_ID  			= 4,
 	FPM_ROUTE_ENCAP_SRV6_ENCAP_SIDLIST_NAME		= 5,
 	FPM_ROUTE_ENCAP_SRV6_ENCAP_SIDLIST_LEN		= 6,
@@ -1441,8 +1441,8 @@ static ssize_t netlink_vpn_route_msg_encode(int cmd,
 	struct nlsock *nl;
 	int bytelen;
 	vrf_id_t vrf_id;
-	uint32_t pic_id = dplane_ctx_get_nhe_id(ctx);
-	uint32_t nhg_id = dplane_ctx_get_pic_nhe_id(ctx);
+	uint32_t nhg_id = dplane_ctx_get_nhe_id(ctx);
+	uint32_t nhg_received_id = dplane_ctx_get_nhe_received_id(ctx);
 	uint32_t table_id;
 
 	struct {
@@ -1521,7 +1521,7 @@ static ssize_t netlink_vpn_route_msg_encode(int cmd,
 	if (!nest)
 		return false;
 
-    if (!nl_attr_put32(&req->n, datalen, FPM_ROUTE_ENCAP_SRV6_PIC_ID, pic_id)){
+    if (!nl_attr_put32(&req->n, datalen, FPM_ROUTE_ENCAP_SRV6_NH_RECEIVED_ID, nhg_received_id)){
 		return 0;
 	}
 
