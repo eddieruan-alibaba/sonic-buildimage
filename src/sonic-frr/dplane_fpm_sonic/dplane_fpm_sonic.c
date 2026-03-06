@@ -983,6 +983,9 @@ static void build_c_nexthopgroupfull_multi(struct C_NextHopGroupFull *c_nhg,
 	uint32_t key = nexthop_group_hash_no_recurse(nhg);
 	c_nhg->key = key;
 
+	/* set nhg_flags */
+	c_nhg->nhg_flags = dplane_ctx_get_nhe_nhg_flags(ctx);
+
 	/* set nh_grp_full_list */
 	const struct nh_grp_full *nh_grp_full_list = dplane_ctx_get_nhe_nh_grp_full(ctx);
 	for (uint32_t i = 0; i < dplane_ctx_get_nhe_nh_grp_full_count(ctx); i++) {
@@ -1023,6 +1026,9 @@ static void build_c_nexthopgroupfull_singleton(struct C_NextHopGroupFull *c_nhg,
 	const struct nexthop_group *nhg = dplane_ctx_get_nhe_ng(ctx);
 	uint32_t key = nexthop_group_hash_no_recurse(nhg);
 	c_nhg->key = key;
+
+	/* set nhg_flags */
+	c_nhg->nhg_flags = dplane_ctx_get_nhe_nhg_flags(ctx);
 
 	const struct nexthop *nh = nhg->nexthop;
 	/* set nexthop type */
