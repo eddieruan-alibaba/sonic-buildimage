@@ -1076,9 +1076,14 @@ static void build_c_nexthopgroupfull_singleton(struct C_NextHopGroupFull *c_nhg,
 
 	/* set nexthop srv6 information if present */
 	if (nh->nh_srv6 != NULL) {
+		/* Get the default SRv6 context which contains seg6's src IP */
+		struct zebra_srv6 *srv6 = zebra_srv6_get_default();
+
 		c_nhg->nh_srv6 = (struct nexthop_srv6 *)malloc(sizeof(struct nexthop_srv6));
 		if (c_nhg->nh_srv6) {
 			memcpy(c_nhg->nh_srv6, nh->nh_srv6, sizeof(struct nexthop_srv6));
+
+			c_nhg->nh_srv6->src = srv6->seg6_src;  // override seg6 src with the default one from zebra_srv6
 			c_nhg->nh_srv6->seg6_segs = NULL;  // clear the pointer to avoid pointing to old address
 
 			/* set nexthop_srv6 seg6_segs if present */
