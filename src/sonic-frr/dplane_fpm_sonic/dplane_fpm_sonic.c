@@ -1079,21 +1079,27 @@ static void build_c_nexthopgroupfull_singleton(struct C_NextHopGroupFull *c_nhg,
 		/* Get the default SRv6 context which contains seg6's src IP */
 		struct zebra_srv6 *srv6 = zebra_srv6_get_default();
 
-		// TODO need to define nh_srv6 as C_nexthop_srv6.
-		c_nhg->nh_srv6 = (struct nexthop_srv6 *)malloc(sizeof(struct C_nexthop_srv6));
+		c_nhg->nh_srv6 = malloc(sizeof(struct C_nexthop_srv6));
 		if (c_nhg->nh_srv6) {
-			struct C_nexthop_srv6 *c_srv6 = (struct C_nexthop_srv6 *)c_nhg->nh_srv6;
-			// TODO change to field copy after using C_nexthop_srv6
-			memcpy(c_srv6, nh->nh_srv6, sizeof(struct nexthop_srv6));
+			/* field copy from nexthop_srv6 to C_nexthop_srv6 */
+			/* seg6local_action */
+			c_nhg->nh_srv6->seg6local_action =
+				(enum C_seg6local_action_t)nh->nh_srv6->seg6local_action;
 
-			c_srv6->seg6_src = srv6->encap_src_addr;  // override seg6 src with the default one from zebra_srv6
-			c_srv6->seg6_segs = NULL;  // clear the pointer to avoid pointing to old address
+			/* seg6local_ctx */
+			memcpy(&c_nhg->nh_srv6->seg6local_ctx, &nh->nh_srv6->seg6local_ctx,
+				sizeof(struct C_seg6local_context));
 
+			/* seg6_src */
+			c_nhg->nh_srv6->seg6_src = srv6->encap_src_addr;
+
+			/* seg6_segs */
+			c_nhg->nh_srv6->seg6_segs = NULL;  // clear the pointer to avoid pointing to old address
 			/* set nexthop_srv6 seg6_segs if present */
 			if (nh->nh_srv6->seg6_segs != NULL) {
-				size_t total_size = sizeof(struct seg6_seg_stack) +
+				size_t total_size = sizeof(struct C_seg6_seg_stack) +
 							nh->nh_srv6->seg6_segs->num_segs * sizeof(struct in6_addr);
-				c_nhg->nh_srv6->seg6_segs = (struct seg6_seg_stack *)malloc(total_size);
+				c_nhg->nh_srv6->seg6_segs = malloc(total_size);
 				if (c_nhg->nh_srv6->seg6_segs) {
 					memcpy(c_nhg->nh_srv6->seg6_segs, nh->nh_srv6->seg6_segs, total_size);
 				}
