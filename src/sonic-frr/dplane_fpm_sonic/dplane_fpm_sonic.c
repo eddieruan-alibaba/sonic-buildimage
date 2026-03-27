@@ -60,6 +60,14 @@
 #include <nexthopgroup/c-api/nexthopgroup_capi.h>
 #include <nexthopgroup/c_nexthopgroupfull.h>
 
+/* FIB log level constants, aligned with fib::LogLevel in nexthopgroup_debug.h */
+enum fib_log_level {
+	FIB_LOG_LEVEL_DEBUG = 0,
+	FIB_LOG_LEVEL_INFO  = 1,
+	FIB_LOG_LEVEL_WARN  = 2,
+	FIB_LOG_LEVEL_ERROR = 3,
+};
+
 #define SOUTHBOUND_DEFAULT_ADDR INADDR_LOOPBACK
 #define SOUTHBOUND_DEFAULT_PORT 2620
 #define SEG6_SEGMENT_NAME_LEN 64
@@ -182,6 +190,7 @@ struct fpm_nl_ctx {
 	bool disabled;
 	bool connecting;
 	bool use_nhg;
+	enum fib_log_level fib_log_level;
 	struct sockaddr_storage addr;
 
 	/* data plane buffers. */
@@ -405,6 +414,33 @@ DEFUN(no_fpm_use_nhg, no_fpm_use_nhg_cmd,
 	return CMD_SUCCESS;
 }
 
+DEFUN(fpm_set_fib_log_level, fpm_set_fib_log_level_cmd,
+      "fpm fib-log-level (0-3)",
+      FPM_STR
+      "Set FIB library log level\n"
+      "Log level (0=DEBUG, 1=INFO, 2=WARN, 3=ERROR)\n")
+{
+	int level = strtol(argv[2]->arg, NULL, 10);
+
+	gfnc->fib_log_level = level;
+	fib_frr_set_log_level(level);
+	zlog_info("%s: FIB log level set to %d", __func__, level);
+	return CMD_SUCCESS;
+}
+
+DEFUN(no_fpm_set_fib_log_level, no_fpm_set_fib_log_level_cmd,
+      "no fpm fib-log-level [(0-3)]",
+      NO_STR
+      FPM_STR
+      "Set FIB library log level\n"
+      "Log level value\n")
+{
+	gfnc->fib_log_level = FIB_LOG_LEVEL_INFO; /* restore to default: INFO */
+	fib_frr_set_log_level(gfnc->fib_log_level);
+	zlog_info("%s: FIB log level reset to default (INFO)", __func__);
+	return CMD_SUCCESS;
+}
+
 DEFUN(fpm_reset_counters, fpm_reset_counters_cmd,
       "clear fpm counters",
       CLEAR_STR
@@ -526,6 +562,11 @@ static int fpm_write_config(struct vty *vty)
 
 	if (!gfnc->use_nhg) {
 		vty_out(vty, "no fpm use-next-hop-groups\n");
+		written = 1;
+	}
+
+	if (gfnc->fib_log_level != FIB_LOG_LEVEL_INFO) {
+		vty_out(vty, "fpm fib-log-level %d\n", gfnc->fib_log_level);
 		written = 1;
 	}
 
@@ -3458,6 +3499,9 @@ static int fpm_nl_new(struct event_loop *tm)
 	int rv;
 
 	gfnc = calloc(1, sizeof(*gfnc));
+	gfnc->fib_log_level = FIB_LOG_LEVEL_INFO; /* Default: INFO */
+	fib_frr_set_log_level(gfnc->fib_log_level);
+	zlog_info("%s: FIB log level initialized to %d (INFO)", __func__, gfnc->fib_log_level);
 	rv = dplane_provider_register(prov_name, DPLANE_PRIO_POSTPROCESS,
 				      DPLANE_PROV_FLAG_THREADED, fpm_nl_start,
 				      fpm_nl_process, fpm_nl_finish, gfnc,
@@ -3474,6 +3518,8 @@ static int fpm_nl_new(struct event_loop *tm)
 	install_element(CONFIG_NODE, &no_fpm_set_address_cmd);
 	install_element(CONFIG_NODE, &fpm_use_nhg_cmd);
 	install_element(CONFIG_NODE, &no_fpm_use_nhg_cmd);
+	install_element(CONFIG_NODE, &fpm_set_fib_log_level_cmd);
+	install_element(CONFIG_NODE, &no_fpm_set_fib_log_level_cmd);
 
 	return 0;
 }
@@ -3517,13 +3563,8 @@ static void fib_init_logging(void) {
     /* Register callback BEFORE any fib_LOG() calls */
     fib_frr_register_callback(frr_log_forwarder);
 
-    /*
-     * TODO set to DEBUG for now to capture all logs, but may want to make this configurable
-     */
-    fib_frr_set_log_level(0);  // DEBUG
-
-    zlog_info("%s : FIB logging initialized and forwarding to FRR, log level set to %d",
-			  __func__, fib_frr_get_log_level());
+    zlog_info("%s : FIB logging callback registered, log level will be applied after configuration load",
+			  __func__);
 }
 
 static int fpm_nl_init(void)
