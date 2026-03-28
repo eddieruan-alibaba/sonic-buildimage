@@ -415,21 +415,38 @@ DEFUN(no_fpm_use_nhg, no_fpm_use_nhg_cmd,
 }
 
 DEFUN(fpm_set_fib_log_level, fpm_set_fib_log_level_cmd,
-      "fpm fib-log-level (0-3)",
+      "fpm fib-log-level (debug|info|warn|error)",
       FPM_STR
       "Set FIB library log level\n"
-      "Log level (0=DEBUG, 1=INFO, 2=WARN, 3=ERROR)\n")
+      "Debug level (most verbose)\n"
+      "Info level\n"
+      "Warn level\n"
+      "Error level (least verbose)\n")
 {
-	int level = strtol(argv[2]->arg, NULL, 10);
+	enum fib_log_level level;
+	const char *level_str = argv[2]->text;
+
+	if (strcmp(level_str, "debug") == 0)
+		level = FIB_LOG_LEVEL_DEBUG;
+	else if (strcmp(level_str, "info") == 0)
+		level = FIB_LOG_LEVEL_INFO;
+	else if (strcmp(level_str, "warn") == 0)
+		level = FIB_LOG_LEVEL_WARN;
+	else if (strcmp(level_str, "error") == 0)
+		level = FIB_LOG_LEVEL_ERROR;
+	else {
+		vty_out(vty, "%% Invalid log level: %s\n", level_str);
+		return CMD_WARNING;
+	}
 
 	gfnc->fib_log_level = level;
-	fib_frr_set_log_level(level);
-	zlog_info("%s: FIB log level set to %d", __func__, level);
+	fib_frr_set_log_level((int)level);
+	zlog_info("%s: FIB log level set to %s (%d)", __func__, level_str, (int)level);
 	return CMD_SUCCESS;
 }
 
 DEFUN(no_fpm_set_fib_log_level, no_fpm_set_fib_log_level_cmd,
-      "no fpm fib-log-level [(0-3)]",
+      "no fpm fib-log-level [(debug|info|warn|error)]",
       NO_STR
       FPM_STR
       "Set FIB library log level\n"
@@ -527,6 +544,29 @@ DEFUN(fpm_show_counters_json, fpm_show_counters_json_cmd,
 	return CMD_SUCCESS;
 }
 
+static const char *fib_log_level_str(enum fib_log_level level)
+{
+	switch (level) {
+	case FIB_LOG_LEVEL_DEBUG: return "debug";
+	case FIB_LOG_LEVEL_INFO:  return "info";
+	case FIB_LOG_LEVEL_WARN:  return "warn";
+	case FIB_LOG_LEVEL_ERROR: return "error";
+	default:                  return "unknown";
+	}
+}
+
+DEFUN(fpm_show_fib_log_level, fpm_show_fib_log_level_cmd,
+      "show fpm fib-log-level",
+      SHOW_STR
+      FPM_STR
+      "Show current FIB library log level\n")
+{
+	vty_out(vty, "FIB log level: %d (%s)\n",
+		gfnc->fib_log_level,
+		fib_log_level_str(gfnc->fib_log_level));
+	return CMD_SUCCESS;
+}
+
 static int fpm_write_config(struct vty *vty)
 {
 	struct sockaddr_in *sin;
@@ -565,10 +605,9 @@ static int fpm_write_config(struct vty *vty)
 		written = 1;
 	}
 
-	if (gfnc->fib_log_level != FIB_LOG_LEVEL_INFO) {
-		vty_out(vty, "fpm fib-log-level %d\n", gfnc->fib_log_level);
-		written = 1;
-	}
+	vty_out(vty, "fpm fib-log-level %s\n",
+		fib_log_level_str(gfnc->fib_log_level));
+	written = 1;
 
 	return written;
 }
@@ -3533,6 +3572,7 @@ static int fpm_nl_new(struct event_loop *tm)
 	install_node(&fpm_node);
 	install_element(ENABLE_NODE, &fpm_show_counters_cmd);
 	install_element(ENABLE_NODE, &fpm_show_counters_json_cmd);
+	install_element(ENABLE_NODE, &fpm_show_fib_log_level_cmd);
 	install_element(ENABLE_NODE, &fpm_reset_counters_cmd);
 	install_element(CONFIG_NODE, &fpm_set_address_cmd);
 	install_element(CONFIG_NODE, &no_fpm_set_address_cmd);
