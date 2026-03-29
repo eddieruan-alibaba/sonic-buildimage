@@ -415,7 +415,7 @@ DEFUN(no_fpm_use_nhg, no_fpm_use_nhg_cmd,
 }
 
 DEFUN(fpm_set_fib_log_level, fpm_set_fib_log_level_cmd,
-      "fpm fib-log-level (debug|info|warn|error)",
+      "fpm fib-log-level <debug|info|warn|error>",
       FPM_STR
       "Set FIB library log level\n"
       "Debug level (most verbose)\n"
@@ -446,7 +446,7 @@ DEFUN(fpm_set_fib_log_level, fpm_set_fib_log_level_cmd,
 }
 
 DEFUN(no_fpm_set_fib_log_level, no_fpm_set_fib_log_level_cmd,
-      "no fpm fib-log-level [(debug|info|warn|error)]",
+      "no fpm fib-log-level [<debug|info|warn|error>]",
       NO_STR
       FPM_STR
       "Set FIB library log level\n"
