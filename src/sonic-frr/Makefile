@@ -27,16 +27,10 @@ endif
 	gbp dch --ignore-branch --new-version=$(FRR_VERSION)-sonic-$(FRR_SUBVERSION) --dch-opt="--force-bad-version" --commit --git-author
 	cp ../$(DPLANE_FPM_SONIC_MODULE) zebra/
 
-ifeq ($(ENABLE_NHG_FULL), y)
-	$(eval NHG_FULL_CFLAGS := -DHAVE_NHG_FULL)
-else
-	$(eval NHG_FULL_CFLAGS := )
-endif
-
 ifeq ($(CROSS_BUILD_ENVIRON), y)
-	CFLAGS="-I $$CROSS_PERL_CORE_PATH" DEB_CFLAGS_APPEND="$(NHG_FULL_CFLAGS)" dpkg-buildpackage -rfakeroot -b -d -us -uc -Ppkg.frr.nortrlib -a$(CONFIGURED_ARCH) -Pcross,nocheck -j$(SONIC_CONFIG_MAKE_JOBS) --admindir $(SONIC_DPKG_ADMINDIR)
+	CFLAGS="-I $$CROSS_PERL_CORE_PATH" dpkg-buildpackage -rfakeroot -b -d -us -uc -Ppkg.frr.nortrlib -a$(CONFIGURED_ARCH) -Pcross,nocheck -j$(SONIC_CONFIG_MAKE_JOBS) --admindir $(SONIC_DPKG_ADMINDIR)
 else
-	DEB_CFLAGS_APPEND="$(NHG_FULL_CFLAGS)" dpkg-buildpackage -rfakeroot -b -us -uc -Ppkg.frr.nortrlib -j$(SONIC_CONFIG_MAKE_JOBS) --admindir $(SONIC_DPKG_ADMINDIR)
+	dpkg-buildpackage -rfakeroot -b -us -uc -Ppkg.frr.nortrlib -j$(SONIC_CONFIG_MAKE_JOBS) --admindir $(SONIC_DPKG_ADMINDIR)
 endif
 	stg undo || true
 	git clean -xfdf

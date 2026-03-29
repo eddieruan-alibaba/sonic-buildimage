@@ -60,6 +60,9 @@
 #include <nexthopgroup/c-api/nexthopgroup_capi.h>
 #include <nexthopgroup/c_nexthopgroupfull.h>
 
+/* Global flag set by zebra --nhg-fib command-line option. */
+extern bool zebra_nhg_fib_enabled;
+
 /* FIB log level constants, aligned with fib::LogLevel in nexthopgroup_debug.h */
 enum fib_log_level {
 	FIB_LOG_LEVEL_DEBUG = 0,
@@ -110,6 +113,8 @@ enum custom_nlmsg_types {
 	RTM_DELSRV6VPNROUTE		= 3001,
 	RTM_NEWSIDLIST			= 4000,
 	RTM_DELSIDLIST			= 4001,
+	RTM_NEWNHGFIB			= 5000,
+	RTM_DELNHGFIB			= 5001,
 };
 
 /* Custom Netlink attribute types */
@@ -190,6 +195,7 @@ struct fpm_nl_ctx {
 	bool disabled;
 	bool connecting;
 	bool use_nhg;
+	bool use_nhg_fib;
 	enum fib_log_level fib_log_level;
 	struct sockaddr_storage addr;
 
@@ -2690,23 +2696,23 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		break;
 
 	case DPLANE_OP_NH_DELETE:
-#ifdef HAVE_NHG_FULL
-		rv = netlink_nexthopgroupfull_msg_encode(RTM_DELNEXTHOP, ctx, nl_buf,
-						sizeof(nl_buf), true);
-		if (rv <= 0) {
-			zlog_err("%s: netlink_nexthopgroupfull_msg_encode failed",
-				 __func__);
-			return 0;
+		if (fnc->use_nhg_fib) {
+			rv = netlink_nexthopgroupfull_msg_encode(RTM_DELNHGFIB, ctx, nl_buf,
+							sizeof(nl_buf), true);
+			if (rv <= 0) {
+				zlog_err("%s: netlink_nexthopgroupfull_msg_encode failed",
+					 __func__);
+				return 0;
+			}
+		} else {
+			rv = netlink_nexthop_msg_encode(RTM_DELNEXTHOP, ctx, nl_buf,
+							sizeof(nl_buf), true);
+			if (rv <= 0) {
+				zlog_err("%s: netlink_nexthop_msg_encode failed",
+					 __func__);
+				return 0;
+			}
 		}
-#else
-		rv = netlink_nexthop_msg_encode(RTM_DELNEXTHOP, ctx, nl_buf,
-						sizeof(nl_buf), true);
-		if (rv <= 0) {
-			zlog_err("%s: netlink_nexthop_msg_encode failed",
-				 __func__);
-			return 0;
-		}
-#endif
 
 		zlog_err("%s: NHG DELETE id=%u", __func__, dplane_ctx_get_nhe_id(ctx));
 
@@ -2714,23 +2720,23 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		break;
 	case DPLANE_OP_NH_INSTALL:
 	case DPLANE_OP_NH_UPDATE:
-#ifdef HAVE_NHG_FULL
-		rv = netlink_nexthopgroupfull_msg_encode(RTM_NEWNEXTHOP, ctx, nl_buf,
-						sizeof(nl_buf), true);
-		if (rv <= 0) {
-			zlog_err("%s: netlink_nexthopgroupfull_msg_encode failed",
-				 __func__);
-			return 0;
+		if (fnc->use_nhg_fib) {
+			rv = netlink_nexthopgroupfull_msg_encode(RTM_NEWNHGFIB, ctx, nl_buf,
+							sizeof(nl_buf), true);
+			if (rv <= 0) {
+				zlog_err("%s: netlink_nexthopgroupfull_msg_encode failed",
+					 __func__);
+				return 0;
+			}
+		} else {
+			rv = netlink_nexthop_msg_encode(RTM_NEWNEXTHOP, ctx, nl_buf,
+							sizeof(nl_buf), true);
+			if (rv <= 0) {
+				zlog_err("%s: netlink_nexthop_msg_encode failed",
+					 __func__);
+				return 0;
+			}
 		}
-#else
-		rv = netlink_nexthop_msg_encode(RTM_NEWNEXTHOP, ctx, nl_buf,
-						sizeof(nl_buf), true);
-		if (rv <= 0) {
-			zlog_err("%s: netlink_nexthop_msg_encode failed",
-				 __func__);
-			return 0;
-		}
-#endif
 
 		zlog_err("%s: NHG %s id=%u", __func__,
 			  op == DPLANE_OP_NH_INSTALL ? "INSTALL" : "UPDATE",
@@ -3559,6 +3565,9 @@ static int fpm_nl_new(struct event_loop *tm)
 
 	gfnc = calloc(1, sizeof(*gfnc));
 	gfnc->fib_log_level = FIB_LOG_LEVEL_INFO; /* Default: INFO */
+	gfnc->use_nhg_fib = zebra_nhg_fib_enabled;
+	if (gfnc->use_nhg_fib)
+		zlog_info("%s: NHG Full encoding enabled via --nhg-fib", __func__);
 	fib_frr_set_log_level(gfnc->fib_log_level);
 	zlog_info("%s: FIB log level initialized to %d (INFO)", __func__, gfnc->fib_log_level);
 	rv = dplane_provider_register(prov_name, DPLANE_PRIO_POSTPROCESS,
