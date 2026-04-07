@@ -2448,7 +2448,7 @@ static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
 	if (!nl_attr_put32(&req->n, buflen, NHA_ID, id))
 		return 0;
 
-	if (cmd == RTM_NEWNEXTHOP) {
+	if (cmd == RTM_NEWNHGFIB) {
 		/* Build C_NextHopGroupFull Object */
 		struct C_NextHopGroupFull c_nhg;
 
@@ -2511,7 +2511,7 @@ cleanup:
 		free(json_str);
 		free_c_nexthopgroupfull(&c_nhg);
 
-	} else if (cmd != RTM_DELNEXTHOP) {
+	} else if (cmd != RTM_DELNHGFIB) {
 		zlog_err(
 			"%s: Nexthop group kernel update command (%d) does not exist",
 			__func__, cmd);
