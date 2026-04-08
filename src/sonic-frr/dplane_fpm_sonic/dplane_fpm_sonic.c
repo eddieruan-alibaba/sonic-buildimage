@@ -2436,7 +2436,7 @@ static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
 	req->n.nlmsg_len = NLMSG_LENGTH(sizeof(struct nhmsg));
 	req->n.nlmsg_flags = NLM_F_CREATE | NLM_F_REQUEST;
 
-	if (cmd == RTM_NEWNEXTHOP)
+	if (cmd == RTM_NEWNHGFIB)
 		req->n.nlmsg_flags |= NLM_F_REPLACE;
 
 	req->n.nlmsg_type = cmd;
