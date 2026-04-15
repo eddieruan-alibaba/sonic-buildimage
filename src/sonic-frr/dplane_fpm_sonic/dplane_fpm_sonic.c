@@ -2457,8 +2457,12 @@ static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
 		 * as what is done in netlink_nexthop_msg_encode.
 		 * For each case, we create C_NextHopGroupFull Object,
 		 * then convert it to C++ NextHopGroupFull Object and return its JSON string.
+		 *  multi case would be the following cases
+		 *   1. ctx has multiple paths
+		 *   2. single recursive path
 		 */
-		if (dplane_ctx_get_nhe_nh_grp_full_count(ctx)) {
+		if (dplane_ctx_get_nhe_nh_grp_full_count(ctx) ||
+		    CHECK_FLAG(dplane_ctx_get_nhe_nhg_flags(ctx), NEXTHOP_GROUP_RECURSIVE)) {
 			/* multi nexthops case */
 			zlog_err("%s: nhg_id=%u multi-nexthop case, count=%u",
 				 __func__, id, dplane_ctx_get_nhe_nh_grp_full_count(ctx));
