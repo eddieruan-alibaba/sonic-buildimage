@@ -1078,6 +1078,24 @@ static void build_c_nexthopgroupfull_multi(struct C_NextHopGroupFull *c_nhg,
 	if (CHECK_FLAG(c_nhg->nhg_flags, NEXTHOP_GROUP_RECURSIVE)) {
 		const struct nexthop *nh = nhg->nexthop;
 		memcpy(&c_nhg->gate, &nh->gate, sizeof(union g_addr));
+
+
+		size_t len = sizeof(union g_addr);
+		// 2 hex chars + 1 space per byte + 1 for null terminator
+		char hex_buf[len * 3 + 1];
+		const uint8_t *ptr = (const uint8_t *)&c_nhg->gate;
+		size_t pos = 0;
+
+		for (size_t i = 0; i < len; ++i) {
+			pos += snprintf(hex_buf + pos, sizeof(hex_buf) - pos, "%02x ", (unsigned)ptr[i]);
+		}
+
+		// Remove trailing space and ensure null-termination
+		if (pos > 0) {
+			hex_buf[pos - 1] = '\0';
+		}
+
+		zlog_err("DEBUGME : c_nhg->gate memory dump (%zu bytes): %s", len, hex_buf);
 	}
 
 	/* set nh_grp_full_list */
