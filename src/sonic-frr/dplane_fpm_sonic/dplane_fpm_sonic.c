@@ -1072,6 +1072,14 @@ static void build_c_nexthopgroupfull_multi(struct C_NextHopGroupFull *c_nhg,
 	/* set nhg_flags */
 	c_nhg->nhg_flags = dplane_ctx_get_nhe_nhg_flags(ctx);
 
+	/*
+	 * For recursive NH, we keep the nexthop information for convergence handling
+	 */
+	if (CHECK_FLAG(c_nhg->nhg_flags, NEXTHOP_GROUP_RECURSIVE)) {
+		const struct nexthop *nh = nhg->nexthop;
+		memcpy(&c_nhg->gate, &nh->gate, sizeof(union g_addr));
+	}
+
 	/* set nh_grp_full_list */
 	const struct nh_grp_full *nh_grp_full_list = dplane_ctx_get_nhe_nh_grp_full(ctx);
 	for (uint32_t i = 0; i < dplane_ctx_get_nhe_nh_grp_full_count(ctx); i++) {
