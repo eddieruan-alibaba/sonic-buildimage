@@ -1079,6 +1079,8 @@ static void build_c_nexthopgroupfull_multi(struct C_NextHopGroupFull *c_nhg,
 		const struct nexthop *nh = nhg->nexthop;
 		memcpy(&c_nhg->gate, &nh->gate, sizeof(union g_addr));
 
+		/* set nexthop type */
+		c_nhg->type = nh->type;
 
 		size_t len = sizeof(union g_addr);
 		// 2 hex chars + 1 space per byte + 1 for null terminator
