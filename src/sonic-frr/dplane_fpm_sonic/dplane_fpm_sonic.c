@@ -1055,7 +1055,7 @@ static struct zebra_vrf *vrf_lookup_by_table_id(uint32_t table_id)
  * @param c_nhg pointer of the object we're going to construct
  * @param ctx pointer of zebra_dplane_ctx, we get zebra information from it
  */
-static void build_c_nexthopgroupfull_multi(struct C_NextHopGroupFull *c_nhg,
+static bool build_c_nexthopgroupfull_multi(struct C_NextHopGroupFull *c_nhg,
 					   struct zebra_dplane_ctx *ctx)
 {
 	memset(c_nhg, 0, sizeof(struct C_NextHopGroupFull));
@@ -1071,7 +1071,7 @@ static void build_c_nexthopgroupfull_multi(struct C_NextHopGroupFull *c_nhg,
 
 	/* set nhg_flags */
 	c_nhg->nhg_flags = dplane_ctx_get_nhe_nhg_flags(ctx);
-
+	bool is_recurisve = false;
 	/*
 	 * For recursive NH, we keep the nexthop information for convergence handling
 	 */
@@ -1082,22 +1082,7 @@ static void build_c_nexthopgroupfull_multi(struct C_NextHopGroupFull *c_nhg,
 		/* set nexthop type */
 		c_nhg->type = nh->type;
 
-		size_t len = sizeof(union g_addr);
-		// 2 hex chars + 1 space per byte + 1 for null terminator
-		char hex_buf[len * 3 + 1];
-		const uint8_t *ptr = (const uint8_t *)&c_nhg->gate;
-		size_t pos = 0;
-
-		for (size_t i = 0; i < len; ++i) {
-			pos += snprintf(hex_buf + pos, sizeof(hex_buf) - pos, "%02x ", (unsigned)ptr[i]);
-		}
-
-		// Remove trailing space and ensure null-termination
-		if (pos > 0) {
-			hex_buf[pos - 1] = '\0';
-		}
-
-		zlog_err("DEBUGME : c_nhg->gate memory dump (%zu bytes): %s", len, hex_buf);
+		is_recurisve = true;
 	}
 
 	/* set nh_grp_full_list */
@@ -1119,6 +1104,8 @@ static void build_c_nexthopgroupfull_multi(struct C_NextHopGroupFull *c_nhg,
 	for (uint32_t i = 0; i < dplane_ctx_get_nhe_dependents_count(ctx); i++) {
 		c_nhg->dependents[i] = dependents[i];
 	}
+
+	return is_recurisve;
 }
 
 /**
@@ -2495,8 +2482,8 @@ static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
 			zlog_err("%s: nhg_id=%u multi-nexthop case, count=%u",
 				 __func__, id, dplane_ctx_get_nhe_nh_grp_full_count(ctx));
 
-			build_c_nexthopgroupfull_multi(&c_nhg, ctx);
-			json_str = nexthopgroupfull_json_from_c_nhg_multi(&c_nhg, MULTIPATH_NUM);
+			bool is_recursive = build_c_nexthopgroupfull_multi(&c_nhg, ctx);
+			json_str = nexthopgroupfull_json_from_c_nhg_multi(&c_nhg, MULTIPATH_NUM, is_recursive);
 
 			if (!json_str) {
 				zlog_err(
