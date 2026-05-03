@@ -2493,7 +2493,7 @@ static ssize_t netlink_nhtevent_msg_encode(const struct zebra_dplane_ctx *ctx,
 	ret = NLMSG_ALIGN(req->n.nlmsg_len);
 
 	zlog_debug("%s: encoded NHT event rnh=%s ret=%zd",
-		   __func__, c_nht.rnh_prefix, ret);
+		   __func__, rnh_prefix, ret);
 
 	free(json_str);
 	return ret;
