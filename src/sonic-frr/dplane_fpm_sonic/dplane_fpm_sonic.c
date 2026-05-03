@@ -60,7 +60,6 @@
 #include <nexthopgroup/c-api/nexthopgroup_capi.h>
 #include <nexthopgroup/c_nexthopgroupfull.h>
 #include <nexthopgroup/c-api/nhtevent_capi.h>
-#include <nexthopgroup/c_nhtevent.h>
 
 /* Global flag set by zebra --nhg-fib command-line option. */
 extern bool zebra_nhg_fib_enabled;
@@ -2418,7 +2417,11 @@ static ssize_t netlink_nhtevent_msg_encode(const struct zebra_dplane_ctx *ctx,
 	const struct prefix *rnh_pfx;
 	const struct prefix *prev_pfx;
 	const struct prefix *curr_pfx;
-	struct C_NhtEvent c_nht;
+	char rnh_prefix[64];
+	char prev_resolved_prefix[64];
+	uint32_t prev_resolved_nhg_id;
+	char curr_resolved_prefix[64];
+	uint32_t curr_resolved_nhg_id;
 	char *json_str = NULL;
 	ssize_t ret = -1;
 
@@ -2432,40 +2435,41 @@ static ssize_t netlink_nhtevent_msg_encode(const struct zebra_dplane_ctx *ctx,
 	prev_pfx = dplane_ctx_get_nht_prev_resolved_prefix(ctx);
 	curr_pfx = dplane_ctx_get_nht_curr_resolved_prefix(ctx);
 
-	/* Build C_NhtEvent from dplane context */
-	memset(&c_nht, 0, sizeof(c_nht));
-
+	/* Build NHT event fields from dplane context */
 	if (rnh_pfx && rnh_pfx->family != 0)
-		prefix2str(rnh_pfx, c_nht.rnh_prefix,
-			   sizeof(c_nht.rnh_prefix));
+		prefix2str(rnh_pfx, rnh_prefix, sizeof(rnh_prefix));
 	else
-		snprintf(c_nht.rnh_prefix, sizeof(c_nht.rnh_prefix), "::/0");
+		snprintf(rnh_prefix, sizeof(rnh_prefix), "::/0");
 
 	if (prev_pfx && prev_pfx->family != 0)
-		prefix2str(prev_pfx, c_nht.prev_resolved_prefix,
-			   sizeof(c_nht.prev_resolved_prefix));
+		prefix2str(prev_pfx, prev_resolved_prefix,
+			   sizeof(prev_resolved_prefix));
 	else
-		snprintf(c_nht.prev_resolved_prefix,
-			 sizeof(c_nht.prev_resolved_prefix), "::/0");
+		snprintf(prev_resolved_prefix,
+			 sizeof(prev_resolved_prefix), "::/0");
 
-	c_nht.prev_resolved_nhg_id =
+	prev_resolved_nhg_id =
 		dplane_ctx_get_nht_prev_resolved_nhg_id(ctx);
 
 	if (curr_pfx && curr_pfx->family != 0)
-		prefix2str(curr_pfx, c_nht.curr_resolved_prefix,
-			   sizeof(c_nht.curr_resolved_prefix));
+		prefix2str(curr_pfx, curr_resolved_prefix,
+			   sizeof(curr_resolved_prefix));
 	else
-		snprintf(c_nht.curr_resolved_prefix,
-			 sizeof(c_nht.curr_resolved_prefix), "::/0");
+		snprintf(curr_resolved_prefix,
+			 sizeof(curr_resolved_prefix), "::/0");
 
-	c_nht.curr_resolved_nhg_id =
+	curr_resolved_nhg_id =
 		dplane_ctx_get_nht_curr_resolved_nhg_id(ctx);
 
 	/* Convert to JSON via sonic-fib C API */
-	json_str = nhtevent_json_from_c_nht(&c_nht);
+	json_str = nhtevent_json_from_c_nht(rnh_prefix,
+					     prev_resolved_prefix,
+					     prev_resolved_nhg_id,
+					     curr_resolved_prefix,
+					     curr_resolved_nhg_id);
 	if (!json_str) {
 		zlog_err("%s: nhtevent_json_from_c_nht failed for rnh=%s",
-			 __func__, c_nht.rnh_prefix);
+			 __func__, rnh_prefix);
 		return -1;
 	}
 
