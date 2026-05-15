@@ -59,6 +59,8 @@
 #include "lib/srv6.h"
 #include <nexthopgroup/c-api/nexthopgroup_capi.h>
 #include <nexthopgroup/c_nexthopgroupfull.h>
+#include <nexthopgroup/c-api/nhtevent_capi.h>
+#include <nexthopgroup/c_nhtevent.h>
 
 /* Global flag set by zebra --nhg-fib command-line option. */
 extern bool zebra_nhg_fib_enabled;
@@ -115,6 +117,7 @@ enum custom_nlmsg_types {
 	RTM_DELSIDLIST			= 4001,
 	RTM_NEWNHGFIB			= 5000,
 	RTM_DELNHGFIB			= 5001,
+	RTM_NEWNHTEVENT			= 6000,
 };
 
 /* Custom Netlink attribute types */
@@ -2390,6 +2393,108 @@ nexthop_done:
 }
 
 /**
+ * NHT event encoding helper function.
+ *
+ * Converts the NHT dplane context into a JSON string using sonic-fib's
+ * nhtevent_capi, then wraps it in a netlink message (RTM_NEWNHTEVENT)
+ * with the JSON payload as FPM_NHA_JSON_STR attribute.
+ *
+ * \param[in] ctx dataplane context (information snapshot).
+ * \param[out] buf buffer to hold the packet.
+ * \param[in] buflen amount of buffer bytes.
+ *
+ * \returns -1 on failure, 0 when the msg doesn't fit entirely in the buffer,
+ * otherwise the number of bytes written to buf.
+ */
+static ssize_t netlink_nhtevent_msg_encode(const struct zebra_dplane_ctx *ctx,
+					   void *buf, size_t buflen)
+{
+	struct {
+		struct nlmsghdr n;
+		struct rtmsg rtm;
+		char buf[];
+	} *req = buf;
+
+	const struct prefix *rnh_pfx;
+	const struct prefix *prev_pfx;
+	const struct prefix *curr_pfx;
+	struct C_NhtEvent c_nht;
+	char *json_str = NULL;
+	ssize_t ret = -1;
+
+	if (buflen < sizeof(*req))
+		return 0;
+
+	memset(req, 0, sizeof(*req));
+	memset(&c_nht, 0, sizeof(c_nht));
+
+	/* Extract fields from dplane context */
+	rnh_pfx = dplane_ctx_get_rnh_prefix(ctx);
+	prev_pfx = dplane_ctx_get_rnh_prev_resolved_prefix(ctx);
+	curr_pfx = dplane_ctx_get_rnh_curr_resolved_prefix(ctx);
+
+	/* Build NHT event fields with NULL/zero-family fallback */
+	if (rnh_pfx && rnh_pfx->family != 0)
+		prefix2str(rnh_pfx, c_nht.rnh_prefix,
+			   sizeof(c_nht.rnh_prefix));
+	else
+		snprintf(c_nht.rnh_prefix, sizeof(c_nht.rnh_prefix), "::/0");
+
+	if (prev_pfx && prev_pfx->family != 0)
+		prefix2str(prev_pfx, c_nht.prev_resolved_prefix,
+			   sizeof(c_nht.prev_resolved_prefix));
+	else
+		snprintf(c_nht.prev_resolved_prefix,
+			 sizeof(c_nht.prev_resolved_prefix), "::/0");
+
+	c_nht.prev_resolved_nhg_id =
+		dplane_ctx_get_rnh_prev_resolved_nhg_id(ctx);
+
+	if (curr_pfx && curr_pfx->family != 0)
+		prefix2str(curr_pfx, c_nht.curr_resolved_prefix,
+			   sizeof(c_nht.curr_resolved_prefix));
+	else
+		snprintf(c_nht.curr_resolved_prefix,
+			 sizeof(c_nht.curr_resolved_prefix), "::/0");
+
+	c_nht.curr_resolved_nhg_id =
+		dplane_ctx_get_rnh_curr_resolved_nhg_id(ctx);
+
+	/* Convert to JSON via sonic-fib C API */
+	json_str = nhtevent_json_from_c_nht(&c_nht);
+	if (!json_str) {
+		zlog_err("%s: nhtevent_json_from_c_nht failed for rnh=%s",
+			 __func__, c_nht.rnh_prefix);
+		return -1;
+	}
+
+	/* Build netlink message header */
+	req->n.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+	req->n.nlmsg_flags = NLM_F_CREATE | NLM_F_REQUEST;
+	req->n.nlmsg_type = RTM_NEWNHTEVENT;
+	req->n.nlmsg_pid = 0;
+
+	req->rtm.rtm_family = rnh_pfx ? rnh_pfx->family : AF_UNSPEC;
+
+	/* Encode JSON string as attribute in message */
+	if (!nl_attr_put(&req->n, buflen, FPM_NHA_JSON_STR,
+			 json_str, strlen(json_str) + 1)) {
+		zlog_err("%s: Failed to put NHT event JSON into netlink message",
+			 __func__);
+		free(json_str);
+		return -1;
+	}
+
+	ret = NLMSG_ALIGN(req->n.nlmsg_len);
+
+	zlog_debug("%s: encoded NHT event rnh=%s ret=%zd",
+		   __func__, c_nht.rnh_prefix, ret);
+
+	free(json_str);
+	return ret;
+}
+
+/**
  * Next hop packet (full message) encoding helper function.
  * This function is modified from function netlink_nexthop_msg_encode to
  * encode the nexthopgroupfull JSON string to fpmsyncd.
@@ -2828,6 +2933,18 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		if (strmatch(dplane_ctx_get_ifname(ctx), "lo"))
 			event_add_timer(fnc->fthread->master, fpm_srv6_route_reset,
 				 fnc, 0, &fnc->t_ribreset);
+		break;
+
+	case DPLANE_OP_NHT_EVENT_UPDATE:
+		rv = netlink_nhtevent_msg_encode(ctx, nl_buf, sizeof(nl_buf));
+		if (rv <= 0) {
+			zlog_err("%s: netlink_nhtevent_msg_encode failed",
+				 __func__);
+			dplane_ctx_set_status(ctx,
+					      ZEBRA_DPLANE_REQUEST_FAILURE);
+			return 0;
+		}
+		nl_buf_len = (size_t)rv;
 		break;
 
 	/* Un-handled by FPM at this time. */
