@@ -2635,7 +2635,10 @@ cleanup:
 		free(json_str);
 		free_c_nexthopgroupfull(&c_nhg);
 
-	} else if (cmd != RTM_DELNHGFIB) {
+	} else if (cmd == RTM_DELNHGFIB) {
+		/* Delete only needs NHA_ID, already encoded above */
+		ret = NLMSG_ALIGN(req->n.nlmsg_len);
+	} else {
 		zlog_err(
 			"%s: Nexthop group kernel update command (%d) does not exist",
 			__func__, cmd);
