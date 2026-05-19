@@ -2421,7 +2421,9 @@ static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
 	ssize_t ret = -1;
 
 	zlog_err("%s: START encode nhg_id=%u cmd=%s type=%s",
-		 __func__, id, nl_msg_type_to_str(cmd), zebra_route_string(type));
+		 __func__, id,
+		 (cmd == RTM_NEWNHGFIB) ? "RTM_NEWNHGFIB" : "RTM_DELNHGFIB",
+		 zebra_route_string(type));
 
 	if (!id) {
 		zlog_err(
@@ -2530,17 +2532,22 @@ cleanup:
 		free(json_str);
 		free_c_nexthopgroupfull(&c_nhg);
 
-	} else if (cmd != RTM_DELNHGFIB) {
+	} else if (cmd == RTM_DELNHGFIB) {
+		/* Delete only needs NHA_ID, already encoded above */
+		ret = NLMSG_ALIGN(req->n.nlmsg_len);
+	} else {
 		zlog_err(
 			"%s: Nexthop group kernel update command (%d) does not exist",
 			__func__, cmd);
 		return -1;
 	}
 
-	if (IS_ZEBRA_DEBUG_KERNEL)
-		zlog_debug("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd), id);
+	if (IS_ZEBRA_DEBUG_FPM)
+		zlog_debug("%s: %s, id=%u", __func__,
+			(cmd == RTM_NEWNHGFIB) ? "RTM_NEWNHGFIB" : "RTM_DELNHGFIB", id);
 
-	zlog_err("%s: COMPLETE encode nhg_id=%u ret=%zd", __func__, id, ret);
+	zlog_err("%s: COMPLETE encode nhg_id=%u cmd=%s ret=%zd", __func__, id,
+		 (cmd == RTM_NEWNHGFIB) ? "RTM_NEWNHGFIB" : "RTM_DELNHGFIB", ret);
 
 	return ret;
 }
