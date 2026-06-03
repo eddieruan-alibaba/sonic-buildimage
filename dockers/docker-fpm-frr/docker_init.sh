@@ -106,6 +106,7 @@ chown root:root /usr/sbin/bgp-unisolate
 chmod 0755 /usr/sbin/bgp-unisolate
 
 mkdir -p /var/sonic
+mkdir -p /var/log/swss
 echo "# Config files managed by sonic-config-engine" > /var/sonic/config_status
 
 exec /usr/local/bin/supervisord

@@ -31,6 +31,7 @@ $(DOCKER_FPM_FRR)_CONTAINER_NAME = bgp
 $(DOCKER_FPM_FRR)_RUN_OPT += -t --cap-add=NET_ADMIN --cap-add=SYS_ADMIN
 $(DOCKER_FPM_FRR)_RUN_OPT += -v /etc/sonic:/etc/sonic:ro
 $(DOCKER_FPM_FRR)_RUN_OPT += -v /etc/localtime:/etc/localtime:ro
+$(DOCKER_FPM_FRR)_RUN_OPT += -v /var/log/swss:/var/log/swss:rw
 
 
 $(DOCKER_FPM_FRR)_BASE_IMAGE_FILES += vtysh:/usr/bin/vtysh
