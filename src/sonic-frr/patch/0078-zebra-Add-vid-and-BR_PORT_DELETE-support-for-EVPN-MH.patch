@@ -28,14 +28,14 @@ diff --git a/zebra/kernel_netlink.c b/zebra/kernel_netlink.c
 index 22c62aea5..79b9d3132 100644
 --- a/zebra/kernel_netlink.c
 +++ b/zebra/kernel_netlink.c
-@@ -1617,6 +1617,7 @@ static enum netlink_msg_status nl_put_msg(struct nl_batch *bth,
+@@ -1475,6 +1475,7 @@ static enum netlink_msg_status nl_put_msg(struct nl_batch *bth,
  	case DPLANE_OP_ROUTE_NOTIFY:
  	case DPLANE_OP_LSP_NOTIFY:
  	case DPLANE_OP_BR_PORT_UPDATE:
 +	case DPLANE_OP_BR_PORT_DELETE:
  		return FRR_NETLINK_SUCCESS;
  
- 	case DPLANE_OP_IPTABLE_ADD:
+ 	case DPLANE_OP_INTF_SPEED_GET:
 diff --git a/zebra/zebra_dplane.c b/zebra/zebra_dplane.c
 index fe48f7cb7..fcef52d2f 100644
 --- a/zebra/zebra_dplane.c

@@ -29,10 +29,10 @@ diff --git a/zebra/zebra_dplane.c b/zebra/zebra_dplane.c
 index ebedc7b2c..827d55d68 100644
 --- a/zebra/zebra_dplane.c
 +++ b/zebra/zebra_dplane.c
-@@ -26,6 +26,7 @@
- #include "zebra/zebra_pbr.h"
+@@ -28,6 +28,7 @@
  #include "zebra/zebra_neigh.h"
  #include "zebra/zebra_tc.h"
+ #include "zebra/zebra_trace.h"
 +#include "zebra/zebra_srv6.h"
  #include "printfrr.h"
  
