@@ -3194,6 +3194,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 			if (rv <= 0) {
 				zlog_err("%s: netlink_nexthopgroupfull_msg_encode failed",
 					 __func__);
+				dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
 				return 0;
 			}
 		} else {
@@ -3202,6 +3203,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 			if (rv <= 0) {
 				zlog_err("%s: netlink_nexthop_msg_encode failed",
 					 __func__);
+				dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
 				return 0;
 			}
 		}
@@ -3216,6 +3218,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 			if (rv <= 0) {
 				zlog_err("%s: netlink_nexthopgroupfull_msg_encode failed",
 					 __func__);
+				dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
 				return 0;
 			}
 		} else {
@@ -3224,6 +3227,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 			if (rv <= 0) {
 				zlog_err("%s: netlink_nexthop_msg_encode failed",
 					 __func__);
+				dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
 				return 0;
 			}
 		}
