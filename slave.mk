@@ -1143,11 +1143,11 @@ $(SONIC_INSTALL_WHEELS) : $(PYTHON_WHEELS_PATH)/%-install : .platform $$(addsuff
 	# Use flock for serialized pip install — eliminates busy-wait polling from the
 	# previous mkdir lock. Waiters block in the kernel until the lock is released.
 ifneq ($(CROSS_BUILD_ENVIRON),y)
-	flock $(PYTHON_WHEELS_PATH)/pip_lock.lk sudo -E SKIP_BUILD_HOOK=Y pip$($*_PYTHON_VERSION) install $(PYTHON_WHEELS_PATH)/$* $(LOG)
+	flock $(PYTHON_WHEELS_PATH)/pip_lock.lk sudo -E SKIP_BUILD_HOOK=Y pip$($*_PYTHON_VERSION) install --ignore-installed $(PYTHON_WHEELS_PATH)/$* $(LOG)
 else
 	# Link python script and data expected location to the cross python virtual env installation locations
 	flock $(PYTHON_WHEELS_PATH)/pip_lock.lk bash -c '\
-		PATH=$(VIRTENV_BIN_CROSS_PYTHON$($*_PYTHON_VERSION)):$${PATH} sudo -E $(VIRTENV_BIN_CROSS_PYTHON$($*_PYTHON_VERSION))/pip$($*_PYTHON_VERSION) install $(PYTHON_WHEELS_PATH)/$* $(LOG) && \
+		PATH=$(VIRTENV_BIN_CROSS_PYTHON$($*_PYTHON_VERSION)):$${PATH} sudo -E $(VIRTENV_BIN_CROSS_PYTHON$($*_PYTHON_VERSION))/pip$($*_PYTHON_VERSION) install --ignore-installed $(PYTHON_WHEELS_PATH)/$* $(LOG) && \
 		$(if $(findstring $(SONIC_CONFIG_ENGINE_PY3),$*),(sudo ln -s $(VIRTENV_BIN_CROSS_PYTHON$($*_PYTHON_VERSION))/sonic-cfggen /usr/local/bin/sonic-cfggen 2>/dev/null || true), true ) && \
 		$(if $(findstring $(SONIC_YANG_MODELS_PY3),$*),(sudo ln -s $(VIRTENV_BASE_CROSS_PYTHON3)/yang-models /usr/local/yang-models 2>/dev/null || true), true ) \
 	'
