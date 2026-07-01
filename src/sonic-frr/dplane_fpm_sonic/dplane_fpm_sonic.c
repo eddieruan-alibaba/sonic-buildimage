@@ -1499,6 +1499,14 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 	if (!nl_attr_put(&req->n, datalen, FPM_SRV6_LOCALSID_SID_VALUE, &p->u.prefix, bytelen))
 		return 0;
 
+	/*
+	 * Also emit standard RTA_DST so fpmsyncd's offload-ack (which
+	 * rewrites nlmsg_type to RTM_NEWROUTE and echoes the body back)
+	 * can be parsed by zebra's regular route reader.
+	 */
+	if (!nl_attr_put(&req->n, datalen, RTA_DST, &p->u.prefix, bytelen))
+		return 0;
+
 	/* Table corresponding to this route. */
 	table_id = dplane_ctx_get_table(ctx);
 	if (!fpm) {
