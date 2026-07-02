@@ -1490,6 +1490,7 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 	req->r.rtm_family = p->family;
 	req->r.rtm_dst_len = p->prefixlen;
 	req->r.rtm_scope = RT_SCOPE_UNIVERSE;
+	req->r.rtm_type = RTN_UNICAST;
 
 	if (cmd == RTM_DELSRV6LOCALSID)
 		req->r.rtm_protocol = zebra2proto(dplane_ctx_get_old_type(ctx));
