@@ -273,6 +273,26 @@ def build_def_structs(defs):
     return ordered
 
 
+def _render_nhtevent(schema, template_dir, output_path, mode):
+    env = Environment(loader=FileSystemLoader(template_dir))
+    template_name_map = {
+        "header":        "nhtevent.h.j2",
+        "json_bindings": "nhtevent_json.h.j2",
+        "c_header":      "c_nhtevent.h.j2",
+    }
+    if mode not in template_name_map:
+        print(f"Error: NhtEvent does not support mode '{mode}'")
+        sys.exit(1)
+    root_struct = {"name": schema.get("title", "NhtEvent")}
+    template = env.get_template(template_name_map[mode])
+    output = template.render(root_struct=root_struct)
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".",
+                exist_ok=True)
+    with open(output_path, 'w') as f:
+        f.write(output)
+    print(f"✅ Generated {output_path} (mode: {mode})")
+
+
 def main():
     if len(sys.argv) != 5:
         print("Usage: ./render_schema.py <schema.json> <template_dir> <output_file> <mode>")
@@ -291,6 +311,11 @@ def main():
     # Load and parse schema
     with open(schema_path, 'r') as f:
         schema = json.load(f)
+
+    schema_title = schema.get("title", "")
+    if schema_title == "NhtEvent":
+        _render_nhtevent(schema, template_dir, output_path, mode)
+        return
 
     defs = schema.get("$defs", {})
     enums = extract_enums(defs)

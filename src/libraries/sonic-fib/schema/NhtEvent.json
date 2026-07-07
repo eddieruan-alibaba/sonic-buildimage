@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "NhtEvent.json",
+  "title": "NhtEvent",
+  "description": "NHT event carrying prev/curr resolved NHG info for fast-fixup",
+  "type": "object",
+  "properties": {
+    "rnh_prefix":           { "type": "string",  "description": "Tracked nexthop prefix (with prefix length), e.g. '2064:100::1d/128'" },
+    "prev_resolved_prefix": { "type": "string",  "description": "Prefix previously used to resolve rnh_prefix; empty-family '::/0' or '0.0.0.0/0' when previously unreachable" },
+    "prev_resolved_nhg_id": { "type": "integer", "minimum": 0, "description": "Zebra NHG ID previously used to resolve rnh_prefix; 0 when previously unreachable" },
+    "curr_resolved_prefix": { "type": "string",  "description": "Prefix currently used to resolve rnh_prefix; empty-family '::/0' or '0.0.0.0/0' when currently unreachable" },
+    "curr_resolved_nhg_id": { "type": "integer", "minimum": 0, "description": "Zebra NHG ID currently resolving rnh_prefix; 0 when currently unreachable" }
+  },
+  "required": ["rnh_prefix", "prev_resolved_prefix", "prev_resolved_nhg_id",
+               "curr_resolved_prefix", "curr_resolved_nhg_id"],
+  "additionalProperties": false
+}

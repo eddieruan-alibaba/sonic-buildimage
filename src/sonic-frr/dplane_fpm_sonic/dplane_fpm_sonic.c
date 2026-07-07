@@ -118,6 +118,7 @@ enum custom_nlmsg_types {
 	RTM_DELSIDLIST			= 4001,
 	RTM_NEWNHGFIB			= 5000,
 	RTM_DELNHGFIB			= 5001,
+	RTM_NEWNHTEVENT			= 6000,
 };
 
 /* Custom Netlink attribute types */
