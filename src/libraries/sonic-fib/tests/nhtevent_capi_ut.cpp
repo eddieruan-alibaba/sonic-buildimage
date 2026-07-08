@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include "src/c-api/nhtevent_capi.h"
+#include "src/c_nhtevent.h"
 
 // --- Task 5: encode basic ---
 

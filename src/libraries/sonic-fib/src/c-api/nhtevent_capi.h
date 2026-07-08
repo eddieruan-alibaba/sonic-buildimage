@@ -2,11 +2,14 @@
 #define NHTEVENT_CAPI_H
 
 #include <stdint.h>
-#include "c_nhtevent.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Forward declare — callers include "src/c_nhtevent.h" (with src/ prefix)
+ * to obtain the full struct definition. */
+struct C_NhtEvent;
 
 /*
  * Encode a NhtEvent into a JSON string.
