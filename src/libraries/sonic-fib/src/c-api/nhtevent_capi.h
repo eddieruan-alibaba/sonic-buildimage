@@ -26,6 +26,17 @@ char *nht_event_encode(
     uint32_t    curr_resolved_nhg_id);
 
 /*
+ * Encode a C_NhtEvent struct into a JSON string.
+ * Caller owns the returned pointer and must free() it.
+ * Returns NULL on error (NULL arg or allocation/serialization failure).
+ *
+ * This is the struct-based entry used by the FRR FPM dplane provider,
+ * matching the nexthopgroupfull_json_from_c_nhg_* convention: the C side
+ * fills a C struct and the C-API converts it to a JSON string.
+ */
+char *nhtevent_json_from_c_nht(const struct C_NhtEvent *c_nht);
+
+/*
  * Decode a JSON string into C_NhtEvent.
  * Returns 0 on success, non-zero on error.
  * Prefix fields in out are C-strings of length up to C_NHTEVENT_PREFIX_STR_LEN.

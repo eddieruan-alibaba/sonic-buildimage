@@ -50,6 +50,34 @@ char *nht_event_encode(
     }
 }
 
+char *nhtevent_json_from_c_nht(const struct C_NhtEvent *c_nht)
+{
+    if (!c_nht) {
+        return nullptr;
+    }
+
+    try {
+        fib::NhtEvent ev;
+        ev.rnh_prefix           = c_nht->rnh_prefix;
+        ev.prev_resolved_prefix = c_nht->prev_resolved_prefix;
+        ev.prev_resolved_nhg_id = c_nht->prev_resolved_nhg_id;
+        ev.curr_resolved_prefix = c_nht->curr_resolved_prefix;
+        ev.curr_resolved_nhg_id = c_nht->curr_resolved_nhg_id;
+
+        nlohmann::json j = ev;
+        std::string s = j.dump();
+
+        char *out = static_cast<char*>(std::malloc(s.size() + 1));
+        if (!out) {
+            return nullptr;
+        }
+        std::memcpy(out, s.c_str(), s.size() + 1);
+        return out;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 int nht_event_decode(const char *json_str, struct C_NhtEvent *out)
 {
     if (!json_str || !out) {
