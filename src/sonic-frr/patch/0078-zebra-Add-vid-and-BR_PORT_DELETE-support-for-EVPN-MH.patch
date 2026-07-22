@@ -157,19 +157,21 @@ index fe48f7cb7..fcef52d2f 100644
  enum zebra_dplane_result
  dplane_intf_mpls_modify_state(const struct interface *ifp, bool set)
  {
-@@ -6953,6 +7019,7 @@ static void kernel_dplane_log_detail(struct zebra_dplane_ctx *ctx)
+@@ -6953,7 +7019,8 @@ static void kernel_dplane_log_detail(struct zebra_dplane_ctx *ctx)
  	case DPLANE_OP_ROUTE_NOTIFY:
  	case DPLANE_OP_LSP_NOTIFY:
  	case DPLANE_OP_BR_PORT_UPDATE:
 +	case DPLANE_OP_BR_PORT_DELETE:
  
  	case DPLANE_OP_NONE:
+ 	case DPLANE_OP_NHT_EVENT_UPDATE:
  		break;
-@@ -7212,6 +7279,7 @@ static void kernel_dplane_handle_result(struct zebra_dplane_ctx *ctx)
+@@ -7212,7 +7279,8 @@ static void kernel_dplane_handle_result(struct zebra_dplane_ctx *ctx)
  	case DPLANE_OP_ROUTE_NOTIFY:
  	case DPLANE_OP_LSP_NOTIFY:
  	case DPLANE_OP_BR_PORT_UPDATE:
 +	case DPLANE_OP_BR_PORT_DELETE:
+ 	case DPLANE_OP_NHT_EVENT_UPDATE:
  		break;
  
  	/* TODO -- error counters for incoming events? */
