@@ -78,9 +78,10 @@ diff --git a/zebra/zebra_dplane.h b/zebra/zebra_dplane.h
 index 1c03a2953..a0ee63b76 100644
 --- a/zebra/zebra_dplane.h
 +++ b/zebra/zebra_dplane.h
-@@ -125,6 +125,16 @@ enum dplane_op_e {
+@@ -125,7 +125,17 @@ enum dplane_op_e {
  	DPLANE_OP_NH_UPDATE,
  	DPLANE_OP_NH_DELETE,
+ 	DPLANE_OP_NHT_EVENT_UPDATE,
  
 +	/* Pic Context update*/
 +	DPLANE_OP_PIC_CONTEXT_INSTALL,
