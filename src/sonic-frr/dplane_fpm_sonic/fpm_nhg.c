@@ -68,7 +68,18 @@ uint64_t fpm_nhg_hash_leaf(const struct nexthop *nh)
 		uint8_t label_type, nlabels;
 		mpls_label_t labels[MPLS_MAX_LABELS];
 		uint32_t seg6local_action;
-		struct seg6local_context seg6local_ctx;
+		/* seg6local_context copied memberwise: the source struct
+		 * carries interior padding (inside flv) whose content is
+		 * unspecified wire data and must not reach the digest.
+		 */
+		struct in_addr s6l_nh4;
+		struct in6_addr s6l_nh6;
+		uint32_t s6l_table;
+		int32_t s6l_ifindex;
+		uint32_t s6l_flv_ops;
+		uint8_t s6l_lcblock_len, s6l_lcnode_func_len;
+		uint8_t s6l_block_len, s6l_node_len;
+		uint8_t s6l_function_len, s6l_argument_len;
 		uint8_t encap_behavior;
 		uint8_t nseg;
 		struct in6_addr segs[SRV6_MAX_SIDS];
@@ -82,7 +93,7 @@ uint64_t fpm_nhg_hash_leaf(const struct nexthop *nh)
 		k.bh = nh->bh_type;
 	else
 		k.gate = nh->gate;
-	k.flags_subset = nh->flags & NEXTHOP_FLAG_ONLINK;
+	k.flags_subset = nh->flags & NEXTHOP_FLAGS_HASHED;
 	k.label_type = nh->nh_label_type;
 	if (nh->nh_label) {
 		k.nlabels = MIN(nh->nh_label->num_labels, MPLS_MAX_LABELS);
@@ -90,9 +101,21 @@ uint64_t fpm_nhg_hash_leaf(const struct nexthop *nh)
 		       k.nlabels * sizeof(mpls_label_t));
 	}
 	if (nh->nh_srv6) {
+		const struct seg6local_context *ctx =
+			&nh->nh_srv6->seg6local_ctx;
+
 		k.seg6local_action = nh->nh_srv6->seg6local_action;
-		memcpy(&k.seg6local_ctx, &nh->nh_srv6->seg6local_ctx,
-		       sizeof(k.seg6local_ctx));
+		k.s6l_nh4 = ctx->nh4;
+		k.s6l_nh6 = ctx->nh6;
+		k.s6l_table = ctx->table;
+		k.s6l_ifindex = ctx->ifindex;
+		k.s6l_flv_ops = ctx->flv.flv_ops;
+		k.s6l_lcblock_len = ctx->flv.lcblock_len;
+		k.s6l_lcnode_func_len = ctx->flv.lcnode_func_len;
+		k.s6l_block_len = ctx->block_len;
+		k.s6l_node_len = ctx->node_len;
+		k.s6l_function_len = ctx->function_len;
+		k.s6l_argument_len = ctx->argument_len;
 		if (nh->nh_srv6->seg6_segs) {
 			k.encap_behavior =
 				(uint8_t)nh->nh_srv6->seg6_segs->encap_behavior;
