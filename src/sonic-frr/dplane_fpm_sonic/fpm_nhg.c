@@ -35,8 +35,8 @@
 
 DEFINE_MTYPE_STATIC(ZEBRA, FPM_NHG, "FPM dplane nexthop group");
 
-/* Bytes per encoded group member: child hash u64 + weight u8 */
-#define FPM_NHG_CHILD_ENC_LEN 9
+/* Bytes per encoded group member: child hash u64 + weight u16 BE */
+#define FPM_NHG_CHILD_ENC_LEN 10
 /* Group header: level u8 + masked nhg_flags u32 */
 #define FPM_NHG_HDR_ENC_LEN 5
 /* Resolved prefix: family u8 + prefixlen u8 + 16 addr bytes zero-padded */
@@ -170,7 +170,8 @@ uint64_t fpm_nhg_hash_group(uint8_t level, uint32_t nhg_flags,
 	for (i = 0; i < count; i++) {
 		for (j = 7; j >= 0; j--)
 			*p++ = (children[i].obj->hash >> (8 * j)) & 0xff;
-		*p++ = children[i].weight;
+		*p++ = (uint8_t)(children[i].weight >> 8);
+		*p++ = (uint8_t)(children[i].weight & 0xff);
 	}
 	if (level == FPM_NHG_L_B && resolved) {
 		*p++ = resolved->family;
@@ -305,10 +306,7 @@ void fpm_nhg_tables_flush(struct fpm_nhg_tables *t)
 	t->free_id_count = 0;
 	t->free_id_cap = 0;
 	t->next_id = 1;
-	t->obj_created = 0;
-	t->obj_deleted = 0;
-	t->nhgfib_sent = 0;
-	t->dedupe_hits = 0;
+	/* Counters are lifetime totals; reconnect flush does not reset them. */
 }
 
 /*
@@ -487,7 +485,14 @@ static int fpm_nhg_child_cmp(const void *a, const void *b)
 		return -1;
 	if (ca->obj->hash > cb->obj->hash)
 		return 1;
-	return 0; /* equal hash == same deduped object: order irrelevant */
+	/* Same deduped child may appear twice with different weights;
+	 * tie-break so the encoded sequence is deterministic.
+	 */
+	if (ca->weight < cb->weight)
+		return -1;
+	if (ca->weight > cb->weight)
+		return 1;
+	return 0;
 }
 
 /*
@@ -556,7 +561,7 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 		if (!child)
 			return -1;
 		children[i].obj = child;
-		children[i].weight = (uint8_t)nh->weight;
+		children[i].weight = nh->weight;
 		i++;
 	}
 	return 0;

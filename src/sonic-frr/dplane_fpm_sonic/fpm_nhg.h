@@ -42,7 +42,7 @@ struct fpm_dplane_nhg;
 
 struct fpm_nhg_child {
 	struct fpm_dplane_nhg *obj;
-	uint8_t weight;
+	uint16_t weight;
 };
 
 struct fpm_dplane_nhg {
