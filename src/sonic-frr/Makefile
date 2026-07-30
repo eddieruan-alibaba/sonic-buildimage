@@ -6,7 +6,7 @@ MAIN_TARGET = $(FRR)
 DERIVED_TARGET = $(FRR_PYTHONTOOLS) $(FRR_DBG) $(FRR_SNMP) $(FRR_SNMP_DBG)
 SUFFIX = $(shell date +%Y%m%d\.%H%M%S)
 STG_BRANCH = stg_temp.$(SUFFIX)
-DPLANE_FPM_SONIC_MODULE = dplane_fpm_sonic/dplane_fpm_sonic.c
+DPLANE_FPM_SONIC_MODULE = dplane_fpm_sonic/dplane_fpm_sonic.c dplane_fpm_sonic/fpm_nhg.c dplane_fpm_sonic/fpm_nhg.h
 
 CURRENT_BRANCH := $(shell cd ./frr; git branch --show-current 2>/dev/null || true)
 CURRENT_BRANCH := $(if $(CURRENT_BRANCH),$(CURRENT_BRANCH),$(FRR_BRANCH))
@@ -25,7 +25,7 @@ endif
 	#stg branch --create $(STG_BRANCH) $(FRR_TAG)
 	stg import -s ../patch/series
 	gbp dch --ignore-branch --new-version=$(FRR_VERSION)-sonic-$(FRR_SUBVERSION) --dch-opt="--force-bad-version" --commit --git-author
-	cp ../$(DPLANE_FPM_SONIC_MODULE) zebra/
+	cp $(addprefix ../,$(DPLANE_FPM_SONIC_MODULE)) zebra/
 
 ifeq ($(CROSS_BUILD_ENVIRON), y)
 	CFLAGS="-I $$CROSS_PERL_CORE_PATH" dpkg-buildpackage -rfakeroot -b -d -us -uc -Ppkg.frr.nortrlib -a$(CONFIGURED_ARCH) -Pcross,nocheck -j$(SONIC_CONFIG_MAKE_JOBS) --admindir $(SONIC_DPKG_ADMINDIR)
