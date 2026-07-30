@@ -5,7 +5,6 @@
 #include <nlohmann/json.hpp>
 
 #include <string>
-#include <cstring>     // for memset
 #include <arpa/inet.h> // for inet_ntop / inet_pton
 
 namespace fib {
@@ -166,7 +165,7 @@ inline void to_json(nlohmann::ordered_json& j, const {{root_struct_name}}& nh) {
         {%- for field in sorted_fields %}
         {%- if field.name == "bh_type" %}
         {%- elif field.name == "nh_srv6" %}
-        {%- elif field.name in ["gate", "src", "rmap_src", "resolved_addr"] %}
+        {%- elif field.name in ["gate", "src", "rmap_src"] %}
         {"{{ field.name }}", gaddr_to_string(nh.{{ field.name }}, nh.type)},
         {%- else %}
         {"{{ field.name }}", nh.{{ field.name }}},
@@ -189,18 +188,11 @@ inline void to_json(nlohmann::ordered_json& j, const {{root_struct_name}}& nh) {
 inline void from_json(const nlohmann::ordered_json& j, {{ root_struct_name }}& nh) {
     {%- set sorted_fields = root_struct.fields | sort(attribute='position') %}
     {%- for field in sorted_fields %}
-    {%- if field.name == "resolved_addr" %}
-    if (j.contains("resolved_addr")) {
-        std::string resolved_addr_str = j.at("resolved_addr");
-        string_to_gaddr(resolved_addr_str, nh.resolved_addr, nh.type);
+    {%- if field.name == "resolved_prefix" %}
+    if (j.contains("resolved_prefix")) {
+        j.at("resolved_prefix").get_to(nh.resolved_prefix);
     } else {
-        memset(&nh.resolved_addr, 0, sizeof(nh.resolved_addr));
-    }
-    {%- elif field.name == "resolved_len" %}
-    if (j.contains("resolved_len")) {
-        j.at("resolved_len").get_to(nh.resolved_len);
-    } else {
-        nh.resolved_len = 0;
+        nh.resolved_prefix = "";
     }
     {%- elif field.name in ["gate", "src", "rmap_src"] %}
     std::string {{ field.name }}_str = j.at("{{ field.name }}");

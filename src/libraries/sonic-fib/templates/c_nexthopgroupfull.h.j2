@@ -91,7 +91,11 @@ struct C_NextHopGroupFull {
         enum C_blackhole_type bh_type;
     };
 {%- for field in root_struct.fields if field.position == 5 %}
+    {%- if field.name == "resolved_prefix" %}
+    char resolved_prefix[64];
+    {%- else %}
     {{ field.c_type }} {{ field.name }};
+    {%- endif %}
 {%- endfor %}
     char _hash_end[0];
 {%- for field in root_struct.fields if field.position == 6 and field.name != "ifname" %}
