@@ -225,6 +225,7 @@ struct fpm_nl_ctx {
 	struct event *t_write;
 	struct event *t_event;
 	struct event *t_nhg;
+	struct event *t_nhg_fib;
 	struct event *t_dequeue;
 	struct event *t_wedged;
 
@@ -423,11 +424,9 @@ DEFUN(fpm_use_nhg, fpm_use_nhg_cmd,
 	if (gfnc->use_nhg)
 		return CMD_SUCCESS;
 
-	if (gfnc->use_nhg_fib) {
+	if (gfnc->use_nhg_fib)
 		vty_out(vty,
-			"%% cannot enable use-next-hop-groups while use-nhg-fib is set\n");
-		return CMD_WARNING_CONFIG_FAILED;
-	}
+			"%% use-nhg-fib is enabled; it will be disabled by use-next-hop-groups\n");
 
 	event_add_event(gfnc->fthread->master, fpm_process_event, gfnc,
 			 FNE_TOGGLE_NHG, &gfnc->t_nhg);
@@ -460,14 +459,12 @@ DEFUN(fpm_use_nhg_fib, fpm_use_nhg_fib_cmd,
 	if (gfnc->use_nhg_fib)
 		return CMD_SUCCESS;
 
-	if (gfnc->use_nhg) {
+	if (gfnc->use_nhg)
 		vty_out(vty,
-			"%% cannot enable use-nhg-fib while use-next-hop-groups is set\n");
-		return CMD_WARNING_CONFIG_FAILED;
-	}
+			"%% use-next-hop-groups is enabled; it will be disabled by use-nhg-fib\n");
 
 	event_add_event(gfnc->fthread->master, fpm_process_event, gfnc,
-			FNE_TOGGLE_NHG_FIB, &gfnc->t_nhg);
+			FNE_TOGGLE_NHG_FIB, &gfnc->t_nhg_fib);
 
 	return CMD_SUCCESS;
 }
@@ -483,7 +480,7 @@ DEFUN(no_fpm_use_nhg_fib, no_fpm_use_nhg_fib_cmd,
 		return CMD_SUCCESS;
 
 	event_add_event(gfnc->fthread->master, fpm_process_event, gfnc,
-			FNE_TOGGLE_NHG_FIB, &gfnc->t_nhg);
+			FNE_TOGGLE_NHG_FIB, &gfnc->t_nhg_fib);
 
 	return CMD_SUCCESS;
 }
@@ -583,6 +580,7 @@ DEFUN(fpm_show_status,
 
 		json_object_boolean_add(j, "connected", connected);
 		json_object_boolean_add(j, "useNHG", gfnc->use_nhg);
+		json_object_boolean_add(j, "useNHGFib", gfnc->use_nhg_fib);
 		json_object_boolean_add(j, "useRouteReplace",
 					gfnc->use_route_replace);
 		json_object_boolean_add(j, "disabled", gfnc->disabled);
@@ -600,6 +598,8 @@ DEFUN(fpm_show_status,
 		ttable_add_row(table, "Connected|%s", connected ? "Yes" : "No");
 		ttable_add_row(table, "Use Nexthop Groups|%s",
 			       gfnc->use_nhg ? "Yes" : "No");
+		ttable_add_row(table, "Use NHG FIB Mode|%s",
+			       gfnc->use_nhg_fib ? "Yes" : "No");
 		ttable_add_row(table, "Use Route Replace Semantics|%s",
 			       gfnc->use_route_replace ? "Yes" : "No");
 		ttable_add_row(table, "Disabled|%s",
@@ -3951,6 +3951,8 @@ static void fpm_process_event(struct event *t)
 	case FNE_TOGGLE_NHG:
 		zlog_info("%s: toggle next hop groups support", __func__);
 		fnc->use_nhg = !fnc->use_nhg;
+		if (fnc->use_nhg)
+			fnc->use_nhg_fib = false;
 		fpm_reconnect(fnc);
 		break;
 
@@ -3958,6 +3960,8 @@ static void fpm_process_event(struct event *t)
 		zlog_info("%s: toggle RIB/FIB next hop groups support",
 			  __func__);
 		fnc->use_nhg_fib = !fnc->use_nhg_fib;
+		if (fnc->use_nhg_fib)
+			fnc->use_nhg = false;
 		fpm_reconnect(fnc);
 		break;
 
@@ -4034,6 +4038,7 @@ static int fpm_nl_finish_early(struct fpm_nl_ctx *fnc)
 	event_cancel(&fnc->t_rmacwalk);
 	event_cancel(&fnc->t_event);
 	event_cancel(&fnc->t_nhg);
+	event_cancel(&fnc->t_nhg_fib);
 	event_cancel_async(fnc->fthread->master, &fnc->t_read, NULL);
 	event_cancel_async(fnc->fthread->master, &fnc->t_write, NULL);
 	event_cancel_async(fnc->fthread->master, &fnc->t_connect, NULL);
@@ -4172,8 +4177,6 @@ static int fpm_nl_new(struct event_loop *tm)
 	gfnc = calloc(1, sizeof(*gfnc));
 	gfnc->fib_log_level = FIB_LOG_LEVEL_INFO; /* Default: INFO */
 	gfnc->use_nhg_fib = false;
-	if (gfnc->use_nhg_fib)
-		zlog_info("%s: NHG Full encoding enabled via --nhg-fib", __func__);
 	fib_frr_set_log_level(gfnc->fib_log_level);
 	zlog_info("%s: FIB log level initialized to %d (INFO)", __func__, gfnc->fib_log_level);
 	rv = dplane_provider_register(prov_name, DPLANE_PRIO_POSTPROCESS,
