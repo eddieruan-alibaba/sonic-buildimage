@@ -60,10 +60,21 @@ struct fpm_dplane_nhg {
 	struct fpm_nhg_child *children; /* sorted by obj->hash */
 };
 
-/* Route-key -> object map lives in dplane_fpm_sonic.c (P8): key type owned there. */
+/*
+ * Route key: identifies a route the plugin has seen. The (table_id, afi,
+ * prefix) triple is the design's route_nhg_map key — the only memory of
+ * "old" across route events (design §4.2.1).
+ */
+struct fpm_nhg_route_key {
+	uint32_t table_id;
+	uint8_t afi;
+	struct prefix p;
+};
+
 struct fpm_nhg_tables {
 	struct hash *by_hash;
 	struct hash *by_id;
+	struct hash *route_map; /* fpm_nhg_route_key -> top (L-A) object */
 	uint32_t next_id;
 	uint32_t *free_ids;
 	uint32_t free_id_count, free_id_cap;
@@ -96,5 +107,34 @@ struct fpm_dplane_nhg *fpm_nhg_build(struct fpm_nhg_tables *t,
 				     struct fpm_nhg_staging *newq);
 void fpm_nhg_ref(struct fpm_dplane_nhg *obj);
 void fpm_nhg_rollback(struct fpm_nhg_tables *t, struct fpm_nhg_staging *newq);
+
+/*
+ * DEL staging carries the payload BY VALUE, not the object pointer:
+ * fpm_nhg_unref() stages the DEL and then frees the object in the same
+ * call, so a pointer queue would hand the emitter a dangling object.
+ * RTM_DELNHGFIB needs nothing but the id, so one uint32 per entry is the
+ * whole payload.
+ */
+struct fpm_nhg_del_entry {
+	uint32_t dplane_id;
+};
+
+struct fpm_nhg_del_queue {
+	struct fpm_nhg_del_entry *ids; /* parent-before-child DEL order */
+	uint16_t count, cap;
+};
+
+void fpm_nhg_del_queue_free(struct fpm_nhg_del_queue *q);
+void fpm_nhg_unref(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj,
+		   struct fpm_nhg_del_queue *delq);
+
+struct fpm_dplane_nhg *fpm_nhg_route_get(struct fpm_nhg_tables *t,
+					 const struct fpm_nhg_route_key *k);
+void fpm_nhg_route_set(struct fpm_nhg_tables *t,
+		       const struct fpm_nhg_route_key *k,
+		       struct fpm_dplane_nhg *obj);
+struct fpm_dplane_nhg *fpm_nhg_route_pop(struct fpm_nhg_tables *t,
+					 const struct fpm_nhg_route_key *k);
+void fpm_nhg_record_rib_id(struct fpm_dplane_nhg *obj, uint32_t rib_id);
 
 #endif /* _FPM_NHG_H */

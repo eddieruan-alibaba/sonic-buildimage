@@ -27,6 +27,7 @@
 #include "lib/zebra.h"
 #include "lib/memory.h"
 #include "lib/sha256.h"
+#include "lib/jhash.h"
 #include "lib/mpls.h"
 #include "lib/srv6.h"
 #include "zebra/rib.h" /* DECLARE_MGROUP(ZEBRA) */
@@ -243,6 +244,33 @@ static bool fpm_nhg_id_cmp(const void *data1, const void *data2)
 	       ((const struct fpm_dplane_nhg *)data2)->dplane_id;
 }
 
+/*
+ * route_nhg_map: (table_id, afi, prefix) -> top (L-A) object. Entries are
+ * their own small allocation; the value is a borrowed pointer (the map's
+ * refcount on the object is taken/released by the caller, not here).
+ */
+struct fpm_nhg_route_entry {
+	struct fpm_nhg_route_key key;
+	struct fpm_dplane_nhg *obj;
+};
+
+static unsigned int fpm_nhg_route_key_hash(const void *data)
+{
+	const struct fpm_nhg_route_entry *e = data;
+
+	/* prefix_hash_key() (lib/prefix.h) zero-normalizes the prefix bytes */
+	return jhash_2words(e->key.table_id, e->key.afi,
+			    prefix_hash_key(&e->key.p));
+}
+
+static bool fpm_nhg_route_key_cmp(const void *data1, const void *data2)
+{
+	const struct fpm_nhg_route_entry *a = data1, *b = data2;
+
+	return a->key.table_id == b->key.table_id &&
+	       a->key.afi == b->key.afi && prefix_same(&a->key.p, &b->key.p);
+}
+
 void fpm_nhg_tables_init(struct fpm_nhg_tables *t)
 {
 	memset(t, 0, sizeof(*t));
@@ -250,6 +278,9 @@ void fpm_nhg_tables_init(struct fpm_nhg_tables *t)
 				 "FPM dplane NHG by hash");
 	t->by_id = hash_create(fpm_nhg_id_key, fpm_nhg_id_cmp,
 			       "FPM dplane NHG by id");
+	t->route_map = hash_create(fpm_nhg_route_key_hash,
+				   fpm_nhg_route_key_cmp,
+				   "FPM dplane NHG route map");
 	t->next_id = 1;
 }
 
@@ -300,13 +331,20 @@ static void fpm_nhg_obj_free(void *data)
 	XFREE(MTYPE_FPM_NHG, obj);
 }
 
+static void fpm_nhg_route_entry_free(void *data)
+{
+	XFREE(MTYPE_FPM_NHG, data);
+}
+
 void fpm_nhg_tables_flush(struct fpm_nhg_tables *t)
 {
 	/*
 	 * Objects live in both tables: empty by_id without freeing, then
 	 * free each object once via by_hash. The tables themselves are
-	 * kept (reused after reconnect).
+	 * kept (reused after reconnect). route_map entries only hold
+	 * borrowed object pointers, so they go first.
 	 */
+	hash_clean(t->route_map, fpm_nhg_route_entry_free);
 	hash_clean(t->by_id, NULL);
 	hash_clean(t->by_hash, fpm_nhg_obj_free);
 	XFREE(MTYPE_FPM_NHG, t->free_ids);
@@ -705,4 +743,131 @@ void fpm_nhg_rollback(struct fpm_nhg_tables *t, struct fpm_nhg_staging *newq)
 		t->obj_created--;
 	}
 	newq->count = 0;
+}
+
+/*
+ * Deletion (design §4.2.1 "Deletion primitive"). Objects die only when
+ * their refcount reaches 0 — no GC pass, no tree diffing.
+ *
+ * The DEL of a parent is staged BEFORE recursing into its children, so
+ * the staged sequence is parent-before-child: fpmsyncd never sees a live
+ * object whose depends have already been deleted.
+ *
+ * Staging is by value (dplane id only): the object is freed before this
+ * function returns, so staging the pointer would hand the emitter freed
+ * memory.
+ *
+ * id_free() vs DEL flush: the design requires that a freed id is not
+ * reused before its DEL has been flushed. That holds without deferring
+ * the free because
+ *   (a) within one ctx the whole fpm_nhg_build() runs before any unref,
+ *       so ids this ctx frees cannot be popped by this ctx's allocations;
+ *   (b) the caller flushes the staged DELs before returning from the
+ *       route op, so any later ctx allocating a recycled id necessarily
+ *       emits its NEW after that DEL in the byte stream.
+ */
+static void fpm_nhg_del_queue_push(struct fpm_nhg_del_queue *q, uint32_t id)
+{
+	if (q->count == q->cap) {
+		q->cap = q->cap ? q->cap * 2 : 16;
+		q->ids = XREALLOC(MTYPE_FPM_NHG, q->ids,
+				  q->cap * sizeof(*q->ids));
+	}
+	q->ids[q->count++].dplane_id = id;
+}
+
+void fpm_nhg_del_queue_free(struct fpm_nhg_del_queue *q)
+{
+	XFREE(MTYPE_FPM_NHG, q->ids);
+	q->count = 0;
+	q->cap = 0;
+}
+
+void fpm_nhg_unref(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj,
+		   struct fpm_nhg_del_queue *delq)
+{
+	uint16_t i;
+
+	assert(obj->refcount > 0);
+	if (--obj->refcount > 0)
+		return;
+
+	fpm_nhg_del_queue_push(delq, obj->dplane_id);
+	for (i = 0; i < obj->num_children; i++)
+		fpm_nhg_unref(t, obj->children[i].obj, delq);
+	fpm_nhg_remove(t, obj);
+	fpm_nhg_id_free(t, obj->dplane_id);
+	fpm_nhg_obj_free(obj);
+	t->obj_deleted++;
+}
+
+/*
+ * route_nhg_map accessors. The upsert flow is get-then-set: the caller
+ * reads the old object first, installs the new one, then unrefs the old
+ * (design §4.2.1 "Per-op handling").
+ */
+static void *fpm_nhg_route_entry_alloc(void *arg)
+{
+	const struct fpm_nhg_route_entry *ref = arg;
+	struct fpm_nhg_route_entry *e;
+
+	e = XCALLOC(MTYPE_FPM_NHG, sizeof(*e));
+	e->key = ref->key;
+	return e;
+}
+
+struct fpm_dplane_nhg *fpm_nhg_route_get(struct fpm_nhg_tables *t,
+					 const struct fpm_nhg_route_key *k)
+{
+	struct fpm_nhg_route_entry ref = { .key = *k }, *e;
+
+	e = hash_lookup(t->route_map, &ref);
+	return e ? e->obj : NULL;
+}
+
+void fpm_nhg_route_set(struct fpm_nhg_tables *t,
+		       const struct fpm_nhg_route_key *k,
+		       struct fpm_dplane_nhg *obj)
+{
+	struct fpm_nhg_route_entry ref = { .key = *k }, *e;
+
+	e = hash_get(t->route_map, &ref, fpm_nhg_route_entry_alloc);
+	e->obj = obj; /* replaces any previous object: caller unrefs the old */
+}
+
+struct fpm_dplane_nhg *fpm_nhg_route_pop(struct fpm_nhg_tables *t,
+					 const struct fpm_nhg_route_key *k)
+{
+	struct fpm_nhg_route_entry ref = { .key = *k }, *e;
+	struct fpm_dplane_nhg *obj;
+
+	e = hash_release(t->route_map, &ref);
+	if (!e)
+		return NULL;
+	obj = e->obj;
+	XFREE(MTYPE_FPM_NHG, e);
+	return obj;
+}
+
+/*
+ * Remember which zebra (rib) NHG ids were seen referencing this object.
+ * Show-only mapping (design D13): a small dedup ring, oldest dropped
+ * when full. Id 0 means "no zebra NHG" and is never recorded.
+ */
+void fpm_nhg_record_rib_id(struct fpm_dplane_nhg *obj, uint32_t rib_id)
+{
+	uint8_t i;
+
+	if (rib_id == 0)
+		return;
+	for (i = 0; i < obj->rib_nhg_id_count; i++)
+		if (obj->rib_nhg_ids[i] == rib_id)
+			return;
+	if (obj->rib_nhg_id_count < FPM_NHG_RIB_ID_TRACK) {
+		obj->rib_nhg_ids[obj->rib_nhg_id_count++] = rib_id;
+		return;
+	}
+	memmove(&obj->rib_nhg_ids[0], &obj->rib_nhg_ids[1],
+		(FPM_NHG_RIB_ID_TRACK - 1) * sizeof(obj->rib_nhg_ids[0]));
+	obj->rib_nhg_ids[FPM_NHG_RIB_ID_TRACK - 1] = rib_id;
 }

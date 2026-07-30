@@ -57,6 +57,7 @@
 #include "lib/netlink_parser.h"
 #include "zebra/debug.h"
 #include "zebra/zebra_srv6.h"
+#include "zebra/fpm_nhg.h"
 #include "fpm/fpm.h"
 #include "lib/srv6.h"
 #include "lib/vrf.h"
@@ -208,6 +209,15 @@ struct fpm_nl_ctx {
 	struct stream *ibuf;
 	struct stream *obuf;
 	pthread_mutex_t obuf_mutex;
+
+	/*
+	 * Dplane NHG objects derived from route events (nhg-fib mode).
+	 * Serialized by obuf_mutex: the tables are mutated in the same
+	 * critical section that writes the resulting messages, so state
+	 * changes and the byte stream they describe stay in lockstep even
+	 * though route ops arrive from both the dplane and the FPM thread.
+	 */
+	struct fpm_nhg_tables nhg_tables;
 
 	/*
 	 * data plane context queue:
@@ -818,6 +828,12 @@ static void fpm_reconnect(struct fpm_nl_ctx *fnc)
 
 	stream_reset(fnc->ibuf);
 	stream_reset(fnc->obuf);
+	/*
+	 * Drop all dplane NHG state: a new connection is a full resync, so
+	 * no DELNHGFIB is emitted here (design §4.2.1). zebra's replay
+	 * rebuilds every object with fresh ids.
+	 */
+	fpm_nhg_tables_flush(&fnc->nhg_tables);
 	event_cancel(&fnc->t_read);
 	event_cancel(&fnc->t_write);
 
@@ -3132,6 +3148,281 @@ dplane_fpm_nl_handle_br_port_update(const struct zebra_dplane_ctx *ctx,
 }
 
 #define DPLANE_FPM_NL_BUF_SIZE 65536
+
+/**
+ * Check that one FPM frame of `nl_buf_len` netlink bytes still fits in the
+ * output buffer, accounting the buffer-full event when it does not.
+ *
+ * Requires `fnc->obuf_mutex` to be held. `caller` keeps the debug message
+ * attributed to the calling function.
+ */
+static bool fpm_obuf_have_room_locked(struct fpm_nl_ctx *fnc,
+				      size_t nl_buf_len, const char *caller)
+{
+	if (STREAM_WRITEABLE(fnc->obuf) >= (nl_buf_len + FPM_HEADER_SIZE))
+		return true;
+
+	atomic_fetch_add_explicit(&fnc->counters.buffer_full, 1,
+				  memory_order_relaxed);
+
+	if (IS_ZEBRA_DEBUG_FPM)
+		zlog_debug("%s: buffer full: wants to write %zu but has %zu",
+			   caller, nl_buf_len + FPM_HEADER_SIZE,
+			   STREAM_WRITEABLE(fnc->obuf));
+
+	return false;
+}
+
+/**
+ * Write one already encoded netlink buffer into the output stream as a
+ * single FPM frame and wake the writer.
+ *
+ * Requires `fnc->obuf_mutex` to be held.
+ *
+ * @return 0 on success, -1 when the output buffer is full (nothing written).
+ */
+static int fpm_obuf_write_locked(struct fpm_nl_ctx *fnc, const uint8_t *nl_buf,
+				 size_t nl_buf_len, const char *caller)
+{
+	uint64_t obytes, obytes_peak;
+
+	/* Check if we have enough buffer space. */
+	if (!fpm_obuf_have_room_locked(fnc, nl_buf_len, caller))
+		return -1;
+
+	/*
+	 * Fill in the FPM header information.
+	 *
+	 * See FPM_HEADER_SIZE definition for more information.
+	 */
+	stream_putc(fnc->obuf, 1);
+	stream_putc(fnc->obuf, 1);
+	stream_putw(fnc->obuf, nl_buf_len + FPM_HEADER_SIZE);
+
+	/* Write current data. */
+	stream_write(fnc->obuf, nl_buf, (size_t)nl_buf_len);
+
+	/* Account number of bytes waiting to be written. */
+	atomic_fetch_add_explicit(&fnc->counters.obuf_bytes,
+				  nl_buf_len + FPM_HEADER_SIZE,
+				  memory_order_relaxed);
+	obytes = atomic_load_explicit(&fnc->counters.obuf_bytes,
+				      memory_order_relaxed);
+	obytes_peak = atomic_load_explicit(&fnc->counters.obuf_peak,
+					   memory_order_relaxed);
+	if (obytes_peak < obytes)
+		atomic_store_explicit(&fnc->counters.obuf_peak, obytes,
+				      memory_order_relaxed);
+
+	/* Tell the thread to start writing. */
+	event_add_write(fnc->fthread->master, fpm_write, fnc, fnc->socket,
+			 &fnc->t_write);
+
+	return 0;
+}
+
+/*
+ * NHGFIB message emitters — the seam P9 fills in.
+ *
+ * P8 owns state and ordering, P9 owns the bytes. Both emitters are called
+ * with `fnc->obuf_mutex` held and in the design's flush order: every NEW
+ * (children before parents) before the route message, every DEL after it.
+ *
+ * P9: replace the body with netlink_nhgfull_obj_msg_encode(RTM_NEWNHGFIB /
+ * RTM_DELNHGFIB, ...) into a local buffer followed by
+ * fpm_obuf_write_locked(). The P9 implementation must account its own
+ * output space (fpm_obuf_have_room_locked()) and propagate failure so the
+ * caller can stop mid-flush.
+ */
+static void fpm_emit_nhgfib_new(struct fpm_nl_ctx *fnc,
+				const struct fpm_dplane_nhg *obj)
+{
+	/* P9: encode + write RTM_NEWNHGFIB for `obj` here. */
+	fnc->nhg_tables.nhgfib_sent++;
+
+	if (IS_ZEBRA_DEBUG_FPM)
+		zlog_debug("%s: NEWNHGFIB id %u level %u flags 0x%x children %u refcount %u",
+			   __func__, obj->dplane_id, obj->level, obj->nhg_flags,
+			   obj->num_children, obj->refcount);
+}
+
+static void fpm_emit_nhgfib_del(struct fpm_nl_ctx *fnc, uint32_t dplane_id)
+{
+	/* P9: encode + write RTM_DELNHGFIB for `dplane_id` here. */
+	fnc->nhg_tables.nhgfib_sent++;
+
+	if (IS_ZEBRA_DEBUG_FPM)
+		zlog_debug("%s: DELNHGFIB id %u", __func__, dplane_id);
+}
+
+/*
+ * route_nhg_map key: (table_id, afi, prefix). Source prefixes of srcdest
+ * routes are not part of the key, matching the design.
+ */
+static void fpm_nhg_route_key_from_ctx(const struct zebra_dplane_ctx *ctx,
+				       struct fpm_nhg_route_key *key)
+{
+	const struct prefix *p = dplane_ctx_get_dest(ctx);
+
+	memset(key, 0, sizeof(*key));
+	key->table_id = dplane_ctx_get_table(ctx);
+	key->afi = (p->family == AF_INET6) ? AFI_IP6 : AFI_IP;
+	prefix_copy(&key->p, p);
+}
+
+/**
+ * Route operation handling in nhg-fib mode (design §4.2.1 "Per-op
+ * handling"): the route event itself drives the dplane NHG object
+ * lifecycle and the route message carries a plugin allocated RTA_NH_ID.
+ *
+ * The whole sequence runs under `obuf_mutex`, which also serializes the
+ * NHG tables against the other thread enqueueing route ops, and keeps the
+ * emitted order (NEWs -> route -> DELs) atomic in the byte stream.
+ *
+ * @return 0 on success or on a handled failure (nothing emitted, state
+ *         unchanged), -1 when the output buffer is full.
+ */
+static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
+					struct zebra_dplane_ctx *ctx,
+					enum dplane_op_e op)
+{
+	uint8_t nl_buf[DPLANE_FPM_NL_BUF_SIZE];
+	struct fpm_nhg_staging newq = {};
+	struct fpm_nhg_del_queue delq = {};
+	struct fpm_dplane_nhg *new_top = NULL, *old_top;
+	struct fpm_nhg_route_key key;
+	size_t nl_buf_len = 0, route_off;
+	struct nlmsghdr *n;
+	ssize_t rv;
+	uint16_t i;
+	int ret = 0;
+
+	fpm_nhg_route_key_from_ctx(ctx, &key);
+
+	frr_mutex_lock_autounlock(&fnc->obuf_mutex);
+
+	/*
+	 * Explicit removal: DELETE, and UPDATE when route replace semantics
+	 * are disabled (same message pair the legacy path emits).
+	 */
+	if (op == DPLANE_OP_ROUTE_DELETE || op == DPLANE_OP_ROUTE_UPDATE) {
+		rv = netlink_route_multipath_msg_encode(RTM_DELROUTE, ctx,
+						       nl_buf, sizeof(nl_buf),
+						       true, false, false);
+		if (rv <= 0) {
+			zlog_err("%s: netlink_route_multipath_msg_encode failed",
+				 __func__);
+			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
+			return 0;
+		}
+
+		nl_buf_len = (size_t)rv;
+	}
+
+	if (op != DPLANE_OP_ROUTE_DELETE) {
+		new_top = fpm_nhg_build(&fnc->nhg_tables,
+					dplane_ctx_get_ng(ctx)->nexthop, &newq);
+		if (new_top == NULL) {
+			zlog_err("%s: fpm_nhg_build failed", __func__);
+			fpm_nhg_rollback(&fnc->nhg_tables, &newq);
+			fpm_nhg_staging_free(&newq);
+			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
+			return 0;
+		}
+
+		route_off = nl_buf_len;
+		/*
+		 * force_nhg is false on purpose: it would make the encoder
+		 * emit RTA_NH_ID from dplane_ctx_get_nhe_id(), which is the
+		 * zebra NHG id. The wire id must be the plugin allocated
+		 * dplane id, so the attribute is appended below instead.
+		 */
+		rv = netlink_route_multipath_msg_encode(RTM_NEWROUTE, ctx,
+						       &nl_buf[route_off],
+						       sizeof(nl_buf) - route_off,
+						       true, false,
+						       fnc->use_route_replace);
+		if (rv > 0) {
+			/*
+			 * Append RTA_NH_ID to the message just encoded. The
+			 * encoder builds the message through the very same
+			 * nl_attr_put*() helpers and returns
+			 * NLMSG_ALIGN(nlmsg_len), so the assembled header is
+			 * complete and every nested attribute is already
+			 * closed: one more top level attribute is exactly
+			 * what the encoder itself does for RTA_PREFSRC.
+			 * nl_attr_put32() appends at NLMSG_ALIGN(nlmsg_len)
+			 * and bounds itself by maxlen measured from the start
+			 * of the header, hence sizeof(nl_buf) - route_off.
+			 * Alignment of the cast is inherited from the encoder,
+			 * which casts the same address to its own header
+			 * struct (route_off is NLMSG_ALIGN'ed).
+			 */
+			n = (struct nlmsghdr *)&nl_buf[route_off];
+			if (!nl_attr_put32(n, sizeof(nl_buf) - route_off,
+					   RTA_NH_ID, new_top->dplane_id))
+				rv = 0;
+			else
+				nl_buf_len = route_off +
+					     NLMSG_ALIGN(n->nlmsg_len);
+		}
+		if (rv <= 0) {
+			/* Encode failure: roll back and emit nothing at all. */
+			zlog_err("%s: route encode failed, dropping ctx",
+				 __func__);
+			fpm_nhg_rollback(&fnc->nhg_tables, &newq);
+			fpm_nhg_staging_free(&newq);
+			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
+			return 0;
+		}
+	}
+
+	/* We must know if someday a message goes beyond 65KiB. */
+	assert((nl_buf_len + FPM_HEADER_SIZE) <= UINT16_MAX);
+
+	/*
+	 * Space is checked before any state moves: on buffer full nothing is
+	 * emitted and the map keeps pointing at the old object, so the
+	 * caller can retry the whole ctx.
+	 */
+	if (!fpm_obuf_have_room_locked(fnc, nl_buf_len, __func__)) {
+		fpm_nhg_rollback(&fnc->nhg_tables, &newq);
+		fpm_nhg_staging_free(&newq);
+		return -1;
+	}
+
+	if (op == DPLANE_OP_ROUTE_DELETE) {
+		old_top = fpm_nhg_route_pop(&fnc->nhg_tables, &key);
+	} else {
+		fpm_nhg_record_rib_id(new_top, dplane_ctx_get_nhe_id(ctx));
+		old_top = fpm_nhg_route_get(&fnc->nhg_tables, &key);
+		fpm_nhg_route_set(&fnc->nhg_tables, &key, new_top);
+		fpm_nhg_ref(new_top);
+	}
+	/*
+	 * ref-then-unref also covers the "same tree re-sent" case: there
+	 * old_top == new_top, the two operations net to zero and no DEL is
+	 * staged.
+	 */
+	if (old_top)
+		fpm_nhg_unref(&fnc->nhg_tables, old_top, &delq);
+
+	/* Flush order: NEWs (children first) -> route message -> DELs. */
+	for (i = 0; i < newq.count; i++)
+		fpm_emit_nhgfib_new(fnc, newq.objs[i]);
+
+	if (nl_buf_len)
+		ret = fpm_obuf_write_locked(fnc, nl_buf, nl_buf_len, __func__);
+
+	for (i = 0; i < delq.count; i++)
+		fpm_emit_nhgfib_del(fnc, delq.ids[i].dplane_id);
+
+	fpm_nhg_staging_free(&newq);
+	fpm_nhg_del_queue_free(&delq);
+
+	return ret;
+}
+
 /**
  * Encode data plane operation context into netlink and enqueue it in the FPM
  * output buffer.
@@ -3145,7 +3436,6 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 	uint8_t nl_buf[DPLANE_FPM_NL_BUF_SIZE];
 	size_t nl_buf_len;
 	ssize_t rv;
-	uint64_t obytes, obytes_peak;
 	enum dplane_op_e op = dplane_ctx_get_op(ctx);
 	struct nexthop *nexthop;
 
@@ -3184,6 +3474,17 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 			op = DPLANE_OP_ROUTE_INSTALL;
 		}
 	}
+
+	/*
+	 * nhg-fib mode: route events drive the dplane NHG object lifecycle
+	 * and the route message carries a plugin allocated RTA_NH_ID
+	 * (design §4.2.1). SRv6 routes keep the legacy encoders for now;
+	 * P9 folds them into the derived objects.
+	 */
+	if (fnc->use_nhg_fib && !has_srv6_nexthop(ctx) &&
+	    (op == DPLANE_OP_ROUTE_INSTALL || op == DPLANE_OP_ROUTE_UPDATE ||
+	     op == DPLANE_OP_ROUTE_DELETE))
+		return fpm_nl_enqueue_route_nhg_fib(fnc, ctx, op);
 
 	switch (op) {
 	case DPLANE_OP_ROUTE_UPDATE:
@@ -3452,49 +3753,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 
 	frr_mutex_lock_autounlock(&fnc->obuf_mutex);
 
-	/* Check if we have enough buffer space. */
-	if (STREAM_WRITEABLE(fnc->obuf) < (nl_buf_len + FPM_HEADER_SIZE)) {
-		atomic_fetch_add_explicit(&fnc->counters.buffer_full, 1,
-					  memory_order_relaxed);
-
-		if (IS_ZEBRA_DEBUG_FPM)
-			zlog_debug(
-				"%s: buffer full: wants to write %zu but has %zu",
-				__func__, nl_buf_len + FPM_HEADER_SIZE,
-				STREAM_WRITEABLE(fnc->obuf));
-
-		return -1;
-	}
-
-	/*
-	 * Fill in the FPM header information.
-	 *
-	 * See FPM_HEADER_SIZE definition for more information.
-	 */
-	stream_putc(fnc->obuf, 1);
-	stream_putc(fnc->obuf, 1);
-	stream_putw(fnc->obuf, nl_buf_len + FPM_HEADER_SIZE);
-
-	/* Write current data. */
-	stream_write(fnc->obuf, nl_buf, (size_t)nl_buf_len);
-
-	/* Account number of bytes waiting to be written. */
-	atomic_fetch_add_explicit(&fnc->counters.obuf_bytes,
-				  nl_buf_len + FPM_HEADER_SIZE,
-				  memory_order_relaxed);
-	obytes = atomic_load_explicit(&fnc->counters.obuf_bytes,
-				      memory_order_relaxed);
-	obytes_peak = atomic_load_explicit(&fnc->counters.obuf_peak,
-					   memory_order_relaxed);
-	if (obytes_peak < obytes)
-		atomic_store_explicit(&fnc->counters.obuf_peak, obytes,
-				      memory_order_relaxed);
-
-	/* Tell the thread to start writing. */
-	event_add_write(fnc->fthread->master, fpm_write, fnc, fnc->socket,
-			 &fnc->t_write);
-
-	return 0;
+	return fpm_obuf_write_locked(fnc, nl_buf, nl_buf_len, __func__);
 }
 
 /*
@@ -4065,6 +4324,7 @@ static int fpm_nl_finish_late(struct fpm_nl_ctx *fnc)
 	/* Free all allocated resources. */
 	pthread_mutex_destroy(&fnc->obuf_mutex);
 	pthread_mutex_destroy(&fnc->ctxqueue_mutex);
+	fpm_nhg_tables_flush(&fnc->nhg_tables);
 	stream_free(fnc->ibuf);
 	stream_free(fnc->obuf);
 	free(gfnc);
@@ -4177,6 +4437,7 @@ static int fpm_nl_new(struct event_loop *tm)
 	gfnc = calloc(1, sizeof(*gfnc));
 	gfnc->fib_log_level = FIB_LOG_LEVEL_INFO; /* Default: INFO */
 	gfnc->use_nhg_fib = false;
+	fpm_nhg_tables_init(&gfnc->nhg_tables);
 	fib_frr_set_log_level(gfnc->fib_log_level);
 	zlog_info("%s: FIB log level initialized to %d (INFO)", __func__, gfnc->fib_log_level);
 	rv = dplane_provider_register(prov_name, DPLANE_PRIO_POSTPROCESS,
