@@ -68,6 +68,11 @@ struct fpm_nhg_leaf_key {
 	uint8_t type, bh;
 	int32_t ifindex;
 	union g_addr gate;
+	/* src/rmap_src are emitted in the NHGFIB JSON, so they are part of
+	 * leaf identity: leaves differing only there must not dedupe.
+	 */
+	union g_addr src;
+	union g_addr rmap_src;
 	uint32_t flags_subset; /* NEXTHOP_FLAGS_HASHED bits only */
 	uint8_t label_type, nlabels;
 	mpls_label_t labels[MPLS_MAX_LABELS];
@@ -100,6 +105,8 @@ static void fpm_nhg_leaf_key_fill(struct fpm_nhg_leaf_key *k,
 		k->bh = nh->bh_type;
 	else
 		k->gate = nh->gate;
+	k->src = nh->src;
+	k->rmap_src = nh->rmap_src;
 	k->flags_subset = nh->flags & NEXTHOP_FLAGS_HASHED;
 	k->label_type = nh->nh_label_type;
 	if (nh->nh_label) {
