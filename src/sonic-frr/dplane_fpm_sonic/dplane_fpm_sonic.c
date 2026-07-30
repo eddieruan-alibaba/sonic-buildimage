@@ -214,8 +214,11 @@ struct fpm_nl_ctx {
 	 * Dplane NHG objects derived from route events (nhg-fib mode).
 	 * Serialized by obuf_mutex: the tables are mutated in the same
 	 * critical section that writes the resulting messages, so state
-	 * changes and the byte stream they describe stay in lockstep even
-	 * though route ops arrive from both the dplane and the FPM thread.
+	 * changes and the byte stream they describe stay in lockstep. Two
+	 * threads reach this state: the FPM pthread (normal dplane context
+	 * processing) and the zebra main thread, which calls fpm_nl_enqueue()
+	 * directly from the fpm_rib_send() resync walk — that is the whole
+	 * locking rationale.
 	 */
 	struct fpm_nhg_tables nhg_tables;
 
@@ -3150,6 +3153,29 @@ dplane_fpm_nl_handle_br_port_update(const struct zebra_dplane_ctx *ctx,
 #define DPLANE_FPM_NL_BUF_SIZE 65536
 
 /**
+ * Check that `bytes` more bytes (FPM headers included) still fit in the
+ * output buffer, accounting the buffer-full event when they do not.
+ *
+ * Requires `fnc->obuf_mutex` to be held. `caller` keeps the debug message
+ * attributed to the calling function.
+ */
+static bool fpm_obuf_have_bytes_locked(struct fpm_nl_ctx *fnc, size_t bytes,
+				       const char *caller)
+{
+	if (STREAM_WRITEABLE(fnc->obuf) >= bytes)
+		return true;
+
+	atomic_fetch_add_explicit(&fnc->counters.buffer_full, 1,
+				  memory_order_relaxed);
+
+	if (IS_ZEBRA_DEBUG_FPM)
+		zlog_debug("%s: buffer full: wants to write %zu but has %zu",
+			   caller, bytes, STREAM_WRITEABLE(fnc->obuf));
+
+	return false;
+}
+
+/**
  * Check that one FPM frame of `nl_buf_len` netlink bytes still fits in the
  * output buffer, accounting the buffer-full event when it does not.
  *
@@ -3159,18 +3185,8 @@ dplane_fpm_nl_handle_br_port_update(const struct zebra_dplane_ctx *ctx,
 static bool fpm_obuf_have_room_locked(struct fpm_nl_ctx *fnc,
 				      size_t nl_buf_len, const char *caller)
 {
-	if (STREAM_WRITEABLE(fnc->obuf) >= (nl_buf_len + FPM_HEADER_SIZE))
-		return true;
-
-	atomic_fetch_add_explicit(&fnc->counters.buffer_full, 1,
-				  memory_order_relaxed);
-
-	if (IS_ZEBRA_DEBUG_FPM)
-		zlog_debug("%s: buffer full: wants to write %zu but has %zu",
-			   caller, nl_buf_len + FPM_HEADER_SIZE,
-			   STREAM_WRITEABLE(fnc->obuf));
-
-	return false;
+	return fpm_obuf_have_bytes_locked(fnc, nl_buf_len + FPM_HEADER_SIZE,
+					  caller);
 }
 
 /**
@@ -3221,6 +3237,159 @@ static int fpm_obuf_write_locked(struct fpm_nl_ctx *fnc, const uint8_t *nl_buf,
 	return 0;
 }
 
+DEFINE_MTYPE_STATIC(ZEBRA, FPM_FRAME, "FPM pending output frame");
+
+/* One FPM frame pending write: fully encoded netlink message bytes. */
+struct fpm_frame {
+	uint8_t *buf;
+	size_t len;
+};
+
+/*
+ * Every frame one dplane context produces, in wire order. The batch is the
+ * unit of atomicity: it is written to obuf in a single critical section
+ * after a single room check, so the peer never observes a partially
+ * emitted context.
+ */
+struct fpm_frame_batch {
+	struct fpm_frame *frames;
+	uint16_t count, cap;
+	size_t total_len;   /* sum of len + FPM_HEADER_SIZE per frame */
+};
+
+/*
+ * Upper bound on one encoded RTM_NEWNHGFIB / RTM_DELNHGFIB frame, used by
+ * the pre-reservation below. This is a P9-verified bound: P9 MUST assert
+ * that every encoded NHGFIB frame is <= this value (the design's 64KiB cap
+ * applies per frame, this is the much tighter bound the reservation needs).
+ */
+#define FPM_NHGFIB_FRAME_MAX 4096
+
+/**
+ * Append one fully encoded netlink message to the batch. The bytes are
+ * copied, so callers may encode every frame into the same scratch buffer.
+ */
+static void fpm_frame_batch_add(struct fpm_frame_batch *batch,
+				const uint8_t *buf, size_t len)
+{
+	assert(len > 0 && (len + FPM_HEADER_SIZE) <= UINT16_MAX);
+
+	if (batch->count == batch->cap) {
+		/*
+		 * cap is uint16 (a context cannot produce more frames than
+		 * that): do the doubling in uint32 and assert the bound
+		 * instead of silently wrapping the field.
+		 */
+		uint32_t cap = batch->cap ? (uint32_t)batch->cap * 2 : 16;
+
+		assert(cap <= UINT16_MAX);
+		batch->cap = (uint16_t)cap;
+		batch->frames = XREALLOC(MTYPE_FPM_FRAME, batch->frames,
+					 (size_t)batch->cap *
+						 sizeof(*batch->frames));
+	}
+
+	batch->frames[batch->count].buf = XCALLOC(MTYPE_FPM_FRAME, len);
+	memcpy(batch->frames[batch->count].buf, buf, len);
+	batch->frames[batch->count].len = len;
+	batch->count++;
+	batch->total_len += len + FPM_HEADER_SIZE;
+}
+
+static void fpm_frame_batch_free(struct fpm_frame_batch *batch)
+{
+	uint16_t i;
+
+	for (i = 0; i < batch->count; i++)
+		XFREE(MTYPE_FPM_FRAME, batch->frames[i].buf);
+	XFREE(MTYPE_FPM_FRAME, batch->frames);
+	batch->count = 0;
+	batch->cap = 0;
+	batch->total_len = 0;
+}
+
+/**
+ * Write a whole batch into the output stream as one atomic unit and wake
+ * the writer once.
+ *
+ * Requires `fnc->obuf_mutex` to be held.
+ *
+ * Room is checked once, for the whole batch. Callers reserve the space
+ * BEFORE they mutate any state (see fpm_nl_enqueue_route_nhg_fib()), so by
+ * the time this runs the state change the frames describe has already
+ * happened: a room failure here can no longer be replayed as a harmless
+ * retry. It therefore logs an error and forces a reconnect, which drops all
+ * dplane NHG state and makes the peer resync from scratch — that is what
+ * keeps "the peer never sees a partial context" true even in that case.
+ *
+ * @return 0 when every frame was written, -1 when the batch did not fit
+ *         and a resync was requested.
+ */
+static int fpm_frame_batch_write_locked(struct fpm_nl_ctx *fnc,
+					struct fpm_frame_batch *batch,
+					const char *caller)
+{
+	uint64_t obytes, obytes_peak;
+	uint16_t i;
+
+	if (batch->count == 0)
+		return 0;
+
+	if (!fpm_obuf_have_bytes_locked(fnc, batch->total_len, caller)) {
+		zlog_err("%s: output buffer cannot take a %u frame batch (%zu bytes), forcing FPM resync",
+			 caller, batch->count, batch->total_len);
+		FPM_RECONNECT(fnc);
+		return -1;
+	}
+
+	for (i = 0; i < batch->count; i++) {
+		size_t len = batch->frames[i].len;
+
+		/*
+		 * Unreachable after the batch check above; kept so an
+		 * under-estimating reservation can never truncate a context
+		 * on the wire — resync instead.
+		 */
+		if (!fpm_obuf_have_bytes_locked(fnc, len + FPM_HEADER_SIZE,
+						caller)) {
+			zlog_err("%s: output buffer exhausted mid-batch at frame %u/%u, forcing FPM resync",
+				 caller, i, batch->count);
+			FPM_RECONNECT(fnc);
+			return -1;
+		}
+
+		/*
+		 * Fill in the FPM header information.
+		 *
+		 * See FPM_HEADER_SIZE definition for more information.
+		 */
+		stream_putc(fnc->obuf, 1);
+		stream_putc(fnc->obuf, 1);
+		stream_putw(fnc->obuf, len + FPM_HEADER_SIZE);
+
+		/* Write current data. */
+		stream_write(fnc->obuf, batch->frames[i].buf, len);
+
+		/* Account number of bytes waiting to be written. */
+		atomic_fetch_add_explicit(&fnc->counters.obuf_bytes,
+					  len + FPM_HEADER_SIZE,
+					  memory_order_relaxed);
+		obytes = atomic_load_explicit(&fnc->counters.obuf_bytes,
+					      memory_order_relaxed);
+		obytes_peak = atomic_load_explicit(&fnc->counters.obuf_peak,
+						   memory_order_relaxed);
+		if (obytes_peak < obytes)
+			atomic_store_explicit(&fnc->counters.obuf_peak, obytes,
+					      memory_order_relaxed);
+	}
+
+	/* Tell the thread to start writing (once for the whole batch). */
+	event_add_write(fnc->fthread->master, fpm_write, fnc, fnc->socket,
+			 &fnc->t_write);
+
+	return 0;
+}
+
 /*
  * NHGFIB message emitters — the seam P9 fills in.
  *
@@ -3228,16 +3397,23 @@ static int fpm_obuf_write_locked(struct fpm_nl_ctx *fnc, const uint8_t *nl_buf,
  * with `fnc->obuf_mutex` held and in the design's flush order: every NEW
  * (children before parents) before the route message, every DEL after it.
  *
+ * Emitters only APPEND to the caller's frame batch, they never touch obuf:
+ * the batch is written in one piece afterwards, which is what makes the
+ * whole context atomic on the wire.
+ *
  * P9: replace the body with netlink_nhgfull_obj_msg_encode(RTM_NEWNHGFIB /
- * RTM_DELNHGFIB, ...) into a local buffer followed by
- * fpm_obuf_write_locked(). The P9 implementation must account its own
- * output space (fpm_obuf_have_room_locked()) and propagate failure so the
- * caller can stop mid-flush.
+ * RTM_DELNHGFIB, ...) into a local buffer, then
+ *	assert(len <= FPM_NHGFIB_FRAME_MAX);
+ *	fpm_frame_batch_add(batch, buf, len);
+ * The FPM_NHGFIB_FRAME_MAX assert is mandatory: the caller's output space
+ * reservation is computed from that bound.
  */
 static void fpm_emit_nhgfib_new(struct fpm_nl_ctx *fnc,
-				const struct fpm_dplane_nhg *obj)
+				const struct fpm_dplane_nhg *obj,
+				struct fpm_frame_batch *batch)
 {
-	/* P9: encode + write RTM_NEWNHGFIB for `obj` here. */
+	/* P9: encode RTM_NEWNHGFIB for `obj` and append it to `batch`. */
+	(void)batch;
 	fnc->nhg_tables.nhgfib_sent++;
 
 	if (IS_ZEBRA_DEBUG_FPM)
@@ -3246,9 +3422,11 @@ static void fpm_emit_nhgfib_new(struct fpm_nl_ctx *fnc,
 			   obj->num_children, obj->refcount);
 }
 
-static void fpm_emit_nhgfib_del(struct fpm_nl_ctx *fnc, uint32_t dplane_id)
+static void fpm_emit_nhgfib_del(struct fpm_nl_ctx *fnc, uint32_t dplane_id,
+				struct fpm_frame_batch *batch)
 {
-	/* P9: encode + write RTM_DELNHGFIB for `dplane_id` here. */
+	/* P9: encode RTM_DELNHGFIB for `dplane_id` and append it to `batch`. */
+	(void)batch;
 	fnc->nhg_tables.nhgfib_sent++;
 
 	if (IS_ZEBRA_DEBUG_FPM)
@@ -3256,19 +3434,37 @@ static void fpm_emit_nhgfib_del(struct fpm_nl_ctx *fnc, uint32_t dplane_id)
 }
 
 /*
- * route_nhg_map key: (table_id, afi, prefix). Source prefixes of srcdest
- * routes are not part of the key, matching the design.
+ * route_nhg_map key: (table_id, afi, prefix, source prefix). The source
+ * prefix is only set for srcdest routes and stays all-zero otherwise.
  */
 static void fpm_nhg_route_key_from_ctx(const struct zebra_dplane_ctx *ctx,
 				       struct fpm_nhg_route_key *key)
 {
 	const struct prefix *p = dplane_ctx_get_dest(ctx);
+	const struct prefix *src = dplane_ctx_get_src(ctx);
 
 	memset(key, 0, sizeof(*key));
 	key->table_id = dplane_ctx_get_table(ctx);
 	key->afi = (p->family == AF_INET6) ? AFI_IP6 : AFI_IP;
 	prefix_copy(&key->p, p);
+	/* No source prefix: the memset above leaves family AF_UNSPEC. */
+	if (src)
+		prefix_copy(&key->src_p, src);
 }
+
+/*
+ * Conservative extra frame allowance for the DELs one context can stage.
+ *
+ * The reservation must be computed BEFORE the map upsert, because the DEL
+ * ids only exist after fpm_nhg_unref() has already freed the objects — at
+ * which point the state change is no longer undoable. The exact DEL count
+ * is therefore unknown at reservation time, so a heuristic allowance is
+ * reserved on top of the (known) NEW count. A context deleting more than
+ * this many objects still cannot truncate anything: the batch write detects
+ * the shortfall and forces a resync instead (see
+ * fpm_frame_batch_write_locked()).
+ */
+#define FPM_NHG_DEL_RESERVE 64
 
 /**
  * Route operation handling in nhg-fib mode (design §4.2.1 "Per-op
@@ -3279,23 +3475,46 @@ static void fpm_nhg_route_key_from_ctx(const struct zebra_dplane_ctx *ctx,
  * NHG tables against the other thread enqueueing route ops, and keeps the
  * emitted order (NEWs -> route -> DELs) atomic in the byte stream.
  *
+ * All-or-nothing scheme, in order:
+ *
+ *  1. build the object tree (pure state, rollback-able) and encode the
+ *     route frame into the caller's scratch buffer;
+ *  2. RESERVE output space for a conservative upper bound of the resulting
+ *     batch: route frame + (NEW count + FPM_NHG_DEL_RESERVE) NHGFIB frames
+ *     of FPM_NHGFIB_FRAME_MAX bytes each. This happens while the whole
+ *     context is still undoable, so a reservation failure rolls the build
+ *     back, leaves the map pointing at the old object and returns -1 for
+ *     the caller to retry the context as a whole;
+ *  3. mutate state (map upsert, ref of the new top, unref of the old one).
+ *     The unref is what produces the DEL ids, and it already freed the
+ *     objects — there is no undo past this point, which is exactly why the
+ *     reservation had to be conservative rather than exact;
+ *  4. accumulate all frames of the context into one batch, in wire order:
+ *     NEWs (children before parents), the route frame, then the DELs;
+ *  5. write the batch in one piece. Should the reservation ever have been
+ *     too small, the write path logs and forces a reconnect, so the peer
+ *     resyncs from scratch instead of seeing a partial context.
+ *
+ * @param nl_buf      caller owned scratch buffer for the route frame.
+ * @param nl_buf_size size of that buffer.
  * @return 0 on success or on a handled failure (nothing emitted, state
  *         unchanged), -1 when the output buffer is full.
  */
 static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 					struct zebra_dplane_ctx *ctx,
-					enum dplane_op_e op)
+					enum dplane_op_e op, uint8_t *nl_buf,
+					size_t nl_buf_size)
 {
-	uint8_t nl_buf[DPLANE_FPM_NL_BUF_SIZE];
 	struct fpm_nhg_staging newq = {};
 	struct fpm_nhg_del_queue delq = {};
+	struct fpm_frame_batch batch = {};
 	struct fpm_dplane_nhg *new_top = NULL, *old_top;
 	struct fpm_nhg_route_key key;
-	size_t nl_buf_len = 0, route_off;
+	size_t nl_buf_len = 0, route_off, reserve;
 	struct nlmsghdr *n;
 	ssize_t rv;
-	uint16_t i;
-	int ret = 0;
+	uint32_t i;
+	int ret;
 
 	fpm_nhg_route_key_from_ctx(ctx, &key);
 
@@ -3307,7 +3526,7 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	 */
 	if (op == DPLANE_OP_ROUTE_DELETE || op == DPLANE_OP_ROUTE_UPDATE) {
 		rv = netlink_route_multipath_msg_encode(RTM_DELROUTE, ctx,
-						       nl_buf, sizeof(nl_buf),
+						       nl_buf, nl_buf_size,
 						       true, false, false);
 		if (rv <= 0) {
 			zlog_err("%s: netlink_route_multipath_msg_encode failed",
@@ -3339,7 +3558,7 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 		 */
 		rv = netlink_route_multipath_msg_encode(RTM_NEWROUTE, ctx,
 						       &nl_buf[route_off],
-						       sizeof(nl_buf) - route_off,
+						       nl_buf_size - route_off,
 						       true, false,
 						       fnc->use_route_replace);
 		if (rv > 0) {
@@ -3353,13 +3572,13 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 			 * what the encoder itself does for RTA_PREFSRC.
 			 * nl_attr_put32() appends at NLMSG_ALIGN(nlmsg_len)
 			 * and bounds itself by maxlen measured from the start
-			 * of the header, hence sizeof(nl_buf) - route_off.
+			 * of the header, hence nl_buf_size - route_off.
 			 * Alignment of the cast is inherited from the encoder,
 			 * which casts the same address to its own header
 			 * struct (route_off is NLMSG_ALIGN'ed).
 			 */
 			n = (struct nlmsghdr *)&nl_buf[route_off];
-			if (!nl_attr_put32(n, sizeof(nl_buf) - route_off,
+			if (!nl_attr_put32(n, nl_buf_size - route_off,
 					   RTA_NH_ID, new_top->dplane_id))
 				rv = 0;
 			else
@@ -3381,16 +3600,25 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	assert((nl_buf_len + FPM_HEADER_SIZE) <= UINT16_MAX);
 
 	/*
-	 * Space is checked before any state moves: on buffer full nothing is
-	 * emitted and the map keeps pointing at the old object, so the
-	 * caller can retry the whole ctx.
+	 * Output space is RESERVED here, while the context is still fully
+	 * undoable: the NEW count is known, the DEL count is not (it only
+	 * materializes inside fpm_nhg_unref() below, which frees the objects
+	 * as it goes), so the reservation covers the exact NEW count plus the
+	 * FPM_NHG_DEL_RESERVE heuristic, at FPM_NHGFIB_FRAME_MAX bytes per
+	 * NHGFIB frame. On failure nothing is emitted, no state moves and the
+	 * map keeps pointing at the old object, so the caller can retry the
+	 * whole context.
 	 */
-	if (!fpm_obuf_have_room_locked(fnc, nl_buf_len, __func__)) {
+	reserve = nl_buf_len + FPM_HEADER_SIZE +
+		  ((size_t)newq.count + FPM_NHG_DEL_RESERVE) *
+			  (FPM_NHGFIB_FRAME_MAX + FPM_HEADER_SIZE);
+	if (!fpm_obuf_have_bytes_locked(fnc, reserve, __func__)) {
 		fpm_nhg_rollback(&fnc->nhg_tables, &newq);
 		fpm_nhg_staging_free(&newq);
 		return -1;
 	}
 
+	/* Past this point the state change is committed and not undoable. */
 	if (op == DPLANE_OP_ROUTE_DELETE) {
 		old_top = fpm_nhg_route_pop(&fnc->nhg_tables, &key);
 	} else {
@@ -3407,20 +3635,68 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	if (old_top)
 		fpm_nhg_unref(&fnc->nhg_tables, old_top, &delq);
 
-	/* Flush order: NEWs (children first) -> route message -> DELs. */
+	/* Wire order: NEWs (children first) -> route message -> DELs. */
 	for (i = 0; i < newq.count; i++)
-		fpm_emit_nhgfib_new(fnc, newq.objs[i]);
+		fpm_emit_nhgfib_new(fnc, newq.objs[i], &batch);
 
 	if (nl_buf_len)
-		ret = fpm_obuf_write_locked(fnc, nl_buf, nl_buf_len, __func__);
+		fpm_frame_batch_add(&batch, nl_buf, nl_buf_len);
 
 	for (i = 0; i < delq.count; i++)
-		fpm_emit_nhgfib_del(fnc, delq.ids[i].dplane_id);
+		fpm_emit_nhgfib_del(fnc, delq.ids[i].dplane_id, &batch);
 
+	/* One atomic write for the whole context. */
+	ret = fpm_frame_batch_write_locked(fnc, &batch, __func__);
+
+	fpm_frame_batch_free(&batch);
 	fpm_nhg_staging_free(&newq);
 	fpm_nhg_del_queue_free(&delq);
 
 	return ret;
+}
+
+/**
+ * Drop any nhg-fib state this route still owns, emitting the resulting
+ * DELNHGFIB messages.
+ *
+ * Needed when a prefix leaves the nhg-fib path while keeping its identity,
+ * i.e. a non-SRv6 route becoming an SRv6 route: SRv6 contexts go through the
+ * legacy encoders, so without this the route_nhg_map would keep a stale
+ * entry and the reference it holds would never be released — the top object
+ * (and everything below it) would leak until the next reconnect flush.
+ */
+static void fpm_nhg_fib_forget_route(struct fpm_nl_ctx *fnc,
+				     struct zebra_dplane_ctx *ctx)
+{
+	struct fpm_nhg_del_queue delq = {};
+	struct fpm_frame_batch batch = {};
+	struct fpm_dplane_nhg *old_top;
+	struct fpm_nhg_route_key key;
+	uint32_t i;
+
+	fpm_nhg_route_key_from_ctx(ctx, &key);
+
+	frr_mutex_lock_autounlock(&fnc->obuf_mutex);
+
+	old_top = fpm_nhg_route_pop(&fnc->nhg_tables, &key);
+	if (old_top == NULL)
+		return;
+
+	fpm_nhg_unref(&fnc->nhg_tables, old_top, &delq);
+
+	for (i = 0; i < delq.count; i++)
+		fpm_emit_nhgfib_del(fnc, delq.ids[i].dplane_id, &batch);
+
+	/*
+	 * DELs only release ids the peer already knows about, and the local
+	 * objects are gone either way; if the batch does not fit,
+	 * fpm_frame_batch_write_locked() forces a resync, which is the only
+	 * way to keep the peer consistent from here.
+	 */
+	(void)fpm_frame_batch_write_locked(fnc, &batch, __func__);
+
+	fpm_frame_batch_free(&batch);
+	fpm_nhg_del_queue_free(&delq);
 }
 
 /**
@@ -3481,10 +3757,19 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 	 * (design §4.2.1). SRv6 routes keep the legacy encoders for now;
 	 * P9 folds them into the derived objects.
 	 */
-	if (fnc->use_nhg_fib && !has_srv6_nexthop(ctx) &&
+	if (fnc->use_nhg_fib &&
 	    (op == DPLANE_OP_ROUTE_INSTALL || op == DPLANE_OP_ROUTE_UPDATE ||
-	     op == DPLANE_OP_ROUTE_DELETE))
-		return fpm_nl_enqueue_route_nhg_fib(fnc, ctx, op);
+	     op == DPLANE_OP_ROUTE_DELETE)) {
+		if (!has_srv6_nexthop(ctx))
+			return fpm_nl_enqueue_route_nhg_fib(fnc, ctx, op, nl_buf,
+							    sizeof(nl_buf));
+		/*
+		 * A prefix can transition non-SRv6 -> SRv6: release the
+		 * nhg-fib state it owned before handing it to the legacy
+		 * encoders below.
+		 */
+		fpm_nhg_fib_forget_route(fnc, ctx);
+	}
 
 	switch (op) {
 	case DPLANE_OP_ROUTE_UPDATE:
@@ -4324,7 +4609,12 @@ static int fpm_nl_finish_late(struct fpm_nl_ctx *fnc)
 	/* Free all allocated resources. */
 	pthread_mutex_destroy(&fnc->obuf_mutex);
 	pthread_mutex_destroy(&fnc->ctxqueue_mutex);
-	fpm_nhg_tables_flush(&fnc->nhg_tables);
+	/*
+	 * Destroy the NHG tables themselves, not just their contents: this is
+	 * the final teardown. It runs after frr_pthread_stop() above, so no
+	 * writer is left and the already destroyed obuf_mutex is not needed.
+	 */
+	fpm_nhg_tables_fini(&fnc->nhg_tables);
 	stream_free(fnc->ibuf);
 	stream_free(fnc->obuf);
 	free(gfnc);

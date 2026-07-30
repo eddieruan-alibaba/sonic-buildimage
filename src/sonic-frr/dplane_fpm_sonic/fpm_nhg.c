@@ -258,9 +258,26 @@ static unsigned int fpm_nhg_route_key_hash(const void *data)
 {
 	const struct fpm_nhg_route_entry *e = data;
 
-	/* prefix_hash_key() (lib/prefix.h) zero-normalizes the prefix bytes */
+	/* prefix_hash_key() (lib/prefix.h) zero-normalizes the prefix bytes;
+	 * it handles AF_UNSPEC (the "no source prefix" case) as well.
+	 */
 	return jhash_2words(e->key.table_id, e->key.afi,
-			    prefix_hash_key(&e->key.p));
+			    jhash_1word(prefix_hash_key(&e->key.src_p),
+					prefix_hash_key(&e->key.p)));
+}
+
+/*
+ * prefix_same() has no AF_UNSPEC case, so it reports two all-zero prefixes
+ * as different. A non-srcdest route carries exactly such a zeroed src_p, so
+ * that case is handled explicitly here.
+ */
+static bool fpm_nhg_src_same(const struct prefix *a, const struct prefix *b)
+{
+	if (a->family != b->family || a->prefixlen != b->prefixlen)
+		return false;
+	if (a->family == AF_UNSPEC)
+		return true;
+	return prefix_same(a, b) != 0;
 }
 
 static bool fpm_nhg_route_key_cmp(const void *data1, const void *data2)
@@ -268,7 +285,8 @@ static bool fpm_nhg_route_key_cmp(const void *data1, const void *data2)
 	const struct fpm_nhg_route_entry *a = data1, *b = data2;
 
 	return a->key.table_id == b->key.table_id &&
-	       a->key.afi == b->key.afi && prefix_same(&a->key.p, &b->key.p);
+	       a->key.afi == b->key.afi && prefix_same(&a->key.p, &b->key.p) &&
+	       fpm_nhg_src_same(&a->key.src_p, &b->key.src_p);
 }
 
 void fpm_nhg_tables_init(struct fpm_nhg_tables *t)
@@ -355,6 +373,23 @@ void fpm_nhg_tables_flush(struct fpm_nhg_tables *t)
 }
 
 /*
+ * Shutdown counterpart of flush: empty the tables, then destroy the table
+ * structures themselves. Only for plugin teardown — after this the tables
+ * must be re-inited before any further use.
+ *
+ * lib's hash_free() is static, so hash_clean_and_free() is the public
+ * equivalent; the flush above already emptied every table, hence the NULL
+ * free_func (nothing left to free) and the NULLed pointers it leaves behind.
+ */
+void fpm_nhg_tables_fini(struct fpm_nhg_tables *t)
+{
+	fpm_nhg_tables_flush(t);
+	hash_clean_and_free(&t->route_map, NULL);
+	hash_clean_and_free(&t->by_id, NULL);
+	hash_clean_and_free(&t->by_hash, NULL);
+}
+
+/*
  * Build engine: post-order DFS decomposition of a route ctx nexthop
  * tree into deduplicated dplane NHG objects (design §4.2.1). Pure
  * state — no message emission; every newly created object is pushed
@@ -369,6 +404,7 @@ static void fpm_nhg_staging_push(struct fpm_nhg_staging *s,
 				 struct fpm_dplane_nhg *obj)
 {
 	if (s->count == s->cap) {
+		/* count/cap are uint32: the doubling cannot wrap the field */
 		s->cap = s->cap ? s->cap * 2 : 16;
 		s->objs = XREALLOC(MTYPE_FPM_NHG, s->objs,
 				   s->cap * sizeof(*s->objs));
@@ -578,13 +614,23 @@ fpm_nhg_build_group(struct fpm_nhg_tables *t, const struct nexthop *chain,
  * Resolve every member of chain to a child object. Same-level
  * traversal uses ->next only; ->resolved subtrees are entered
  * exclusively through the L-B recursion (never ALL_NEXTHOPS, which
- * would flatten the tree). Returns 0, or -1 if any child failed
- * (partial creations stay queued; the caller rolls back).
+ * would flatten the tree).
+ *
+ * A member flagged RECURSIVE but with no ->resolved chain is skipped
+ * entirely: it is an unresolved recursive nexthop, i.e. nothing that can
+ * be installed. Treating it as an L-C leaf would publish its (unresolved)
+ * gate as a real forwarding entry. *count therefore reports how many
+ * members were actually collected, which may be less than the member
+ * count of the chain — and may be 0, which the caller turns into a failed
+ * group build.
+ *
+ * Returns 0, or -1 if any child failed (partial creations stay queued;
+ * the caller rolls back).
  */
 static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 				    const struct nexthop *chain,
 				    struct fpm_nhg_child *children,
-				    bool *any_recursive,
+				    uint16_t *count, bool *any_recursive,
 				    struct fpm_nhg_staging *newq)
 {
 	const struct nexthop *nh;
@@ -593,8 +639,9 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 	uint16_t i = 0;
 
 	for (nh = chain; nh; nh = nh->next) {
-		if (CHECK_FLAG(nh->flags, NEXTHOP_FLAG_RECURSIVE) &&
-		    nh->resolved) {
+		if (CHECK_FLAG(nh->flags, NEXTHOP_FLAG_RECURSIVE)) {
+			if (!nh->resolved)
+				continue; /* unresolved: not installable */
 			fpm_nhg_resolved_prefix(nh, &rp);
 			child = fpm_nhg_build_group(t, nh->resolved,
 						    FPM_NHG_L_B, nh, &rp,
@@ -609,6 +656,7 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 		children[i].weight = nh->weight;
 		i++;
 	}
+	*count = i;
 	return 0;
 }
 
@@ -659,15 +707,20 @@ fpm_nhg_build_group(struct fpm_nhg_tables *t, const struct nexthop *chain,
 	const struct nexthop *nh;
 	bool any_recursive = false;
 	uint64_t hash;
-	uint16_t n = 0;
+	uint16_t nmembers = 0, n = 0;
 
 	for (nh = chain; nh; nh = nh->next)
-		n++;
-	if (n == 0)
+		nmembers++;
+	if (nmembers == 0)
 		return NULL;
-	children = XCALLOC(MTYPE_FPM_NHG, n * sizeof(*children));
-	if (fpm_nhg_collect_children(t, chain, children, &any_recursive,
+	children = XCALLOC(MTYPE_FPM_NHG, nmembers * sizeof(*children));
+	if (fpm_nhg_collect_children(t, chain, children, &n, &any_recursive,
 				     newq) < 0) {
+		XFREE(MTYPE_FPM_NHG, children);
+		return NULL;
+	}
+	/* every member was an unresolved recursive nexthop: nothing to install */
+	if (n == 0) {
 		XFREE(MTYPE_FPM_NHG, children);
 		return NULL;
 	}
@@ -728,7 +781,8 @@ void fpm_nhg_ref(struct fpm_dplane_nhg *obj)
 void fpm_nhg_rollback(struct fpm_nhg_tables *t, struct fpm_nhg_staging *newq)
 {
 	struct fpm_dplane_nhg *obj;
-	uint16_t i, c;
+	uint32_t i;
+	uint16_t c;
 
 	for (i = newq->count; i > 0; i--) {
 		obj = newq->objs[i - 1];
@@ -769,6 +823,7 @@ void fpm_nhg_rollback(struct fpm_nhg_tables *t, struct fpm_nhg_staging *newq)
 static void fpm_nhg_del_queue_push(struct fpm_nhg_del_queue *q, uint32_t id)
 {
 	if (q->count == q->cap) {
+		/* count/cap are uint32: the doubling cannot wrap the field */
 		q->cap = q->cap ? q->cap * 2 : 16;
 		q->ids = XREALLOC(MTYPE_FPM_NHG, q->ids,
 				  q->cap * sizeof(*q->ids));

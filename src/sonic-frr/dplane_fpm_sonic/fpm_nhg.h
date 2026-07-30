@@ -62,13 +62,20 @@ struct fpm_dplane_nhg {
 
 /*
  * Route key: identifies a route the plugin has seen. The (table_id, afi,
- * prefix) triple is the design's route_nhg_map key — the only memory of
- * "old" across route events (design §4.2.1).
+ * prefix, src_p) tuple is the design's route_nhg_map key — the only memory
+ * of "old" across route events (design §4.2.1).
+ *
+ * src_p carries dplane_ctx_get_src() for srcdest routes and is all-zero
+ * (family AF_UNSPEC) otherwise: two srcdest routes sharing one destination
+ * are distinct routes in the kernel/FIB, so they must not share one map
+ * entry — sharing would make the second install unref the first one's
+ * object and desync the peer.
  */
 struct fpm_nhg_route_key {
 	uint32_t table_id;
 	uint8_t afi;
 	struct prefix p;
+	struct prefix src_p;
 };
 
 struct fpm_nhg_tables {
@@ -78,12 +85,18 @@ struct fpm_nhg_tables {
 	uint32_t next_id;
 	uint32_t *free_ids;
 	uint32_t free_id_count, free_id_cap;
-	/* counters */
+	/*
+	 * counters (lifetime totals, never reset by a reconnect flush).
+	 * dedupe_hits is cumulative lookups incl. rolled-back builds: a
+	 * build that fails and rolls back keeps the hits it scored, so the
+	 * counter tracks lookup behaviour, not surviving objects.
+	 */
 	uint64_t obj_created, obj_deleted, nhgfib_sent, dedupe_hits;
 };
 
 void fpm_nhg_tables_init(struct fpm_nhg_tables *t);
 void fpm_nhg_tables_flush(struct fpm_nhg_tables *t);
+void fpm_nhg_tables_fini(struct fpm_nhg_tables *t);
 uint32_t fpm_nhg_id_alloc(struct fpm_nhg_tables *t);
 void fpm_nhg_id_free(struct fpm_nhg_tables *t, uint32_t id);
 uint64_t fpm_nhg_hash_leaf(const struct nexthop *nh);
@@ -98,7 +111,8 @@ void fpm_nhg_remove(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj);
 
 struct fpm_nhg_staging {
 	struct fpm_dplane_nhg **objs;  /* objects needing RTM_NEWNHGFIB, child-first order */
-	uint16_t count, cap;
+	/* uint32: doubling growth must never overflow the field itself */
+	uint32_t count, cap;
 };
 
 void fpm_nhg_staging_free(struct fpm_nhg_staging *s);
@@ -121,7 +135,8 @@ struct fpm_nhg_del_entry {
 
 struct fpm_nhg_del_queue {
 	struct fpm_nhg_del_entry *ids; /* parent-before-child DEL order */
-	uint16_t count, cap;
+	/* uint32: doubling growth must never overflow the field itself */
+	uint32_t count, cap;
 };
 
 void fpm_nhg_del_queue_free(struct fpm_nhg_del_queue *q);
