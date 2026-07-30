@@ -64,8 +64,12 @@ uint64_t fpm_nhg_hash_leaf(const struct nexthop *nh)
 		uint8_t type, bh;
 		int32_t ifindex;
 		union g_addr gate;
+		uint32_t flags_subset; /* NEXTHOP_FLAGS_HASHED bits only */
 		uint8_t label_type, nlabels;
 		mpls_label_t labels[MPLS_MAX_LABELS];
+		uint32_t seg6local_action;
+		struct seg6local_context seg6local_ctx;
+		uint8_t encap_behavior;
 		uint8_t nseg;
 		struct in6_addr segs[SRV6_MAX_SIDS];
 	} k;
@@ -78,29 +82,43 @@ uint64_t fpm_nhg_hash_leaf(const struct nexthop *nh)
 		k.bh = nh->bh_type;
 	else
 		k.gate = nh->gate;
+	k.flags_subset = nh->flags & NEXTHOP_FLAG_ONLINK;
 	k.label_type = nh->nh_label_type;
 	if (nh->nh_label) {
 		k.nlabels = MIN(nh->nh_label->num_labels, MPLS_MAX_LABELS);
 		memcpy(k.labels, nh->nh_label->label,
 		       k.nlabels * sizeof(mpls_label_t));
 	}
-	if (nh->nh_srv6 && nh->nh_srv6->seg6_segs) {
-		k.nseg = MIN(nh->nh_srv6->seg6_segs->num_segs, SRV6_MAX_SIDS);
-		memcpy(k.segs, nh->nh_srv6->seg6_segs->seg,
-		       k.nseg * sizeof(struct in6_addr));
+	if (nh->nh_srv6) {
+		k.seg6local_action = nh->nh_srv6->seg6local_action;
+		memcpy(&k.seg6local_ctx, &nh->nh_srv6->seg6local_ctx,
+		       sizeof(k.seg6local_ctx));
+		if (nh->nh_srv6->seg6_segs) {
+			k.encap_behavior =
+				(uint8_t)nh->nh_srv6->seg6_segs->encap_behavior;
+			k.nseg = MIN(nh->nh_srv6->seg6_segs->num_segs,
+				     SRV6_MAX_SIDS);
+			memcpy(k.segs, nh->nh_srv6->seg6_segs->seg,
+			       k.nseg * sizeof(struct in6_addr));
+		}
 	}
 	return fpm_nhg_digest(&k, sizeof(k));
 }
 
+/* Resolving vrf: vrf_id u32. Only meaningful for L-B objects, but always
+ * encoded so the layout stays fixed; callers pass 0 for non-L-B levels. */
+#define FPM_NHG_VRF_ENC_LEN 4
+
 uint64_t fpm_nhg_hash_group(uint8_t level, uint32_t nhg_flags,
 			    const struct fpm_nhg_child *children,
-			    uint16_t count, const struct prefix *resolved)
+			    uint16_t count, const struct prefix *resolved,
+			    vrf_id_t vrf_id)
 {
 	uint32_t flags = nhg_flags &
 			 (FPM_NHG_FLAG_RECURSIVE | FPM_NHG_FLAG_RECEIVED);
 	size_t len = FPM_NHG_HDR_ENC_LEN +
 		     (size_t)count * FPM_NHG_CHILD_ENC_LEN +
-		     FPM_NHG_PFX_ENC_LEN;
+		     FPM_NHG_PFX_ENC_LEN + FPM_NHG_VRF_ENC_LEN;
 	uint8_t *buf, *p;
 	uint64_t h;
 	uint16_t i;
@@ -123,6 +141,11 @@ uint64_t fpm_nhg_hash_group(uint8_t level, uint32_t nhg_flags,
 		blen = MIN(prefix_blen(resolved), 16);
 		memcpy(p, &resolved->u.prefix, blen);
 	}
+	/* vrf_id sits right after the 18-byte prefix block */
+	p = buf + FPM_NHG_HDR_ENC_LEN +
+	    (size_t)count * FPM_NHG_CHILD_ENC_LEN + FPM_NHG_PFX_ENC_LEN;
+	for (j = 3; j >= 0; j--)
+		*p++ = ((uint32_t)vrf_id >> (8 * j)) & 0xff;
 	h = fpm_nhg_digest(buf, len);
 	XFREE(MTYPE_FPM_NHG, buf);
 	return h;
@@ -130,9 +153,14 @@ uint64_t fpm_nhg_hash_group(uint8_t level, uint32_t nhg_flags,
 
 uint32_t fpm_nhg_id_alloc(struct fpm_nhg_tables *t)
 {
+	uint32_t id;
+
 	if (t->free_id_count)
 		return t->free_ids[--t->free_id_count];
-	return t->next_id++; /* starts at 1; 0 is the invalid sentinel */
+	id = t->next_id++; /* starts at 1; 0 is the invalid sentinel */
+	if (t->next_id == 0)
+		t->next_id = 1; /* wrap: never hand out the 0 sentinel */
+	return id;
 }
 
 void fpm_nhg_id_free(struct fpm_nhg_tables *t, uint32_t id)
@@ -197,8 +225,12 @@ struct fpm_dplane_nhg *fpm_nhg_lookup_id(struct fpm_nhg_tables *t, uint32_t id)
 
 void fpm_nhg_insert(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj)
 {
-	(void)hash_get(t->by_hash, obj, hash_alloc_intern);
-	(void)hash_get(t->by_id, obj, hash_alloc_intern);
+	struct fpm_dplane_nhg *ret;
+
+	ret = hash_get(t->by_hash, obj, hash_alloc_intern);
+	assert(ret == obj);
+	ret = hash_get(t->by_id, obj, hash_alloc_intern);
+	assert(ret == obj);
 }
 
 void fpm_nhg_remove(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj)

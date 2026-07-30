@@ -27,10 +27,11 @@
 enum fpm_nhg_level { FPM_NHG_L_C = 0, FPM_NHG_L_B, FPM_NHG_L_A };
 
 /*
- * nhg_flags bits carried in the NHGFIB JSON. Values mirror the fpmsyncd
- * wire contract (nhgmgr.h: NEXTHOP_GROUP_RECURSIVE (1 << 3),
- * NEXTHOP_GROUP_RECEIVED (1 << 12)); fpmsyncd checks (1 << 12), so these
- * must never change even if zebra_nhg.h flag values move.
+ * nhg_flags bits carried in the NHGFIB JSON. RECURSIVE (1 << 3) mirrors
+ * zebra_nhg.h NEXTHOP_GROUP_RECURSIVE; RECEIVED (1 << 12) mirrors the
+ * fpmsyncd wire contract (nhgmgr.h NEXTHOP_GROUP_RECEIVED, checked as
+ * (1 << 12)), so these must never change even if zebra_nhg.h flag
+ * values move.
  */
 #define FPM_NHG_FLAG_RECURSIVE (1 << 3)
 #define FPM_NHG_FLAG_RECEIVED (1 << 12)
@@ -59,6 +60,7 @@ struct fpm_dplane_nhg {
 	struct fpm_nhg_child *children; /* sorted by obj->hash */
 };
 
+/* Route-key -> object map lives in dplane_fpm_sonic.c (P8): key type owned there. */
 struct fpm_nhg_tables {
 	struct hash *by_hash;
 	struct hash *by_id;
@@ -76,7 +78,8 @@ void fpm_nhg_id_free(struct fpm_nhg_tables *t, uint32_t id);
 uint64_t fpm_nhg_hash_leaf(const struct nexthop *nh);
 uint64_t fpm_nhg_hash_group(uint8_t level, uint32_t nhg_flags,
 			    const struct fpm_nhg_child *children,
-			    uint16_t count, const struct prefix *resolved);
+			    uint16_t count, const struct prefix *resolved,
+			    vrf_id_t vrf_id);
 struct fpm_dplane_nhg *fpm_nhg_lookup_hash(struct fpm_nhg_tables *t, uint64_t hash);
 struct fpm_dplane_nhg *fpm_nhg_lookup_id(struct fpm_nhg_tables *t, uint32_t id);
 void fpm_nhg_insert(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj);
