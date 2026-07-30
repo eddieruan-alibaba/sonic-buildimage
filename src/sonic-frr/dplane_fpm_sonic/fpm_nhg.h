@@ -85,4 +85,16 @@ struct fpm_dplane_nhg *fpm_nhg_lookup_id(struct fpm_nhg_tables *t, uint32_t id);
 void fpm_nhg_insert(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj);
 void fpm_nhg_remove(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj);
 
+struct fpm_nhg_staging {
+	struct fpm_dplane_nhg **objs;  /* objects needing RTM_NEWNHGFIB, child-first order */
+	uint16_t count, cap;
+};
+
+void fpm_nhg_staging_free(struct fpm_nhg_staging *s);
+struct fpm_dplane_nhg *fpm_nhg_build(struct fpm_nhg_tables *t,
+				     const struct nexthop *chain,
+				     struct fpm_nhg_staging *newq);
+void fpm_nhg_ref(struct fpm_dplane_nhg *obj);
+void fpm_nhg_rollback(struct fpm_nhg_tables *t, struct fpm_nhg_staging *newq);
+
 #endif /* _FPM_NHG_H */
