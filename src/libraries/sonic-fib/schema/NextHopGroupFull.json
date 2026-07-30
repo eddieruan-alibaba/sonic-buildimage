@@ -109,6 +109,19 @@
       "position" : 5,
       "description": "Route-map source address"
     },
+    "resolved_addr": {
+      "position" : 5,
+      "$ref": "#/$defs/ip_address",
+      "description": "Resolving route prefix address for a recursive group (optional)"
+    },
+    "resolved_len": {
+      "type": "integer",
+      "position" : 3,
+      "minimum": 0,
+      "maximum": 128,
+      "default_value" : "0",
+      "description": "Resolving route prefix length for a recursive group (optional)"
+    },
 
     "nh_srv6": {
       "position" : 6,
