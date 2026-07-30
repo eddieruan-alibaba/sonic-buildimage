@@ -4,3 +4,8 @@
 0026-SONiC-ONLY-Translate-tableid-for-dplane-route-notify.patch
 0077-zebra-Add-FPM-EVPN-MH-message-types-and-structures.patch
 0078-zebra-Add-vid-and-BR_PORT_DELETE-support-for-EVPN-MH.patch
+0100-lib-zebra-track-the-id-of-the-nhgs-used-to-resolve-n.patch
+0101-lib-zebra-add-resolved-via-id-to-show-output.patch
+0102-zebra-Encode-resolved-via-field-for-FPM.patch
+0103-WIP-adding-resolving-prefix-in-addition-to-the-resol.patch
+0104-tests-cover-resolved-via-field-copy-in-nexthop_dup.patch
