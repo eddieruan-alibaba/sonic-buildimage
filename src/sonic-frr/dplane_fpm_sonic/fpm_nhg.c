@@ -245,8 +245,8 @@ static bool fpm_nhg_id_cmp(const void *data1, const void *data2)
 }
 
 /*
- * route_nhg_map: (table_id, afi, prefix) -> top (L-A) object. Entries are
- * their own small allocation; the value is a borrowed pointer (the map's
+ * route_nhg_map: (table_id, afi, prefix, src_p) -> top (L-A) object. Entries
+ * are their own small allocation; the value is a borrowed pointer (the map's
  * refcount on the object is taken/released by the caller, not here).
  */
 struct fpm_nhg_route_entry {
@@ -404,7 +404,12 @@ static void fpm_nhg_staging_push(struct fpm_nhg_staging *s,
 				 struct fpm_dplane_nhg *obj)
 {
 	if (s->count == s->cap) {
-		/* count/cap are uint32: the doubling cannot wrap the field */
+		/*
+		 * cap doubles only when count reaches it, so cap is the
+		 * smallest power of two >= count; count is bounded by the
+		 * object count of one route's nexthop tree (see the struct
+		 * comment), so cap never approaches 2^31.
+		 */
 		s->cap = s->cap ? s->cap * 2 : 16;
 		s->objs = XREALLOC(MTYPE_FPM_NHG, s->objs,
 				   s->cap * sizeof(*s->objs));
@@ -619,13 +624,17 @@ fpm_nhg_build_group(struct fpm_nhg_tables *t, const struct nexthop *chain,
  * A member flagged RECURSIVE but with no ->resolved chain is skipped
  * entirely: it is an unresolved recursive nexthop, i.e. nothing that can
  * be installed. Treating it as an L-C leaf would publish its (unresolved)
- * gate as a real forwarding entry. *count therefore reports how many
+ * gate as a real forwarding entry. A recursive member whose whole resolved
+ * chain turns out to be unresolvable (fpm_nhg_build_group() returns NULL
+ * without having created anything) is skipped for exactly the same reason:
+ * failing the whole context there would drop a route that may still have
+ * perfectly usable other members. *count therefore reports how many
  * members were actually collected, which may be less than the member
  * count of the chain — and may be 0, which the caller turns into a failed
  * group build.
  *
- * Returns 0, or -1 if any child failed (partial creations stay queued;
- * the caller rolls back).
+ * Returns 0, or -1 if any child failed for a reason other than "nothing
+ * installable" (partial creations stay queued; the caller rolls back).
  */
 static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 				    const struct nexthop *chain,
@@ -636,6 +645,7 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 	const struct nexthop *nh;
 	struct fpm_dplane_nhg *child;
 	struct prefix rp;
+	uint32_t staged;
 	uint16_t i = 0;
 
 	for (nh = chain; nh; nh = nh->next) {
@@ -643,15 +653,29 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 			if (!nh->resolved)
 				continue; /* unresolved: not installable */
 			fpm_nhg_resolved_prefix(nh, &rp);
+			staged = newq->count;
 			child = fpm_nhg_build_group(t, nh->resolved,
 						    FPM_NHG_L_B, nh, &rp,
 						    nh->vrf_id, newq);
+			if (!child) {
+				/*
+				 * Objects already queued means the nested build
+				 * hit a real error mid-way: propagate so the
+				 * caller rolls them back. Otherwise nothing was
+				 * created and this member simply has nothing
+				 * installable behind it — skip it.
+				 */
+				if (newq->count != staged)
+					return -1;
+				continue;
+			}
+			/* only a member that contributed makes the group recursive */
 			*any_recursive = true;
 		} else {
 			child = fpm_nhg_get_leaf(t, nh, newq);
+			if (!child)
+				return -1;
 		}
-		if (!child)
-			return -1;
 		children[i].obj = child;
 		children[i].weight = nh->weight;
 		i++;
@@ -719,7 +743,11 @@ fpm_nhg_build_group(struct fpm_nhg_tables *t, const struct nexthop *chain,
 		XFREE(MTYPE_FPM_NHG, children);
 		return NULL;
 	}
-	/* every member was an unresolved recursive nexthop: nothing to install */
+	/*
+	 * Every member was skipped as not installable (unresolved recursive
+	 * nexthop, or a recursive nexthop with nothing installable behind it):
+	 * NULL here consistently means "nothing to install", never "error".
+	 */
 	if (n == 0) {
 		XFREE(MTYPE_FPM_NHG, children);
 		return NULL;
@@ -812,18 +840,25 @@ void fpm_nhg_rollback(struct fpm_nhg_tables *t, struct fpm_nhg_staging *newq)
  * memory.
  *
  * id_free() vs DEL flush: the design requires that a freed id is not
- * reused before its DEL has been flushed. That holds without deferring
- * the free because
+ * reused before its DEL has been flushed. That holds even though the
+ * caller now DEFERS the staged DELs to the head of its next batch,
+ * because
  *   (a) within one ctx the whole fpm_nhg_build() runs before any unref,
  *       so ids this ctx frees cannot be popped by this ctx's allocations;
- *   (b) the caller flushes the staged DELs before returning from the
- *       route op, so any later ctx allocating a recycled id necessarily
- *       emits its NEW after that DEL in the byte stream.
+ *   (b) the deferred DELs are emitted at the HEAD of the next batch, i.e.
+ *       ahead of every RTM_NEWNHGFIB in it, so a later ctx that pops a
+ *       recycled id from the free list necessarily emits its NEW after
+ *       that DEL in the byte stream.
  */
 static void fpm_nhg_del_queue_push(struct fpm_nhg_del_queue *q, uint32_t id)
 {
 	if (q->count == q->cap) {
-		/* count/cap are uint32: the doubling cannot wrap the field */
+		/*
+		 * cap doubles only when count reaches it, so cap is the
+		 * smallest power of two >= count; count is bounded by the
+		 * number of live objects (see the struct comment), so cap
+		 * never approaches 2^31.
+		 */
 		q->cap = q->cap ? q->cap * 2 : 16;
 		q->ids = XREALLOC(MTYPE_FPM_NHG, q->ids,
 				  q->cap * sizeof(*q->ids));
@@ -836,6 +871,11 @@ void fpm_nhg_del_queue_free(struct fpm_nhg_del_queue *q)
 	XFREE(MTYPE_FPM_NHG, q->ids);
 	q->count = 0;
 	q->cap = 0;
+}
+
+void fpm_nhg_del_queue_reset(struct fpm_nhg_del_queue *q)
+{
+	q->count = 0;
 }
 
 void fpm_nhg_unref(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj,

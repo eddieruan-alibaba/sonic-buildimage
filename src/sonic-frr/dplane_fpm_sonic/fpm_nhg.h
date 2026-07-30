@@ -111,7 +111,14 @@ void fpm_nhg_remove(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj);
 
 struct fpm_nhg_staging {
 	struct fpm_dplane_nhg **objs;  /* objects needing RTM_NEWNHGFIB, child-first order */
-	/* uint32: doubling growth must never overflow the field itself */
+	/*
+	 * count is bumped one object at a time and cap only doubles (from 16)
+	 * when count reaches it, so cap stays the smallest power of two >=
+	 * count. count itself is bounded by the number of objects one build
+	 * creates, i.e. by the size of one route's nexthop tree (thousands at
+	 * most) — five orders of magnitude below the 2^31 where the doubling
+	 * would leave the uint32.
+	 */
 	uint32_t count, cap;
 };
 
@@ -135,11 +142,20 @@ struct fpm_nhg_del_entry {
 
 struct fpm_nhg_del_queue {
 	struct fpm_nhg_del_entry *ids; /* parent-before-child DEL order */
-	/* uint32: doubling growth must never overflow the field itself */
+	/*
+	 * Same growth argument as fpm_nhg_staging: cap doubles (from 16) only
+	 * when count reaches it, so cap is the smallest power of two >= count.
+	 * count is bounded by the number of live objects the tables hold, and
+	 * every one of those costs more than a hundred heap bytes, so reaching
+	 * the 2^31 where the doubling would leave the uint32 would need
+	 * hundreds of gigabytes of NHG state.
+	 */
 	uint32_t count, cap;
 };
 
 void fpm_nhg_del_queue_free(struct fpm_nhg_del_queue *q);
+/* Empty the queue but keep its allocation (a queue reused across batches). */
+void fpm_nhg_del_queue_reset(struct fpm_nhg_del_queue *q);
 void fpm_nhg_unref(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj,
 		   struct fpm_nhg_del_queue *delq);
 

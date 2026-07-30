@@ -223,6 +223,26 @@ struct fpm_nl_ctx {
 	struct fpm_nhg_tables nhg_tables;
 
 	/*
+	 * DELNHGFIB ids produced by contexts already written to obuf, waiting
+	 * to be emitted at the HEAD of the next batch (or by the end-of-drain
+	 * flush in fpm_process_queue()).
+	 *
+	 * Deferring them is what makes every write exactly reservable: the DEL
+	 * ids only exist after fpm_nhg_unref() has already freed the objects,
+	 * i.e. after the point of no return, so a context that had to emit its
+	 * own DELs could never know its exact byte count before mutating. The
+	 * design does not require the DELs to be in the same batch — the only
+	 * invariant it needs is that a DEL arrives AFTER the route message that
+	 * dereferenced it, never before. Carrying them into the next batch
+	 * satisfies that strictly (see fpm_nl_enqueue_route_nhg_fib()).
+	 *
+	 * Serialized by obuf_mutex together with nhg_tables. Dropped without
+	 * emission on reconnect: a new connection is a full resync, so the ids
+	 * these DELs name no longer mean anything to the peer.
+	 */
+	struct fpm_nhg_del_queue pending_dels;
+
+	/*
 	 * data plane context queue:
 	 * When a FPM server connection becomes a bottleneck, we must keep the
 	 * data plane contexts until we get a chance to process them.
@@ -834,9 +854,11 @@ static void fpm_reconnect(struct fpm_nl_ctx *fnc)
 	/*
 	 * Drop all dplane NHG state: a new connection is a full resync, so
 	 * no DELNHGFIB is emitted here (design §4.2.1). zebra's replay
-	 * rebuilds every object with fresh ids.
+	 * rebuilds every object with fresh ids. The deferred DELs go with it:
+	 * they name ids of a connection that no longer exists.
 	 */
 	fpm_nhg_tables_flush(&fnc->nhg_tables);
+	fpm_nhg_del_queue_reset(&fnc->pending_dels);
 	event_cancel(&fnc->t_read);
 	event_cancel(&fnc->t_write);
 
@@ -3247,27 +3269,30 @@ struct fpm_frame {
 
 /*
  * Every frame one dplane context produces, in wire order. The batch is the
- * unit of atomicity: it is written to obuf in a single critical section
- * after a single room check, so the peer never observes a partially
- * emitted context.
+ * unit of atomicity: its total byte count is known exactly before anything is
+ * written, so it is admitted by a single room check and then written to obuf
+ * in one critical section — the peer never observes a partially emitted
+ * context.
+ *
+ * count/cap are uint32 so an unusually large batch degrades into a room
+ * failure (which the caller can roll back and retry) instead of tripping an
+ * assert. The per-frame framing bound is enforced in fpm_frame_batch_add().
  */
 struct fpm_frame_batch {
 	struct fpm_frame *frames;
-	uint16_t count, cap;
+	uint32_t count, cap;
 	size_t total_len;   /* sum of len + FPM_HEADER_SIZE per frame */
 };
-
-/*
- * Upper bound on one encoded RTM_NEWNHGFIB / RTM_DELNHGFIB frame, used by
- * the pre-reservation below. This is a P9-verified bound: P9 MUST assert
- * that every encoded NHGFIB frame is <= this value (the design's 64KiB cap
- * applies per frame, this is the much tighter bound the reservation needs).
- */
-#define FPM_NHGFIB_FRAME_MAX 4096
 
 /**
  * Append one fully encoded netlink message to the batch. The bytes are
  * copied, so callers may encode every frame into the same scratch buffer.
+ *
+ * The assert is the per-frame wire bound: the FPM header carries the frame
+ * length as a u16 (stream_putw()), so no single frame may exceed UINT16_MAX
+ * bytes including that header. Every producer is bounded by it — netlink
+ * messages are encoded into a DPLANE_FPM_NL_BUF_SIZE (64KiB) scratch buffer,
+ * and P9's NHGFIB encoder must respect the same limit.
  */
 static void fpm_frame_batch_add(struct fpm_frame_batch *batch,
 				const uint8_t *buf, size_t len)
@@ -3275,15 +3300,7 @@ static void fpm_frame_batch_add(struct fpm_frame_batch *batch,
 	assert(len > 0 && (len + FPM_HEADER_SIZE) <= UINT16_MAX);
 
 	if (batch->count == batch->cap) {
-		/*
-		 * cap is uint16 (a context cannot produce more frames than
-		 * that): do the doubling in uint32 and assert the bound
-		 * instead of silently wrapping the field.
-		 */
-		uint32_t cap = batch->cap ? (uint32_t)batch->cap * 2 : 16;
-
-		assert(cap <= UINT16_MAX);
-		batch->cap = (uint16_t)cap;
+		batch->cap = batch->cap ? batch->cap * 2 : 16;
 		batch->frames = XREALLOC(MTYPE_FPM_FRAME, batch->frames,
 					 (size_t)batch->cap *
 						 sizeof(*batch->frames));
@@ -3298,7 +3315,7 @@ static void fpm_frame_batch_add(struct fpm_frame_batch *batch,
 
 static void fpm_frame_batch_free(struct fpm_frame_batch *batch)
 {
-	uint16_t i;
+	uint32_t i;
 
 	for (i = 0; i < batch->count; i++)
 		XFREE(MTYPE_FPM_FRAME, batch->frames[i].buf);
@@ -3314,13 +3331,15 @@ static void fpm_frame_batch_free(struct fpm_frame_batch *batch)
  *
  * Requires `fnc->obuf_mutex` to be held.
  *
- * Room is checked once, for the whole batch. Callers reserve the space
- * BEFORE they mutate any state (see fpm_nl_enqueue_route_nhg_fib()), so by
- * the time this runs the state change the frames describe has already
- * happened: a room failure here can no longer be replayed as a harmless
- * retry. It therefore logs an error and forces a reconnect, which drops all
- * dplane NHG state and makes the peer resync from scratch — that is what
- * keeps "the peer never sees a partial context" true even in that case.
+ * Callers assemble the complete batch first, so `batch->total_len` is the
+ * exact byte count of the write; they admit it with one
+ * fpm_obuf_have_bytes_locked(total_len) check under the very same held
+ * obuf_mutex and only then call this. Nothing else appends to obuf without
+ * that mutex, so both room checks below can no longer fail — they are kept as
+ * the last line of defence: if a caller ever admitted a batch it had not
+ * fully assembled, the peer must not see a truncated context, so this logs
+ * and forces a reconnect (dropping all dplane NHG state and making the peer
+ * resync from scratch) instead of writing part of it.
  *
  * @return 0 when every frame was written, -1 when the batch did not fit
  *         and a resync was requested.
@@ -3330,7 +3349,7 @@ static int fpm_frame_batch_write_locked(struct fpm_nl_ctx *fnc,
 					const char *caller)
 {
 	uint64_t obytes, obytes_peak;
-	uint16_t i;
+	uint32_t i;
 
 	if (batch->count == 0)
 		return 0;
@@ -3394,19 +3413,24 @@ static int fpm_frame_batch_write_locked(struct fpm_nl_ctx *fnc,
  * NHGFIB message emitters — the seam P9 fills in.
  *
  * P8 owns state and ordering, P9 owns the bytes. Both emitters are called
- * with `fnc->obuf_mutex` held and in the design's flush order: every NEW
- * (children before parents) before the route message, every DEL after it.
+ * with `fnc->obuf_mutex` held and in the design's flush order: the DELs
+ * carried over from earlier contexts first, then every NEW of this context
+ * (children before parents), then its route message. The DELs this context
+ * produces are carried over in turn (see fnc->pending_dels).
  *
  * Emitters only APPEND to the caller's frame batch, they never touch obuf:
  * the batch is written in one piece afterwards, which is what makes the
- * whole context atomic on the wire.
+ * whole context atomic on the wire — and what makes its size exactly known
+ * before any byte is written.
  *
  * P9: replace the body with netlink_nhgfull_obj_msg_encode(RTM_NEWNHGFIB /
  * RTM_DELNHGFIB, ...) into a local buffer, then
- *	assert(len <= FPM_NHGFIB_FRAME_MAX);
  *	fpm_frame_batch_add(batch, buf, len);
- * The FPM_NHGFIB_FRAME_MAX assert is mandatory: the caller's output space
- * reservation is computed from that bound.
+ * P9 must keep every encoded NHGFIB frame within DPLANE_FPM_NL_BUF_SIZE
+ * (64KiB), which is also what the FPM framing allows: fpm_frame_batch_add()
+ * asserts len + FPM_HEADER_SIZE <= UINT16_MAX, the bound of the u16 length
+ * field the FPM header carries. No tighter per-frame bound is needed — the
+ * output space reservation is computed from the assembled batch itself.
  */
 static void fpm_emit_nhgfib_new(struct fpm_nl_ctx *fnc,
 				const struct fpm_dplane_nhg *obj,
@@ -3452,19 +3476,64 @@ static void fpm_nhg_route_key_from_ctx(const struct zebra_dplane_ctx *ctx,
 		prefix_copy(&key->src_p, src);
 }
 
-/*
- * Conservative extra frame allowance for the DELs one context can stage.
+/**
+ * Append every DEL carried over from earlier contexts to `batch`, in queue
+ * order (parent before child, oldest context first).
  *
- * The reservation must be computed BEFORE the map upsert, because the DEL
- * ids only exist after fpm_nhg_unref() has already freed the objects — at
- * which point the state change is no longer undoable. The exact DEL count
- * is therefore unknown at reservation time, so a heuristic allowance is
- * reserved on top of the (known) NEW count. A context deleting more than
- * this many objects still cannot truncate anything: the batch write detects
- * the shortfall and forces a resync instead (see
- * fpm_frame_batch_write_locked()).
+ * Ordering argument: these ids belong to contexts whose route messages were
+ * already written to obuf in earlier batches, so the route message that
+ * dereferenced each of them precedes this batch entirely. Emitting them at
+ * the HEAD of this batch therefore keeps the design's only ordering
+ * requirement — "a DEL arrives after the route message that dereferenced it"
+ * — and additionally puts them ahead of every RTM_NEWNHGFIB in this batch,
+ * which is what makes id recycling safe (see fpm_nhg.c, "id_free() vs DEL
+ * flush").
+ *
+ * Requires `fnc->obuf_mutex` to be held.
  */
-#define FPM_NHG_DEL_RESERVE 64
+static void fpm_nhg_pending_dels_add(struct fpm_nl_ctx *fnc,
+				     struct fpm_frame_batch *batch)
+{
+	uint32_t i;
+
+	for (i = 0; i < fnc->pending_dels.count; i++)
+		fpm_emit_nhgfib_del(fnc, fnc->pending_dels.ids[i].dplane_id,
+				    batch);
+}
+
+/**
+ * Emit the carried-over DELs as a batch of their own. Bounds how long a
+ * deferred DEL can lag behind the route message that dropped its last
+ * reference when no further nhg-fib context comes along.
+ *
+ * Same exact-reservation rule as everywhere else: the batch is assembled
+ * first, admitted by a single room check, and the queue is only emptied once
+ * the bytes are on the wire. With no room the DELs simply stay queued for the
+ * next attempt — a lagging DEL is harmless, it only leaves the peer holding
+ * an unreferenced NHG for a while longer.
+ *
+ * Requires `fnc->obuf_mutex` to be held.
+ */
+static void fpm_nhg_pending_dels_flush_locked(struct fpm_nl_ctx *fnc,
+					      const char *caller)
+{
+	struct fpm_frame_batch batch = {};
+
+	if (fnc->pending_dels.count == 0)
+		return;
+
+	fpm_nhg_pending_dels_add(fnc, &batch);
+
+	if (!fpm_obuf_have_bytes_locked(fnc, batch.total_len, caller)) {
+		fpm_frame_batch_free(&batch);
+		return;
+	}
+
+	if (fpm_frame_batch_write_locked(fnc, &batch, caller) == 0)
+		fpm_nhg_del_queue_reset(&fnc->pending_dels);
+
+	fpm_frame_batch_free(&batch);
+}
 
 /**
  * Route operation handling in nhg-fib mode (design §4.2.1 "Per-op
@@ -3473,27 +3542,29 @@ static void fpm_nhg_route_key_from_ctx(const struct zebra_dplane_ctx *ctx,
  *
  * The whole sequence runs under `obuf_mutex`, which also serializes the
  * NHG tables against the other thread enqueueing route ops, and keeps the
- * emitted order (NEWs -> route -> DELs) atomic in the byte stream.
+ * emitted order atomic in the byte stream.
  *
- * All-or-nothing scheme, in order:
+ * Every write is EXACTLY reserved, in this order:
  *
  *  1. build the object tree (pure state, rollback-able) and encode the
  *     route frame into the caller's scratch buffer;
- *  2. RESERVE output space for a conservative upper bound of the resulting
- *     batch: route frame + (NEW count + FPM_NHG_DEL_RESERVE) NHGFIB frames
- *     of FPM_NHGFIB_FRAME_MAX bytes each. This happens while the whole
- *     context is still undoable, so a reservation failure rolls the build
- *     back, leaves the map pointing at the old object and returns -1 for
- *     the caller to retry the context as a whole;
- *  3. mutate state (map upsert, ref of the new top, unref of the old one).
- *     The unref is what produces the DEL ids, and it already freed the
- *     objects — there is no undo past this point, which is exactly why the
- *     reservation had to be conservative rather than exact;
- *  4. accumulate all frames of the context into one batch, in wire order:
- *     NEWs (children before parents), the route frame, then the DELs;
- *  5. write the batch in one piece. Should the reservation ever have been
- *     too small, the write path logs and forces a reconnect, so the peer
- *     resyncs from scratch instead of seeing a partial context.
+ *  2. assemble the whole batch: first the DELs carried over from earlier
+ *     contexts, then this context's NEWs (children before parents), then its
+ *     route frame. Nothing is written yet, so the context is still fully
+ *     undoable;
+ *  3. admit the batch with ONE room check for its exact total length. On
+ *     failure the build is rolled back, the map keeps pointing at the old
+ *     object, the carried-over DELs stay queued and -1 is returned so the
+ *     caller can retry (or report the failure to zebra);
+ *  4. write the batch in one piece and drop the carried-over DELs: they are
+ *     on the wire now;
+ *  5. only then mutate state (map upsert, ref of the new top, unref of the
+ *     old one). The unref is what produces DEL ids, and it frees the objects
+ *     as it goes — there is no undo past this point, which is exactly why it
+ *     comes last: the write no longer depends on any of its results. The ids
+ *     it produces are appended to fnc->pending_dels and ride out at the head
+ *     of the next batch (or in the end-of-drain flush), which is where the
+ *     need for any guessed DEL allowance disappears.
  *
  * @param nl_buf      caller owned scratch buffer for the route frame.
  * @param nl_buf_size size of that buffer.
@@ -3506,11 +3577,10 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 					size_t nl_buf_size)
 {
 	struct fpm_nhg_staging newq = {};
-	struct fpm_nhg_del_queue delq = {};
 	struct fpm_frame_batch batch = {};
 	struct fpm_dplane_nhg *new_top = NULL, *old_top;
 	struct fpm_nhg_route_key key;
-	size_t nl_buf_len = 0, route_off, reserve;
+	size_t nl_buf_len = 0, route_off;
 	struct nlmsghdr *n;
 	ssize_t rv;
 	uint32_t i;
@@ -3600,23 +3670,48 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	assert((nl_buf_len + FPM_HEADER_SIZE) <= UINT16_MAX);
 
 	/*
-	 * Output space is RESERVED here, while the context is still fully
-	 * undoable: the NEW count is known, the DEL count is not (it only
-	 * materializes inside fpm_nhg_unref() below, which frees the objects
-	 * as it goes), so the reservation covers the exact NEW count plus the
-	 * FPM_NHG_DEL_RESERVE heuristic, at FPM_NHGFIB_FRAME_MAX bytes per
-	 * NHGFIB frame. On failure nothing is emitted, no state moves and the
-	 * map keeps pointing at the old object, so the caller can retry the
-	 * whole context.
+	 * Assemble the complete batch while the context is still fully undoable.
+	 * Wire order: carried-over DELs -> this context's NEWs (children first)
+	 * -> route message.
+	 *
+	 * The NEWs are encoded before the mutation below, which is safe because
+	 * the mutation changes nothing an NHGFIB message carries: it only moves
+	 * refcounts and the route map entry, and it only frees objects that
+	 * existed before this build (a newly built object cannot be a child of
+	 * the old top, so the unref cascade can never reach one).
 	 */
-	reserve = nl_buf_len + FPM_HEADER_SIZE +
-		  ((size_t)newq.count + FPM_NHG_DEL_RESERVE) *
-			  (FPM_NHGFIB_FRAME_MAX + FPM_HEADER_SIZE);
-	if (!fpm_obuf_have_bytes_locked(fnc, reserve, __func__)) {
+	fpm_nhg_pending_dels_add(fnc, &batch);
+
+	for (i = 0; i < newq.count; i++)
+		fpm_emit_nhgfib_new(fnc, newq.objs[i], &batch);
+
+	if (nl_buf_len)
+		fpm_frame_batch_add(&batch, nl_buf, nl_buf_len);
+
+	/*
+	 * batch.total_len is now the EXACT byte count of the write, so this
+	 * single check is the whole reservation — no upper bound heuristic is
+	 * involved anymore. On failure nothing is emitted, no state moves, the
+	 * map keeps pointing at the old object and the carried-over DELs stay
+	 * queued, so the caller can retry the whole context.
+	 */
+	if (!fpm_obuf_have_bytes_locked(fnc, batch.total_len, __func__)) {
 		fpm_nhg_rollback(&fnc->nhg_tables, &newq);
 		fpm_nhg_staging_free(&newq);
+		fpm_frame_batch_free(&batch);
 		return -1;
 	}
+
+	/* One atomic write for the whole context. */
+	ret = fpm_frame_batch_write_locked(fnc, &batch, __func__);
+	fpm_frame_batch_free(&batch);
+	fpm_nhg_staging_free(&newq);
+
+	/*
+	 * The carried-over DELs are on the wire (or a resync was forced, which
+	 * invalidates every id anyway): stop carrying them.
+	 */
+	fpm_nhg_del_queue_reset(&fnc->pending_dels);
 
 	/* Past this point the state change is committed and not undoable. */
 	if (op == DPLANE_OP_ROUTE_DELETE) {
@@ -3631,48 +3726,45 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	 * ref-then-unref also covers the "same tree re-sent" case: there
 	 * old_top == new_top, the two operations net to zero and no DEL is
 	 * staged.
+	 *
+	 * The DELs land in fnc->pending_dels: the route message that
+	 * dereferenced them has just been written, so emitting them at the head
+	 * of the next batch keeps them strictly after it.
 	 */
 	if (old_top)
-		fpm_nhg_unref(&fnc->nhg_tables, old_top, &delq);
-
-	/* Wire order: NEWs (children first) -> route message -> DELs. */
-	for (i = 0; i < newq.count; i++)
-		fpm_emit_nhgfib_new(fnc, newq.objs[i], &batch);
-
-	if (nl_buf_len)
-		fpm_frame_batch_add(&batch, nl_buf, nl_buf_len);
-
-	for (i = 0; i < delq.count; i++)
-		fpm_emit_nhgfib_del(fnc, delq.ids[i].dplane_id, &batch);
-
-	/* One atomic write for the whole context. */
-	ret = fpm_frame_batch_write_locked(fnc, &batch, __func__);
-
-	fpm_frame_batch_free(&batch);
-	fpm_nhg_staging_free(&newq);
-	fpm_nhg_del_queue_free(&delq);
+		fpm_nhg_unref(&fnc->nhg_tables, old_top, &fnc->pending_dels);
 
 	return ret;
 }
 
 /**
- * Drop any nhg-fib state this route still owns, emitting the resulting
- * DELNHGFIB messages.
+ * Drop any nhg-fib state this route still owns, queueing the resulting
+ * DELNHGFIB ids for the next batch.
  *
  * Needed when a prefix leaves the nhg-fib path while keeping its identity,
  * i.e. a non-SRv6 route becoming an SRv6 route: SRv6 contexts go through the
  * legacy encoders, so without this the route_nhg_map would keep a stale
  * entry and the reference it holds would never be released — the top object
  * (and everything below it) would leak until the next reconnect flush.
+ *
+ * State only: no message is emitted here. Emitting the DELs at this point
+ * would put them BEFORE the legacy route message this context is about to
+ * encode, i.e. before the very message that drops the last reference — the
+ * one ordering the design forbids. Handing them to fnc->pending_dels instead
+ * makes them ride out with the next nhg-fib batch or with the end-of-drain
+ * flush, strictly after this context's route message. The lag is harmless:
+ * the peer keeps an unreferenced NHG for a moment longer, and the id cannot
+ * be reused ahead of its DEL because every NEW is emitted behind the pending
+ * DELs (see fpm_nhg_pending_dels_add()).
+ *
+ * obuf_mutex is still held: it is what serializes the tables and
+ * fnc->pending_dels against the other thread.
  */
 static void fpm_nhg_fib_forget_route(struct fpm_nl_ctx *fnc,
 				     struct zebra_dplane_ctx *ctx)
 {
-	struct fpm_nhg_del_queue delq = {};
-	struct fpm_frame_batch batch = {};
 	struct fpm_dplane_nhg *old_top;
 	struct fpm_nhg_route_key key;
-	uint32_t i;
 
 	fpm_nhg_route_key_from_ctx(ctx, &key);
 
@@ -3682,21 +3774,7 @@ static void fpm_nhg_fib_forget_route(struct fpm_nl_ctx *fnc,
 	if (old_top == NULL)
 		return;
 
-	fpm_nhg_unref(&fnc->nhg_tables, old_top, &delq);
-
-	for (i = 0; i < delq.count; i++)
-		fpm_emit_nhgfib_del(fnc, delq.ids[i].dplane_id, &batch);
-
-	/*
-	 * DELs only release ids the peer already knows about, and the local
-	 * objects are gone either way; if the batch does not fit,
-	 * fpm_frame_batch_write_locked() forces a resync, which is the only
-	 * way to keep the peer consistent from here.
-	 */
-	(void)fpm_frame_batch_write_locked(fnc, &batch, __func__);
-
-	fpm_frame_batch_free(&batch);
-	fpm_nhg_del_queue_free(&delq);
+	fpm_nhg_unref(&fnc->nhg_tables, old_top, &fnc->pending_dels);
 }
 
 /**
@@ -4419,18 +4497,49 @@ static void fpm_process_queue(struct event *t)
 			break;
 
 		/*
-		 * Intentionally ignoring the return value
-		 * as that we are ensuring that we can write to
-		 * the output data in the STREAM_WRITEABLE
-		 * check above, so we can ignore the return
+		 * -1 means the context did not fit in the output buffer, so
+		 * nothing of it was emitted.
+		 *
+		 * The context cannot be retried here: it has already been
+		 * dequeued and the dplane queue API this plugin has offers no
+		 * head insertion, so putting it back would reorder it behind
+		 * later operations on the same prefix. Tell zebra the route was
+		 * not programmed instead — silently dropping it (what the old
+		 * "intentionally ignoring the return value" comment did) loses
+		 * the route with nobody noticing. The STREAM_WRITEABLE check
+		 * above only guarantees one DPLANE_FPM_NL_BUF_SIZE of room,
+		 * which an nhg-fib batch (NHGFIB frames plus the route frame)
+		 * can legitimately exceed.
+		 *
+		 * Gated on use_nhg_fib: the legacy path can also return -1
+		 * (fpm_obuf_write_locked()) and has always ignored it, so its
+		 * behaviour is left exactly as it was.
 		 */
-		if (fnc->socket != -1)
-			(void)fpm_nl_enqueue(fnc, ctx);
+		if (fnc->socket != -1 && fpm_nl_enqueue(fnc, ctx) == -1 &&
+		    fnc->use_nhg_fib) {
+			zlog_warn("%s: output buffer full, route not programmed (%pFX table %u)",
+				  __func__, dplane_ctx_get_dest(ctx),
+				  dplane_ctx_get_table(ctx));
+			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
+		}
 
 		/* Account the processed entries. */
 		processed_contexts++;
 
 		dplane_provider_enqueue_out_ctx(fnc->prov, ctx);
+	}
+
+	/*
+	 * End of drain: flush the DELs deferred by the contexts just processed.
+	 * They are only carried until the next batch needs them at its head, so
+	 * without this they could sit here for as long as no further nhg-fib
+	 * context arrives. Bounding that lag is all this does — correctness
+	 * never depended on it.
+	 */
+	if (fnc->use_nhg_fib && fnc->socket != -1) {
+		frr_with_mutex (&fnc->obuf_mutex) {
+			fpm_nhg_pending_dels_flush_locked(fnc, __func__);
+		}
 	}
 
 	/* Update count of processed contexts */
@@ -4615,6 +4724,7 @@ static int fpm_nl_finish_late(struct fpm_nl_ctx *fnc)
 	 * writer is left and the already destroyed obuf_mutex is not needed.
 	 */
 	fpm_nhg_tables_fini(&fnc->nhg_tables);
+	fpm_nhg_del_queue_free(&fnc->pending_dels);
 	stream_free(fnc->ibuf);
 	stream_free(fnc->obuf);
 	free(gfnc);
