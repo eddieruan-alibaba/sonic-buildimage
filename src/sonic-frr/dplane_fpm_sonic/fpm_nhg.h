@@ -56,33 +56,8 @@ struct fpm_dplane_nhg {
 	vrf_id_t vrf_id;
 	uint32_t rib_nhg_ids[FPM_NHG_RIB_ID_TRACK]; /* show only */
 	uint8_t rib_nhg_id_count;
-	/*
-	 * Binding convergence state (design §5): set on an L-B object whose
-	 * resolving prefix is currently gone, cleared when it comes back. A
-	 * repaired object keeps its children — only the JSON emission treats
-	 * its member set as empty, which is how "drop the dead recursive
-	 * branch" is realized without touching the object model (so restore is
-	 * nothing but clearing this flag again).
-	 */
-	bool repaired;
 	uint16_t num_children;
 	struct fpm_nhg_child *children; /* sorted by obj->hash */
-	/*
-	 * Reverse edges: every object that holds this one as a child, one
-	 * entry per child slot (a parent listing the same deduped child twice
-	 * links twice, so link/unlink stay symmetric with the refcount).
-	 *
-	 * Needed by the repair/restore walk: a parent's flattened member list
-	 * embeds its whole subtree, so flipping `repaired` on an L-B changes
-	 * the JSON of every ancestor as well.
-	 *
-	 * uint32 counts, unlike num_children: a group's member count is
-	 * bounded by the wire arrays, but the number of groups sharing one
-	 * child scales with route diversity (many distinct L-A sets can share
-	 * one BGP nexthop's L-B), so 16 bits is not a safe bound here.
-	 */
-	uint32_t num_parents, parents_cap;
-	struct fpm_dplane_nhg **parents;
 };
 
 /*
@@ -103,41 +78,10 @@ struct fpm_nhg_route_key {
 	struct prefix src_p;
 };
 
-/*
- * Binding: resolving prefix -> the L-B objects resolved through it (the
- * plugin's NHT equivalent, design §5).
- *
- * Deliberately keyed on (afi, prefix) only, WITHOUT a vrf: the trigger is the
- * plugin's own route stream, whose key carries a table_id, while an L-B
- * records the nexthop vrf_id — matching the two would need a table_id -> vrf
- * mapping the plugin does not keep. Each entry's objects carry their own
- * vrf_id instead, so a same-prefix event in another vrf repairs one object too
- * many rather than one too few (conservative: zebra's own re-resolution
- * restores it).
- */
-struct fpm_nhg_binding_key {
-	uint8_t afi;
-	struct prefix p;
-};
-
-struct fpm_nhg_binding_entry {
-	struct fpm_nhg_binding_key key;
-	/*
-	 * The L-B objects bound to this prefix. Order is irrelevant (removal
-	 * swaps in the last entry), and the same object is never listed twice.
-	 * uint32 counts for the same reason as num_parents: the number of
-	 * groups resolving through one prefix is not bounded by the wire
-	 * arrays.
-	 */
-	struct fpm_dplane_nhg **objs;
-	uint32_t count, cap;
-};
-
 struct fpm_nhg_tables {
 	struct hash *by_hash;
 	struct hash *by_id;
 	struct hash *route_map; /* fpm_nhg_route_key -> top (L-A) object */
-	struct hash *bindings;  /* fpm_nhg_binding_key -> bound L-B objects */
 	uint32_t next_id;
 	uint32_t *free_ids;
 	uint32_t free_id_count, free_id_cap;
@@ -223,17 +167,5 @@ void fpm_nhg_route_set(struct fpm_nhg_tables *t,
 struct fpm_dplane_nhg *fpm_nhg_route_pop(struct fpm_nhg_tables *t,
 					 const struct fpm_nhg_route_key *k);
 void fpm_nhg_record_rib_id(struct fpm_dplane_nhg *obj, uint32_t rib_id);
-
-/*
- * Binding table maintenance (design §5). add/del are called from the L-B
- * creation and object-free paths inside fpm_nhg.c; the lookup is what the
- * repair/restore trigger uses. All of them, like every other table access,
- * must be called with fnc->obuf_mutex held.
- */
-void fpm_nhg_binding_add(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj);
-void fpm_nhg_binding_del(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj);
-struct fpm_nhg_binding_entry *
-fpm_nhg_binding_lookup(struct fpm_nhg_tables *t, uint8_t afi,
-		       const struct prefix *p);
 
 #endif /* _FPM_NHG_H */

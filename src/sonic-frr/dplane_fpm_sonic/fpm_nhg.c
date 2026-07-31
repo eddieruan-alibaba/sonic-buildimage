@@ -269,9 +269,9 @@ static unsigned int fpm_nhg_route_key_hash(const void *data)
 /*
  * prefix_same() has no AF_UNSPEC case, so it reports two all-zero prefixes
  * as different. A non-srcdest route carries exactly such a zeroed src_p, so
- * that case is handled explicitly here. Shared with the binding table keys.
+ * that case is handled explicitly here.
  */
-static bool fpm_nhg_prefix_same(const struct prefix *a, const struct prefix *b)
+static bool fpm_nhg_src_same(const struct prefix *a, const struct prefix *b)
 {
 	if (a->family != b->family || a->prefixlen != b->prefixlen)
 		return false;
@@ -286,134 +286,7 @@ static bool fpm_nhg_route_key_cmp(const void *data1, const void *data2)
 
 	return a->key.table_id == b->key.table_id &&
 	       a->key.afi == b->key.afi && prefix_same(&a->key.p, &b->key.p) &&
-	       fpm_nhg_prefix_same(&a->key.src_p, &b->key.src_p);
-}
-
-/*
- * bindings: (afi, resolving prefix) -> the L-B objects resolved through it
- * (design §5). See the key struct in fpm_nhg.h for why no vrf takes part in
- * the key. Entries hold borrowed object pointers; the objects themselves live
- * in by_hash.
- */
-static uint8_t fpm_nhg_prefix_afi(const struct prefix *p)
-{
-	return (p->family == AF_INET6) ? AFI_IP6 : AFI_IP;
-}
-
-static unsigned int fpm_nhg_binding_key_hash(const void *data)
-{
-	const struct fpm_nhg_binding_entry *e = data;
-
-	return jhash_1word(e->key.afi, prefix_hash_key(&e->key.p));
-}
-
-static bool fpm_nhg_binding_key_cmp(const void *data1, const void *data2)
-{
-	const struct fpm_nhg_binding_entry *a = data1, *b = data2;
-
-	return a->key.afi == b->key.afi &&
-	       fpm_nhg_prefix_same(&a->key.p, &b->key.p);
-}
-
-static void fpm_nhg_binding_key_fill(struct fpm_nhg_binding_key *key,
-				     uint8_t afi, const struct prefix *p)
-{
-	memset(key, 0, sizeof(*key)); /* deterministic key bytes */
-	key->afi = afi;
-	prefix_copy(&key->p, p);
-}
-
-static void *fpm_nhg_binding_entry_alloc(void *arg)
-{
-	const struct fpm_nhg_binding_entry *ref = arg;
-	struct fpm_nhg_binding_entry *e;
-
-	e = XCALLOC(MTYPE_FPM_NHG, sizeof(*e));
-	e->key = ref->key;
-	return e;
-}
-
-static void fpm_nhg_binding_entry_free(void *data)
-{
-	struct fpm_nhg_binding_entry *e = data;
-
-	XFREE(MTYPE_FPM_NHG, e->objs);
-	XFREE(MTYPE_FPM_NHG, e);
-}
-
-struct fpm_nhg_binding_entry *
-fpm_nhg_binding_lookup(struct fpm_nhg_tables *t, uint8_t afi,
-		       const struct prefix *p)
-{
-	struct fpm_nhg_binding_entry ref = {};
-
-	if (!t || !t->bindings || p->family == AF_UNSPEC)
-		return NULL;
-	fpm_nhg_binding_key_fill(&ref.key, afi, p);
-	return hash_lookup(t->bindings, &ref);
-}
-
-/*
- * Bind an L-B object to its resolving prefix. Called once, at creation, when
- * resolved_prefix is set. An object with no resolving info (AF_UNSPEC — an
- * unresolved recursive nexthop) binds to nothing.
- */
-void fpm_nhg_binding_add(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj)
-{
-	struct fpm_nhg_binding_entry ref = {}, *e;
-	uint32_t i;
-
-	if (obj->resolved_prefix.family == AF_UNSPEC)
-		return;
-
-	fpm_nhg_binding_key_fill(&ref.key,
-				 fpm_nhg_prefix_afi(&obj->resolved_prefix),
-				 &obj->resolved_prefix);
-	e = hash_get(t->bindings, &ref, fpm_nhg_binding_entry_alloc);
-
-	for (i = 0; i < e->count; i++)
-		if (e->objs[i] == obj)
-			return; /* already bound */
-
-	if (e->count == e->cap) {
-		e->cap = e->cap ? e->cap * 2 : 4;
-		e->objs = XREALLOC(MTYPE_FPM_NHG, e->objs,
-				   (size_t)e->cap * sizeof(*e->objs));
-	}
-	e->objs[e->count++] = obj;
-}
-
-/*
- * Unbind one object. Called from the object-free path, so it must tolerate
- * every way an object can die — including "never bound at all" (non-L-B, or
- * L-B without resolving info) and "the whole table is being torn down", in
- * which case the caller passes no tables and the binding entries are dropped
- * wholesale by fpm_nhg_tables_flush() instead.
- */
-void fpm_nhg_binding_del(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj)
-{
-	struct fpm_nhg_binding_entry *e;
-	uint32_t i;
-
-	e = fpm_nhg_binding_lookup(t,
-				   fpm_nhg_prefix_afi(&obj->resolved_prefix),
-				   &obj->resolved_prefix);
-	if (!e)
-		return;
-
-	for (i = 0; i < e->count; i++) {
-		if (e->objs[i] != obj)
-			continue;
-		/* order carries no meaning: fill the hole with the last one */
-		e->objs[i] = e->objs[e->count - 1];
-		e->count--;
-		break;
-	}
-
-	if (e->count == 0) {
-		hash_release(t->bindings, e);
-		fpm_nhg_binding_entry_free(e);
-	}
+	       fpm_nhg_src_same(&a->key.src_p, &b->key.src_p);
 }
 
 void fpm_nhg_tables_init(struct fpm_nhg_tables *t)
@@ -426,9 +299,6 @@ void fpm_nhg_tables_init(struct fpm_nhg_tables *t)
 	t->route_map = hash_create(fpm_nhg_route_key_hash,
 				   fpm_nhg_route_key_cmp,
 				   "FPM dplane NHG route map");
-	t->bindings = hash_create(fpm_nhg_binding_key_hash,
-				  fpm_nhg_binding_key_cmp,
-				  "FPM dplane NHG binding table");
 	t->next_id = 1;
 }
 
@@ -463,22 +333,10 @@ void fpm_nhg_remove(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj)
 	hash_release(t->by_id, obj);
 }
 
-/*
- * Destroy one object. `t` is the tables the object belongs to, or NULL when
- * the whole table set is being torn down: the binding entries are dropped
- * wholesale in that case (fpm_nhg_tables_flush()), so the per-object unbind
- * must be skipped — its entry may already be gone.
- *
- * Reverse edges: this only releases the object's own parents array. The edges
- * pointing AT this object are dropped by whoever releases it as a child (see
- * fpm_nhg_unref() / fpm_nhg_rollback()), which is also the only place where
- * the paired refcount is decremented.
- */
-static void fpm_nhg_obj_destroy(struct fpm_nhg_tables *t,
-				struct fpm_dplane_nhg *obj)
+static void fpm_nhg_obj_free(void *data)
 {
-	if (t)
-		fpm_nhg_binding_del(t, obj);
+	struct fpm_dplane_nhg *obj = data;
+
 	/*
 	 * obj->nh is one nexthop_dup() copy, never chained via ->next.
 	 * nexthop_free() releases labels, srv6 data and the ->resolved
@@ -487,48 +345,8 @@ static void fpm_nhg_obj_destroy(struct fpm_nhg_tables *t,
 	 */
 	if (obj->nh)
 		nexthop_free(obj->nh);
-	XFREE(MTYPE_FPM_NHG, obj->parents);
 	XFREE(MTYPE_FPM_NHG, obj->children);
 	XFREE(MTYPE_FPM_NHG, obj);
-}
-
-/* hash_clean() callback: wholesale teardown, no per-object unbinding. */
-static void fpm_nhg_obj_free_all(void *data)
-{
-	fpm_nhg_obj_destroy(NULL, data);
-}
-
-/*
- * Reverse edge maintenance. One entry per child slot of the parent, so a
- * parent listing the same deduped child twice links twice and the unlink in
- * the release path stays symmetric with its two refcount decrements.
- */
-static void fpm_nhg_parent_link(struct fpm_dplane_nhg *child,
-				struct fpm_dplane_nhg *parent)
-{
-	if (child->num_parents == child->parents_cap) {
-		child->parents_cap = child->parents_cap ? child->parents_cap * 2
-						       : 4;
-		child->parents = XREALLOC(MTYPE_FPM_NHG, child->parents,
-					  (size_t)child->parents_cap *
-						  sizeof(*child->parents));
-	}
-	child->parents[child->num_parents++] = parent;
-}
-
-static void fpm_nhg_parent_unlink(struct fpm_dplane_nhg *child,
-				  struct fpm_dplane_nhg *parent)
-{
-	uint32_t i;
-
-	for (i = 0; i < child->num_parents; i++) {
-		if (child->parents[i] != parent)
-			continue;
-		/* order carries no meaning: fill the hole with the last one */
-		child->parents[i] = child->parents[child->num_parents - 1];
-		child->num_parents--;
-		return;
-	}
 }
 
 static void fpm_nhg_route_entry_free(void *data)
@@ -541,15 +359,12 @@ void fpm_nhg_tables_flush(struct fpm_nhg_tables *t)
 	/*
 	 * Objects live in both tables: empty by_id without freeing, then
 	 * free each object once via by_hash. The tables themselves are
-	 * kept (reused after reconnect). route_map and bindings entries only
-	 * hold borrowed object pointers, so they go first — and because they
-	 * are dropped wholesale here, the object free path is told not to
-	 * unbind object by object.
+	 * kept (reused after reconnect). route_map entries only hold
+	 * borrowed object pointers, so they go first.
 	 */
 	hash_clean(t->route_map, fpm_nhg_route_entry_free);
-	hash_clean(t->bindings, fpm_nhg_binding_entry_free);
 	hash_clean(t->by_id, NULL);
-	hash_clean(t->by_hash, fpm_nhg_obj_free_all);
+	hash_clean(t->by_hash, fpm_nhg_obj_free);
 	XFREE(MTYPE_FPM_NHG, t->free_ids);
 	t->free_id_count = 0;
 	t->free_id_cap = 0;
@@ -569,7 +384,6 @@ void fpm_nhg_tables_flush(struct fpm_nhg_tables *t)
 void fpm_nhg_tables_fini(struct fpm_nhg_tables *t)
 {
 	fpm_nhg_tables_flush(t);
-	hash_clean_and_free(&t->bindings, NULL);
 	hash_clean_and_free(&t->route_map, NULL);
 	hash_clean_and_free(&t->by_id, NULL);
 	hash_clean_and_free(&t->by_hash, NULL);
@@ -896,18 +710,11 @@ fpm_nhg_group_new(struct fpm_nhg_tables *t,
 	if (key->level == FPM_NHG_L_B) {
 		obj->resolved_prefix = *key->resolved;
 		obj->vrf_id = key->vrf_id;
-		/*
-		 * The object is now the L-B for this resolving prefix: bind it
-		 * so a later route event on that prefix finds it (design §5).
-		 */
-		fpm_nhg_binding_add(t, obj);
 	}
 	obj->num_children = key->count;
 	obj->children = children; /* ownership transferred, sorted */
-	for (i = 0; i < key->count; i++) {
+	for (i = 0; i < key->count; i++)
 		fpm_nhg_ref(children[i].obj);
-		fpm_nhg_parent_link(children[i].obj, obj);
-	}
 	return obj;
 }
 
@@ -1026,11 +833,10 @@ void fpm_nhg_rollback(struct fpm_nhg_tables *t, struct fpm_nhg_staging *newq)
 		for (c = 0; c < obj->num_children; c++) {
 			assert(obj->children[c].obj->refcount > 0);
 			obj->children[c].obj->refcount--;
-			fpm_nhg_parent_unlink(obj->children[c].obj, obj);
 		}
 		fpm_nhg_remove(t, obj);
 		fpm_nhg_id_free(t, obj->dplane_id);
-		fpm_nhg_obj_destroy(t, obj);
+		fpm_nhg_obj_free(obj);
 		t->obj_created--;
 	}
 	newq->count = 0;
@@ -1097,21 +903,11 @@ void fpm_nhg_unref(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj,
 		return;
 
 	fpm_nhg_del_queue_push(delq, obj->dplane_id);
-	for (i = 0; i < obj->num_children; i++) {
-		struct fpm_dplane_nhg *child = obj->children[i].obj;
-
-		/*
-		 * Drop the reverse edge first: the recursive unref below may
-		 * free the child, and one edge is dropped per child slot so a
-		 * child listed twice keeps its second edge until its second
-		 * refcount decrement.
-		 */
-		fpm_nhg_parent_unlink(child, obj);
-		fpm_nhg_unref(t, child, delq);
-	}
+	for (i = 0; i < obj->num_children; i++)
+		fpm_nhg_unref(t, obj->children[i].obj, delq);
 	fpm_nhg_remove(t, obj);
 	fpm_nhg_id_free(t, obj->dplane_id);
-	fpm_nhg_obj_destroy(t, obj);
+	fpm_nhg_obj_free(obj);
 	t->obj_deleted++;
 }
 
