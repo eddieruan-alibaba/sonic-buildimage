@@ -64,9 +64,6 @@
 #include <nexthopgroup/c_nexthopgroupfull.h>
 #include <nexthopgroup/c-api/nexthopgroup_capi.h>
 
-/* Global flag set by zebra --nhg-fib command-line option. */
-extern bool zebra_nhg_fib_enabled;
-
 /* FIB log level constants, aligned with fib::LogLevel in nexthopgroup_debug.h */
 enum fib_log_level {
 	FIB_LOG_LEVEL_DEBUG = 0,
@@ -1292,164 +1289,136 @@ static bool has_srv6_localsid_nexthop(struct zebra_dplane_ctx *ctx)
 }
 
 /**
- * Construct C_NextHopGroupFull Object for nexthop group
- * with multiple nexthops based on zebra information.
+ * Construct a C_NextHopGroupFull object from a derived dplane NHG object.
  *
- * @param c_nhg pointer of the object we're going to construct
- * @param ctx pointer of zebra_dplane_ctx, we get zebra information from it
+ * One builder covers all three levels of the derived hierarchy: the C object
+ * shape only distinguishes "has members" (L-A / L-B, encoded by
+ * libnexthopgroup's multi builder) from "is a leaf" (L-C, its singleton
+ * builder), and the caller picks the encoder from obj->num_children.
+ *
+ * Every id on the wire is a plugin allocated uint32 dplane id (design §3.1):
+ * the object's own id and every depends / nh_grp_full_list entry.
+ *
+ * @param c_nhg object to fill (fully overwritten).
+ * @param obj derived dplane NHG object.
+ * @return false when obj carries more members than the C arrays can hold.
  */
-static bool build_c_nexthopgroupfull_multi(struct C_NextHopGroupFull *c_nhg,
-					   const struct zebra_dplane_ctx *ctx)
+static bool build_c_nhgfull_from_obj(struct C_NextHopGroupFull *c_nhg,
+				     const struct fpm_dplane_nhg *obj)
 {
-	memset(c_nhg, 0, sizeof(struct C_NextHopGroupFull));
-	const struct nexthop_group *nhg;
+	const struct nexthop *nh = obj->nh;
+	uint16_t i;
 
-	/* set id */
-	c_nhg->id = dplane_ctx_get_nhe_id(ctx);
+	memset(c_nhg, 0, sizeof(*c_nhg));
 
-	/* set hash value */
-	nhg = dplane_ctx_get_nhe_ng(ctx);
-	uint32_t key = nexthop_group_hash_no_recurse(nhg);
-	c_nhg->key = key;
-
-	/* set nhg_flags */
-	c_nhg->nhg_flags = dplane_ctx_get_nhe_nhg_flags(ctx);
-	bool is_recurisve = false;
 	/*
-	 * For recursive NH, we keep the nexthop information for convergence handling
+	 * Both member arrays are indexed by the same loop below, so the
+	 * narrower one bounds it. Failing here (instead of clamping) keeps a
+	 * truncated group off the wire: fpmsyncd would install it as if it
+	 * were complete.
 	 */
-	if (CHECK_FLAG(c_nhg->nhg_flags, NEXTHOP_GROUP_RECURSIVE)) {
-		const struct nexthop *nh = nhg->nexthop;
-		memcpy(&c_nhg->gate, &nh->gate, sizeof(union g_addr));
+	if (obj->num_children > array_size(c_nhg->depends) ||
+	    obj->num_children > array_size(c_nhg->nh_grp_full_list)) {
+		zlog_err("%s: dplane NHG %u has %u members, C_NextHopGroupFull holds %zu",
+			 __func__, obj->dplane_id, obj->num_children,
+			 array_size(c_nhg->depends));
+		return false;
+	}
 
-		/* set nexthop type */
+	c_nhg->id = obj->dplane_id;
+	/*
+	 * The JSON `key` is 32 bit and purely informational (it used to carry
+	 * zebra's NHG hash): the low half of the Merkle hash is the closest
+	 * equivalent. Nothing keys off the wire value — the plugin dedupes on
+	 * the full 64 bit hash, fpmsyncd on the id.
+	 */
+	c_nhg->key = (uint32_t)obj->hash;
+	c_nhg->nhg_flags = obj->nhg_flags;
+	/* L-B: VRF of the resolving prefix. Overridden by the nexthop below. */
+	c_nhg->vrf_id = obj->vrf_id;
+
+	for (i = 0; i < obj->num_children; i++) {
+		const struct fpm_dplane_nhg *child = obj->children[i].obj;
+
+		c_nhg->depends[i] = child->dplane_id;
+		c_nhg->nh_grp_full_list[i].id = child->dplane_id;
+		c_nhg->nh_grp_full_list[i].weight = obj->children[i].weight;
+		c_nhg->nh_grp_full_list[i].num_direct = child->num_children;
+	}
+
+	/*
+	 * dependents[] stays empty (the memset above): fpmsyncd derives the
+	 * reverse edges from the depends lists it registers (design §4.2.1).
+	 */
+
+	/*
+	 * Nexthop detail fields, same set the ctx driven singleton builder
+	 * used to emit. A leaf (L-C) has its own nexthop, a resolved group
+	 * (L-B) has its recursive parent — which is what the old multi builder
+	 * took gate/type from — and an L-A group has no defining nexthop.
+	 */
+	if (nh) {
 		c_nhg->type = nh->type;
+		c_nhg->vrf_id = nh->vrf_id;
+		c_nhg->ifindex = nh->ifindex;
+		c_nhg->nh_label_type = nh->nh_label_type;
 
-		is_recurisve = true;
-	}
+		if (nh->type == NEXTHOP_TYPE_BLACKHOLE)
+			c_nhg->bh_type = nh->bh_type;
+		else
+			memcpy(&c_nhg->gate, &nh->gate, sizeof(union g_addr));
 
-	/* set nh_grp_full_list */
-	const struct nh_grp_full *nh_grp_full_list = dplane_ctx_get_nhe_nh_grp_full(ctx);
-	for (uint32_t i = 0; i < dplane_ctx_get_nhe_nh_grp_full_count(ctx); i++) {
-		c_nhg->nh_grp_full_list[i].id = nh_grp_full_list[i].id;
-		c_nhg->nh_grp_full_list[i].weight = nh_grp_full_list[i].weight;
-		c_nhg->nh_grp_full_list[i].num_direct = nh_grp_full_list[i].num_direct;
-	}
+		memcpy(&c_nhg->src, &nh->src, sizeof(union g_addr));
+		memcpy(&c_nhg->rmap_src, &nh->rmap_src, sizeof(union g_addr));
+		c_nhg->weight = nh->weight;
+		c_nhg->flags = nh->flags;
 
-	/* set depends list */
-	const uint32_t *depends = dplane_ctx_get_nhe_depends(ctx);
-	for (uint32_t i = 0; i < dplane_ctx_get_nhe_depends_count(ctx); i++) {
-		c_nhg->depends[i] = depends[i];
-	}
+		/* set nexthop srv6 information if present */
+		if (nh->nh_srv6 != NULL) {
+			/* Get the default SRv6 context which contains seg6's src IP */
+			struct zebra_srv6 *srv6 = zebra_srv6_get_default();
 
-	/* set dependents list */
-	const uint32_t *dependents = dplane_ctx_get_nhe_dependents(ctx);
-	for (uint32_t i = 0; i < dplane_ctx_get_nhe_dependents_count(ctx); i++) {
-		c_nhg->dependents[i] = dependents[i];
-	}
+			c_nhg->nh_srv6 = malloc(sizeof(struct C_nexthop_srv6));
+			if (c_nhg->nh_srv6) {
+				/* field copy from nexthop_srv6 to C_nexthop_srv6 */
+				/* seg6local_action */
+				c_nhg->nh_srv6->seg6local_action =
+					(enum C_seg6local_action_t)nh->nh_srv6->seg6local_action;
 
-	return is_recurisve;
-}
+				/* seg6local_ctx */
+				memcpy(&c_nhg->nh_srv6->seg6local_ctx, &nh->nh_srv6->seg6local_ctx,
+					sizeof(struct C_seg6local_context));
 
-/**
- * Construct C_NextHopGroupFull Object for nexthop group
- * with singleton based on zebra information.
- *
- * @param c_nhg pointer of the object we're going to construct
- * @param ctx pointer of zebra_dplane_ctx, we get zebra information from it
- */
-static void build_c_nexthopgroupfull_singleton(struct C_NextHopGroupFull *c_nhg,
-					   const struct zebra_dplane_ctx *ctx)
-{
-	memset(c_nhg, 0, sizeof(struct C_NextHopGroupFull));
+				/* seg6_src */
+				c_nhg->nh_srv6->seg6_src = srv6->encap_src_addr;
 
-	/* set id */
-	c_nhg->id = dplane_ctx_get_nhe_id(ctx);
-
-	/* set hash value */
-	const struct nexthop_group *nhg = dplane_ctx_get_nhe_ng(ctx);
-	uint32_t key = nexthop_group_hash_no_recurse(nhg);
-	c_nhg->key = key;
-
-	/* set nhg_flags */
-	c_nhg->nhg_flags = dplane_ctx_get_nhe_nhg_flags(ctx);
-
-	const struct nexthop *nh = nhg->nexthop;
-	/* set nexthop type */
-	c_nhg->type = nh->type;
-
-	/* set nexthop vrf_id */
-	c_nhg->vrf_id = nh->vrf_id;
-
-	/* set nexthop interface index */
-	c_nhg->ifindex = nh->ifindex;
-
-	/* set nexthop label type, if any */
-	c_nhg->nh_label_type = nh->nh_label_type;
-
-	/* set nexthop bh_type or gateway address based on type */
-	if (c_nhg->type == NEXTHOP_TYPE_BLACKHOLE) {
-		c_nhg->bh_type = nh->bh_type;
-	} else {
-		memcpy(&c_nhg->gate, &nh->gate, sizeof(union g_addr));
-	}
-
-	/* set nexthop src */
-	memcpy(&c_nhg->src, &nh->src, sizeof(union g_addr));
-
-	/* set nexthop rmap src */
-	memcpy(&c_nhg->rmap_src, &nh->rmap_src, sizeof(union g_addr));
-
-	/* set nexthop weight */
-	c_nhg->weight = nh->weight;
-
-	/* set nexthop flags */
-	c_nhg->flags = nh->flags;
-
-	/* set depends list */
-	const uint32_t *depends = dplane_ctx_get_nhe_depends(ctx);
-	for (uint32_t i = 0; i < dplane_ctx_get_nhe_depends_count(ctx); i++) {
-		c_nhg->depends[i] = depends[i];
-	}
-
-	/* set dependents list */
-	const uint32_t *dependents = dplane_ctx_get_nhe_dependents(ctx);
-	for (uint32_t i = 0; i < dplane_ctx_get_nhe_dependents_count(ctx); i++) {
-		c_nhg->dependents[i] = dependents[i];
-	}
-
-	/* set nexthop srv6 information if present */
-	if (nh->nh_srv6 != NULL) {
-		/* Get the default SRv6 context which contains seg6's src IP */
-		struct zebra_srv6 *srv6 = zebra_srv6_get_default();
-
-		c_nhg->nh_srv6 = malloc(sizeof(struct C_nexthop_srv6));
-		if (c_nhg->nh_srv6) {
-			/* field copy from nexthop_srv6 to C_nexthop_srv6 */
-			/* seg6local_action */
-			c_nhg->nh_srv6->seg6local_action =
-				(enum C_seg6local_action_t)nh->nh_srv6->seg6local_action;
-
-			/* seg6local_ctx */
-			memcpy(&c_nhg->nh_srv6->seg6local_ctx, &nh->nh_srv6->seg6local_ctx,
-				sizeof(struct C_seg6local_context));
-
-			/* seg6_src */
-			c_nhg->nh_srv6->seg6_src = srv6->encap_src_addr;
-
-			/* seg6_segs */
-			c_nhg->nh_srv6->seg6_segs = NULL;  // clear the pointer to avoid pointing to old address
-			/* set nexthop_srv6 seg6_segs if present */
-			if (nh->nh_srv6->seg6_segs != NULL) {
-				size_t total_size = sizeof(struct C_seg6_seg_stack) +
-							nh->nh_srv6->seg6_segs->num_segs * sizeof(struct in6_addr);
-				c_nhg->nh_srv6->seg6_segs = malloc(total_size);
-				if (c_nhg->nh_srv6->seg6_segs) {
-					memcpy(c_nhg->nh_srv6->seg6_segs, nh->nh_srv6->seg6_segs, total_size);
+				/* seg6_segs */
+				c_nhg->nh_srv6->seg6_segs = NULL;  // clear the pointer to avoid pointing to old address
+				/* set nexthop_srv6 seg6_segs if present */
+				if (nh->nh_srv6->seg6_segs != NULL) {
+					size_t total_size = sizeof(struct C_seg6_seg_stack) +
+								nh->nh_srv6->seg6_segs->num_segs * sizeof(struct in6_addr);
+					c_nhg->nh_srv6->seg6_segs = malloc(total_size);
+					if (c_nhg->nh_srv6->seg6_segs) {
+						memcpy(c_nhg->nh_srv6->seg6_segs, nh->nh_srv6->seg6_segs, total_size);
+					}
 				}
 			}
 		}
 	}
+
+	/*
+	 * Resolving prefix (L-B only). It travels as a self describing CIDR
+	 * string, so the peer needs no family/length fields of its own.
+	 * snprintfrr() is the printfrr aware bounded formatter (%pFX is an FRR
+	 * extension, unknown to libc snprintf) and char[64] cannot be filled
+	 * even by the longest IPv6 prefix.
+	 */
+	if (obj->resolved_prefix.family != AF_UNSPEC)
+		snprintfrr(c_nhg->resolved_prefix, sizeof(c_nhg->resolved_prefix),
+			   "%pFX", &obj->resolved_prefix);
+
+	return true;
 }
 
 /**
@@ -1803,13 +1772,18 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 /*
  * SRv6 VPN route change via netlink interface (use nhg) , using a dataplane context object
  *
+ * The two NHG ids come from the caller: in nhg-fib mode they are the plugin
+ * allocated dplane ids of the derived objects (design §3.2), which is what
+ * fpmsyncd resolves against the NHGFIB stream. There is no zebra getter for a
+ * "received" NHG id on the upstream base.
+ *
  * Returns -1 on failure, 0 when the msg doesn't fit entirely in the buffer
  * otherwise the number of bytes written to buf.
  */
 static ssize_t netlink_vpn_route_msg_encode(int cmd,
 					   struct zebra_dplane_ctx *ctx,
 					   uint8_t *data, size_t datalen,
-					   bool force_nhg)
+					   uint32_t nhg_received_id, uint32_t nhg_id)
 {
 	struct rtattr *nest;
 	struct nexthop *nexthop;
@@ -1817,8 +1791,6 @@ static ssize_t netlink_vpn_route_msg_encode(int cmd,
 	struct nlsock *nl;
 	int bytelen;
 	vrf_id_t vrf_id;
-	uint32_t nhg_id = dplane_ctx_get_nhe_id(ctx);
-	uint32_t nhg_received_id = dplane_ctx_get_nhe_received_id(ctx);
 	uint32_t table_id;
 
 	struct {
@@ -2214,17 +2186,16 @@ static ssize_t netlink_srv6_msg_encode(int cmd,
 				cmd, ctx, data, datalen, fpm, force_nhg))
 			return 0;
 	} else if (has_srv6_sidlist_nexthop(ctx)) {
-		if(force_nhg){
-			if (!netlink_vpn_route_msg_encode(
-				cmd, ctx, data, datalen, force_nhg))
-				return 0;
-		}
-		else{
-			if (!netlink_srv6_vpn_route_msg_encode(
-				cmd, ctx, data, datalen, fpm, force_nhg))
-				return 0;
-		}
-
+		/*
+		 * Legacy (non nhg-fib) modes publish no NHGFIB objects, so the
+		 * id carrying RTM_NEWSRV6VPNROUTE encode has nothing for
+		 * fpmsyncd to resolve: always emit the per-nexthop SRv6 encap
+		 * form here. The id form lives on the nhg-fib path, which owns
+		 * the ids (design §3.2).
+		 */
+		if (!netlink_srv6_vpn_route_msg_encode(
+			cmd, ctx, data, datalen, fpm, force_nhg))
+			return 0;
 	} else {
 		zlog_err(
 			"%s: invalid srv6 nexthop", __func__);
@@ -2234,563 +2205,27 @@ static ssize_t netlink_srv6_msg_encode(int cmd,
 	return NLMSG_ALIGN(req->n.nlmsg_len);
 }
 
-static int build_label_stack(struct mpls_label_stack *nh_label,
-			     mpls_lse_t *out_lse, char *label_buf,
-			     size_t label_buf_size)
-{
-	char label_buf1[MPLS_LABEL_STRLEN];
-	int num_labels = 0;
-
-	for (int i = 0; nh_label && i < nh_label->num_labels; i++) {
-		if (nh_label->label[i] == MPLS_LABEL_IMPLICIT_NULL)
-			continue;
-
-		if (IS_ZEBRA_DEBUG_KERNEL) {
-			if (!num_labels)
-				snprintf(label_buf, label_buf_size, "label %u",
-					 nh_label->label[i]);
-			else {
-				snprintf(label_buf1, sizeof(label_buf1), "/%u",
-					 nh_label->label[i]);
-				strlcat(label_buf, label_buf1, label_buf_size);
-			}
-		}
-
-		out_lse[num_labels] =
-			mpls_lse_encode(nh_label->label[i], 0, 0, 0);
-		num_labels++;
-	}
-
-	return num_labels;
-}
-
-static bool proto_nexthops_only(void)
-{
-	return zebra_nhg_proto_nexthops_only();
-}
-
-
-/* Helper to control use of kernel-level nexthop ids */
-static bool kernel_nexthops_supported(void)
-{
-
-	return (!vrf_is_backend_netns()
-		&& zebra_nhg_kernel_nexthops_enabled());
-}
-
-/* Char length to debug ID with */
-#define ID_LENGTH 10
-
-static bool _netlink_nexthop_build_group(struct nlmsghdr *n, size_t req_size,
-					 uint32_t id,
-					 const struct nh_grp *z_grp,
-					 const uint8_t count, bool resilient,
-					 const struct nhg_resilience *nhgr)
-{
-	struct nexthop_grp grp[count];
-	/* Need space for max group size, "/", and null term */
-	char buf[(MULTIPATH_NUM * (ID_LENGTH + 1)) + 1];
-	char buf1[ID_LENGTH + 2];
-
-	buf[0] = '\0';
-
-	memset(grp, 0, sizeof(grp));
-
-	if (count) {
-		for (int i = 0; i < count; i++) {
-			grp[i].id = z_grp[i].id;
-			grp[i].weight = z_grp[i].weight - 1;
-
-			if (IS_ZEBRA_DEBUG_KERNEL) {
-				if (i == 0)
-					snprintf(buf, sizeof(buf1), "group %u",
-						 grp[i].id);
-				else {
-					snprintf(buf1, sizeof(buf1), "/%u",
-						 grp[i].id);
-					strlcat(buf, buf1, sizeof(buf));
-				}
-			}
-		}
-		if (!nl_attr_put(n, req_size, NHA_GROUP, grp,
-				 count * sizeof(*grp)))
-			return false;
-
-		if (resilient) {
-			struct rtattr *nest;
-
-			nest = nl_attr_nest(n, req_size, NHA_RES_GROUP);
-
-			nl_attr_put16(n, req_size, NHA_RES_GROUP_BUCKETS,
-				      nhgr->buckets);
-			nl_attr_put32(n, req_size, NHA_RES_GROUP_IDLE_TIMER,
-				      nhgr->idle_timer * 1000);
-			nl_attr_put32(n, req_size,
-				      NHA_RES_GROUP_UNBALANCED_TIMER,
-				      nhgr->unbalanced_timer * 1000);
-			nl_attr_nest_end(n, nest);
-
-			nl_attr_put16(n, req_size, NHA_GROUP_TYPE,
-				      NEXTHOP_GRP_TYPE_RES);
-		}
-	}
-
-	if (IS_ZEBRA_DEBUG_KERNEL)
-		zlog_debug("%s: ID (%u): %s", __func__, id, buf);
-
-	return true;
-}
-
-/* Is this a proto created NHG? */
-static bool is_proto_nhg(uint32_t id, int type)
-{
-	/* If type is available, use it as the source of truth */
-	if (type) {
-		if (type != ZEBRA_ROUTE_NHG)
-			return true;
-		return false;
-	}
-
-	if (id >= ZEBRA_NHG_PROTO_LOWER)
-		return true;
-
-	return false;
-}
-
-static ssize_t fill_seg6ipt_encap_private(char *buffer, size_t buflen,
-				  const struct seg6_seg_stack *segs, const struct in6_addr *src,
-				  const char *segment_name)
-{
-	struct seg6_iptunnel_encap_pri *ipt;
-	struct ipv6_sr_hdr *srh;
-	size_t srhlen;
-	int i;
-
-	if (segs->num_segs > SRV6_MAX_SEGS) {
-		/* Exceeding maximum supported SIDs */
-		zlog_err("%s: Exceeding maximum supported SIDs", __func__);
-		return -1;
-	}
-
-	srhlen = SRH_BASE_HEADER_LENGTH + SRH_SEGMENT_LENGTH * segs->num_segs;
-
-	if (buflen < (sizeof(struct seg6_iptunnel_encap_pri) + srhlen))
-		zlog_err("%s: Buffer too small", __func__);
-		return -1;
-
-	memset(buffer, 0, buflen);
-
-	ipt = (struct seg6_iptunnel_encap_pri *)buffer;
-	ipt->mode = SEG6_IPTUN_MODE_ENCAP;
-	srh = ipt->srh;
-	srh->hdrlen = (srhlen >> 3) - 1;
-	srh->type = 4;
-	srh->segments_left = segs->num_segs - 1;
-	srh->first_segment = segs->num_segs - 1;
-
-	for (i = 0; i < segs->num_segs; i++) {
-		memcpy(&srh->segments[segs->num_segs - i - 1], &segs->seg[i],
-		       sizeof(struct in6_addr));
-	}
-
-	if(src != NULL)
-	    memcpy(&ipt->src, src, sizeof(struct in6_addr));
-
-	if (segment_name != NULL)
-		memcpy(ipt->segment_name, segment_name, SEG6_SEGMENT_NAME_LEN);
-
-	return sizeof(struct seg6_iptunnel_encap_pri) + srhlen;
-}
-
-/*
- * Encode pic context
- */
-static ssize_t netlink_pic_context_msg_encode(uint16_t cmd,
-				   const struct zebra_dplane_ctx *ctx,
-				   void *buf, size_t buflen)
-{
-	struct {
-		struct nlmsghdr n;
-		struct nhmsg nhm;
-		char buf[];
-	} *req = buf;
-
-	mpls_lse_t out_lse[MPLS_MAX_LABELS];
-	char label_buf[256];
-	int num_labels = 0;
-	uint32_t id = dplane_ctx_get_nhe_id(ctx);
-	int type = dplane_ctx_get_nhe_type(ctx);
-	struct rtattr *nest;
-	struct zebra_vrf *zvrf;
-	uint16_t encap;
-	struct nlsock *nl =
-		kernel_netlink_nlsock_lookup(dplane_ctx_get_ns_sock(ctx));
-
-	if (!id) {
-		zlog_err(
-			"Failed trying to update a nexthop group in the kernel that does not have an ID");
-		return -1;
-	}
-
-	/*
-	 * Nothing to do if the kernel doesn't support nexthop objects or
-	 * we dont want to install this type of NHG, but FPM may possible to
-	 * handle this.
-	 */
-	if (!kernel_nexthops_supported()) {
-		if (IS_ZEBRA_DEBUG_KERNEL || IS_ZEBRA_DEBUG_NHG)
-			zlog_debug(
-				"%s: nhg_id %u (%s): kernel nexthops not supported, ignoring",
-				__func__, id, zebra_route_string(type));
-		return 0;
-	}
-
-	if (proto_nexthops_only() && !is_proto_nhg(id, type)) {
-		if (IS_ZEBRA_DEBUG_KERNEL || IS_ZEBRA_DEBUG_NHG)
-			zlog_debug(
-				"%s: nhg_id %u (%s): proto-based nexthops only, ignoring",
-				__func__, id, zebra_route_string(type));
-		return 0;
-	}
-
-	label_buf[0] = '\0';
-
-	if (buflen < sizeof(*req))
-		return 0;
-
-	memset(req, 0, sizeof(*req));
-
-	req->n.nlmsg_len = NLMSG_LENGTH(sizeof(struct nhmsg));
-	req->n.nlmsg_flags = NLM_F_CREATE | NLM_F_REQUEST;
-
-	if (cmd == RTM_NEWNEXTHOP)
-	{
-		req->n.nlmsg_flags |= NLM_F_REPLACE;
-		cmd = RTM_NEWPICCONTEXT;
-	}
-	else if (cmd == RTM_DELNEXTHOP)
-	{
-		cmd = RTM_DELPICCONTEXT;
-	}
-
-	req->n.nlmsg_type = cmd;
-	req->n.nlmsg_pid = nl->snl.nl_pid;
-
-	req->nhm.nh_family = AF_UNSPEC;
-	/* TODO: Scope? */
-
-	if (!nl_attr_put32(&req->n, buflen, NHA_ID, id))
-		return 0;
-
-	if (cmd == RTM_NEWPICCONTEXT) {
-		/*
-		 * We distinguish between a "group", which is a collection
-		 * of ids, and a singleton nexthop with an id. The
-		 * group is installed as an id that just refers to a list of
-		 * other ids.
-		 */
-		if (dplane_ctx_get_nhe_nh_grp_count(ctx)) {
-			const struct nexthop_group *nhg;
-			const struct nhg_resilience *nhgr;
-
-			nhg = dplane_ctx_get_nhe_ng(ctx);
-			nhgr = &nhg->nhgr;
-			if (!_netlink_nexthop_build_group(
-				    &req->n, buflen, id,
-				    dplane_ctx_get_nhe_nh_grp(ctx),
-				    dplane_ctx_get_nhe_nh_grp_count(ctx),
-				    !!nhgr->buckets, nhgr))
-				return 0;
-		} else {
-			const struct nexthop *nh =
-				dplane_ctx_get_nhe_ng(ctx)->nexthop;
-			afi_t afi = dplane_ctx_get_nhe_afi(ctx);
-
-			if (afi == AFI_IP)
-				req->nhm.nh_family = AF_INET;
-			else if (afi == AFI_IP6)
-				req->nhm.nh_family = AF_INET6;
-
-			switch (nh->type) {
-			case NEXTHOP_TYPE_IPV4:
-			case NEXTHOP_TYPE_IPV4_IFINDEX:
-				if (!nl_attr_put(&req->n, buflen, NHA_GATEWAY,
-						 &nh->gate.ipv4,
-						 IPV4_MAX_BYTELEN))
-					return 0;
-				break;
-			case NEXTHOP_TYPE_IPV6:
-			case NEXTHOP_TYPE_IPV6_IFINDEX:
-				if (!nl_attr_put(&req->n, buflen, NHA_GATEWAY,
-						 &nh->gate.ipv6,
-						 IPV6_MAX_BYTELEN))
-					return 0;
-				break;
-			case NEXTHOP_TYPE_BLACKHOLE:
-				if (!nl_attr_put(&req->n, buflen, NHA_BLACKHOLE,
-						 NULL, 0))
-					return 0;
-				/* Blackhole shouldn't have anymore attributes
-				 */
-				goto nexthop_done;
-			case NEXTHOP_TYPE_IFINDEX:
-				/* Don't need anymore info for this */
-				break;
-			}
-
-			if (!nh->ifindex) {
-				zlog_info(
-					"Context received for kernel nexthop update without an interface");
-				return -1;
-			}
-
-			if (!nl_attr_put32(&req->n, buflen, NHA_OIF,
-					   nh->ifindex))
-				return 0;
-
-			if (CHECK_FLAG(nh->flags, NEXTHOP_FLAG_ONLINK))
-				req->nhm.nh_flags |= RTNH_F_ONLINK;
-
-			num_labels =
-				build_label_stack(nh->nh_label, out_lse,
-						  label_buf, sizeof(label_buf));
-
-			if (num_labels) {
-				/* Set the BoS bit */
-				out_lse[num_labels - 1] |=
-					htonl(1 << MPLS_LS_S_SHIFT);
-
-				/*
-				 * TODO: MPLS unsupported for now in kernel.
-				 */
-				if (req->nhm.nh_family == AF_MPLS)
-					goto nexthop_done;
-
-				encap = LWTUNNEL_ENCAP_MPLS;
-				if (!nl_attr_put16(&req->n, buflen,
-						   NHA_ENCAP_TYPE, encap))
-					return 0;
-				nest = nl_attr_nest(&req->n, buflen, NHA_ENCAP);
-				if (!nest)
-					return 0;
-				if (!nl_attr_put(
-					    &req->n, buflen, MPLS_IPTUNNEL_DST,
-					    &out_lse,
-					    num_labels * sizeof(mpls_lse_t)))
-					return 0;
-
-				nl_attr_nest_end(&req->n, nest);
-			}
-
-			if (nh->nh_srv6) {
-				if (nh->nh_srv6->seg6local_action !=
-				    ZEBRA_SEG6_LOCAL_ACTION_UNSPEC) {
-					uint16_t encap;
-					struct rtattr *nest;
-					const struct seg6local_context *seg6local_ctx;
-
-					req->nhm.nh_family = AF_INET6;
-					seg6local_ctx = &nh->nh_srv6->seg6local_ctx;
-					encap = LWTUNNEL_ENCAP_SEG6_LOCAL;
-					if (!nl_attr_put(&req->n, buflen,
-							 NHA_ENCAP_TYPE,
-							 &encap,
-							 sizeof(uint16_t)))
-						return 0;
-
-					nest = nl_attr_nest(&req->n, buflen,
-						NHA_ENCAP | NLA_F_NESTED);
-					if (!nest)
-						return 0;
-
-					switch (nh->nh_srv6->seg6local_action) {
-					case ZEBRA_SEG6_LOCAL_ACTION_END:
-						if (!nl_attr_put32(
-							&req->n, buflen,
-							FPM_SRV6_LOCALSID_ACTION,
-							FPM_SRV6_LOCALSID_ACTION_END))
-							return -1;
-						break;
-					case ZEBRA_SEG6_LOCAL_ACTION_END_X:
-						if (!nl_attr_put32(
-							&req->n, buflen,
-							FPM_SRV6_LOCALSID_ACTION,
-							FPM_SRV6_LOCALSID_ACTION_END_X))
-							return -1;
-						if (!nl_attr_put(&req->n, buflen,
-						    FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh6,
-							sizeof(struct in6_addr)))
-							return -1;
-						break;
-					case ZEBRA_SEG6_LOCAL_ACTION_END_T:
-						zvrf = vrf_lookup_by_table_id(seg6local_ctx->table);
-						if (!zvrf)
-						    return false;
-						if (!nl_attr_put32(
-							&req->n, buflen,
-							FPM_SRV6_LOCALSID_ACTION,
-							FPM_SRV6_LOCALSID_ACTION_END_T))
-							return -1;
-						if (!nl_attr_put(&req->n, buflen,
-						    FPM_SRV6_LOCALSID_VRFNAME,
-							zvrf->vrf->name,
-							strlen(zvrf->vrf->name) + 1))
-							return -1;
-						break;
-					case ZEBRA_SEG6_LOCAL_ACTION_END_DX6:
-						if (!nl_attr_put32(
-							&req->n, buflen,
-							FPM_SRV6_LOCALSID_ACTION,
-							FPM_SRV6_LOCALSID_ACTION_END_DX6))
-							return -1;
-						if (!nl_attr_put(&req->n, buflen,
-						    FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh6,
-							sizeof(struct in6_addr)))
-							return -1;
-						break;
-					case ZEBRA_SEG6_LOCAL_ACTION_END_DX4:
-						if (!nl_attr_put32(
-							&req->n, buflen,
-							FPM_SRV6_LOCALSID_ACTION,
-							FPM_SRV6_LOCALSID_ACTION_END_DX4))
-							return -1;
-						if (!nl_attr_put(&req->n, buflen,
-						    FPM_SRV6_LOCALSID_NH6, &seg6local_ctx->nh4,
-							sizeof(struct in6_addr)))
-							return -1;
-						break;
-					case ZEBRA_SEG6_LOCAL_ACTION_END_DT6:
-						zvrf = vrf_lookup_by_table_id(seg6local_ctx->table);
-						if (!zvrf)
-						    return false;
-						if (!nl_attr_put32(
-							&req->n, buflen,
-							FPM_SRV6_LOCALSID_ACTION,
-							FPM_SRV6_LOCALSID_ACTION_END_DT6))
-							return -1;
-						if (!nl_attr_put(&req->n, buflen,
-						    FPM_SRV6_LOCALSID_VRFNAME,
-							zvrf->vrf->name,
-							strlen(zvrf->vrf->name) + 1))
-							return -1;
-						break;
-					case ZEBRA_SEG6_LOCAL_ACTION_END_DT4:
-						zvrf = vrf_lookup_by_table_id(seg6local_ctx->table);
-						if (!zvrf)
-						    return false;
-						if (!nl_attr_put32(
-							&req->n, buflen,
-							FPM_SRV6_LOCALSID_ACTION,
-							FPM_SRV6_LOCALSID_ACTION_END_DT4))
-							return -1;
-						if (!nl_attr_put(&req->n, buflen,
-						    FPM_SRV6_LOCALSID_VRFNAME,
-							zvrf->vrf->name,
-							strlen(zvrf->vrf->name) + 1))
-							return -1;
-						break;
-					case ZEBRA_SEG6_LOCAL_ACTION_END_DT46:
-						zvrf = vrf_lookup_by_table_id(seg6local_ctx->table);
-						if (!zvrf)
-						    return false;
-						if (!nl_attr_put32(
-							&req->n, buflen,
-							FPM_SRV6_LOCALSID_ACTION,
-							FPM_SRV6_LOCALSID_ACTION_END_DT46))
-							return -1;
-						if (!nl_attr_put(&req->n, buflen,
-						    FPM_SRV6_LOCALSID_VRFNAME,
-							zvrf->vrf->name,
-							strlen(zvrf->vrf->name) + 1))
-							return -1;
-						break;
-					default:
-						zlog_err("%s: unsupport seg6local behaviour action=%u",
-							 __func__, nh->nh_srv6->seg6local_action);
-						return 0;
-					}
-
-					nl_attr_nest_end(&req->n, nest);
-				}
-
-
-				if (!sid_zero(nh->nh_srv6->seg6_segs)) {
-					char tun_buf[4096];
-					ssize_t tun_len;
-					struct rtattr *nest;
-
-					if (!nl_attr_put16(&req->n, buflen,
-					    NHA_ENCAP_TYPE,
-					    LWTUNNEL_ENCAP_SEG6))
-						return 0;
-					nest = nl_attr_nest(&req->n, buflen,
-					    NHA_ENCAP | NLA_F_NESTED);
-					if (!nest)
-						return 0;
-					if (!sid_zero_ipv6(&nh->nh_srv6->seg6_src)) {
-						tun_len = fill_seg6ipt_encap_private(tun_buf,
-						    sizeof(tun_buf),
-						    nh->nh_srv6->seg6_segs,
-						    &nh->nh_srv6->seg6_src, NULL);
-					}
-					else {
-						tun_len = fill_seg6ipt_encap_private(tun_buf,
-					    sizeof(tun_buf),
-					    nh->nh_srv6->seg6_segs,
-						NULL,NULL);
-					}
-					if (tun_len < 0)
-						return 0;
-					if (!nl_attr_put(&req->n, buflen,
-							 SEG6_IPTUNNEL_SRH,
-							 tun_buf, tun_len))
-						return 0;
-					nl_attr_nest_end(&req->n, nest);
-				}
-			}
-
-nexthop_done:
-
-			if (IS_ZEBRA_DEBUG_KERNEL)
-				zlog_debug("%s: ID (%u): %pNHv(%d) vrf %s(%u) %s ",
-					   __func__, id, nh, nh->ifindex,
-					   vrf_id_to_name(nh->vrf_id),
-					   nh->vrf_id, label_buf);
-		}
-
-		req->nhm.nh_protocol = zebra2proto(type);
-
-	} else if (cmd != RTM_DELPICCONTEXT) {
-		zlog_debug(
-			"Nexthop group kernel update command (%d) does not exist",
-			cmd);
-		return -1;
-	}
-
-	if (IS_ZEBRA_DEBUG_KERNEL)
-		zlog_debug("%s: %s, id=%u", __func__, nl_msg_type_to_str(cmd),
-			   id);
-
-	return NLMSG_ALIGN(req->n.nlmsg_len);
-}
-
 /**
- * Next hop packet (full message) encoding helper function.
- * This function is modified from function netlink_nexthop_msg_encode to
- * encode the nexthopgroupfull JSON string to fpmsyncd.
+ * Encode one RTM_NEWNHGFIB message for a derived dplane NHG object.
  *
- * \param[in] cmd netlink command.
- * \param[in] ctx dataplane context (information snapshot).
+ * Same wire shape the ctx driven encoder produced (nhmsg + NHA_ID +
+ * FPM_NHA_JSON_STR holding the C_NextHopGroupFull JSON), with every id taken
+ * from the derived objects instead of the fork's NHG-event ctx getters. The
+ * JSON itself is still produced by libnexthopgroup: the multi builder for an
+ * object with members, the singleton builder for a leaf.
+ *
+ * There is no ctx here (an object outlives the ctx that created it), so
+ * nlmsg_pid stays 0 — fpmsyncd only looks at nlmsg_type and the attributes.
+ *
+ * \param[in] obj derived dplane NHG object.
  * \param[out] buf buffer to hold the packet.
  * \param[in] buflen amount of buffer bytes.
- * \param[in] fpm whether the message is for fpmsyncd.
  *
  * \returns -1 on failure, 0 when the msg doesn't fit entirely in the buffer
  * otherwise the number of bytes written to buf.
  */
-static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
-					   const struct zebra_dplane_ctx *ctx,
-					   void *buf, size_t buflen, bool fpm)
+static ssize_t netlink_nhgfib_obj_msg_encode(const struct fpm_dplane_nhg *obj,
+					     void *buf, size_t buflen)
 {
 	struct {
 		struct nlmsghdr n;
@@ -2798,32 +2233,122 @@ static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
 		char buf[];
 	} *req = buf;
 
-	uint32_t id = dplane_ctx_get_nhe_id(ctx);
-	int type = dplane_ctx_get_nhe_type(ctx);
-	struct nlsock *nl =
-        kernel_netlink_nlsock_lookup(dplane_ctx_get_ns_sock(ctx));
-	char* json_str = NULL;
+	struct C_NextHopGroupFull c_nhg;
+	char *json_str = NULL;
 	ssize_t ret = -1;
 
-	if (!id) {
-		zlog_err(
-			"%s: Failed trying to update a nexthop group in the kernel that does not have an ID",
-			__func__);
+	if (buflen < sizeof(*req))
+		return 0;
+
+	if (!build_c_nhgfull_from_obj(&c_nhg, obj)) {
+		free_c_nexthopgroupfull(&c_nhg);
 		return -1;
 	}
 
-	/*
-	 * Nothing to do if the kernel doesn't support nexthop objects or
-	 * we dont want to install this type of NHG, but FPM may possible to
-	 * handle this.
-	 */
-	if (!fpm && !kernel_nexthops_supported()) {
-		if (IS_ZEBRA_DEBUG_KERNEL || IS_ZEBRA_DEBUG_NHG)
-			zlog_debug(
-				"%s: nhg_id %u (%s): kernel nexthops not supported, ignoring",
-				__func__, id, zebra_route_string(type));
+	memset(req, 0, sizeof(*req));
+
+	req->n.nlmsg_len = NLMSG_LENGTH(sizeof(struct nhmsg));
+	req->n.nlmsg_flags = NLM_F_CREATE | NLM_F_REQUEST | NLM_F_REPLACE;
+	req->n.nlmsg_type = RTM_NEWNHGFIB;
+
+	req->nhm.nh_family = AF_UNSPEC;
+
+	/* Put the dplane NHG id */
+	if (!nl_attr_put32(&req->n, buflen, NHA_ID, obj->dplane_id)) {
+		free_c_nexthopgroupfull(&c_nhg);
 		return 0;
 	}
+
+	if (obj->num_children) {
+		/*
+		 * Group (L-A received set or L-B resolved set). The recursive
+		 * form additionally carries the resolving nexthop's gate/type,
+		 * which only an L-B object has.
+		 */
+		json_str = nexthopgroupfull_json_from_c_nhg_multi(
+			&c_nhg, obj->num_children, obj->num_children, 0,
+			CHECK_FLAG(obj->nhg_flags, FPM_NHG_FLAG_RECURSIVE));
+	} else {
+		/*
+		 * Leaf (L-C). nh_family used to come from the NHG event's afi;
+		 * derive it from the nexthop instead and leave it AF_UNSPEC
+		 * when the nexthop is not address typed.
+		 */
+		switch (c_nhg.type) {
+		case C_NEXTHOP_TYPE_IPV4:
+		case C_NEXTHOP_TYPE_IPV4_IFINDEX:
+			req->nhm.nh_family = AF_INET;
+			break;
+		case C_NEXTHOP_TYPE_IPV6:
+		case C_NEXTHOP_TYPE_IPV6_IFINDEX:
+			req->nhm.nh_family = AF_INET6;
+			break;
+		default:
+			break;
+		}
+
+		json_str = nexthopgroupfull_json_from_c_nhg_singleton(&c_nhg, 0, 0);
+	}
+
+	if (!json_str) {
+		zlog_err("%s: failed to convert dplane NHG %u to a JSON string",
+			 __func__, obj->dplane_id);
+		free_c_nexthopgroupfull(&c_nhg);
+		return -1;
+	}
+
+	/* Encode JSON string as attribute in message */
+	if (!nl_attr_put(&req->n, buflen, FPM_NHA_JSON_STR, json_str,
+			 strlen(json_str) + 1)) {
+		zlog_err("%s: dplane NHG %u JSON (%zu bytes) does not fit the message",
+			 __func__, obj->dplane_id, strlen(json_str) + 1);
+		goto cleanup;
+	}
+
+	ret = NLMSG_ALIGN(req->n.nlmsg_len);
+
+	/*
+	 * The FPM header carries the frame length as a u16 (stream_putw()), so
+	 * a frame that cannot be framed must never reach the batch — where it
+	 * would trip an assert. buflen alone does not guarantee it: the scratch
+	 * buffer is DPLANE_FPM_NL_BUF_SIZE (64KiB), slightly more than the
+	 * framing allows once the header is added.
+	 */
+	if ((size_t)ret + FPM_HEADER_SIZE > UINT16_MAX) {
+		zlog_err("%s: dplane NHG %u message is %zd bytes, too large to frame",
+			 __func__, obj->dplane_id, ret);
+		ret = -1;
+	}
+
+cleanup:
+	free(json_str);
+	free_c_nexthopgroupfull(&c_nhg);
+
+	if (IS_ZEBRA_DEBUG_FPM)
+		zlog_debug("%s: RTM_NEWNHGFIB, id=%u, len=%zd", __func__,
+			   obj->dplane_id, ret);
+
+	return ret;
+}
+
+/**
+ * Encode one RTM_DELNHGFIB message. The id is the whole payload — the object
+ * itself is already gone by the time its DEL rides out (see fpm_nhg_unref()),
+ * which is why this takes a plain id.
+ *
+ * \returns -1 on failure, 0 when the msg doesn't fit entirely in the buffer
+ * otherwise the number of bytes written to buf.
+ */
+static ssize_t netlink_nhgfib_del_msg_encode(uint32_t dplane_id, void *buf,
+					     size_t buflen)
+{
+	struct {
+		struct nlmsghdr n;
+		struct nhmsg nhm;
+		char buf[];
+	} *req = buf;
+
+	ssize_t ret;
 
 	if (buflen < sizeof(*req))
 		return 0;
@@ -2832,113 +2357,24 @@ static ssize_t netlink_nexthopgroupfull_msg_encode(uint16_t cmd,
 
 	req->n.nlmsg_len = NLMSG_LENGTH(sizeof(struct nhmsg));
 	req->n.nlmsg_flags = NLM_F_CREATE | NLM_F_REQUEST;
-
-	if (cmd == RTM_NEWNHGFIB)
-		req->n.nlmsg_flags |= NLM_F_REPLACE;
-
-	req->n.nlmsg_type = cmd;
-	req->n.nlmsg_pid = nl->snl.nl_pid;
+	req->n.nlmsg_type = RTM_DELNHGFIB;
 
 	req->nhm.nh_family = AF_UNSPEC;
 
-	/* Put the nhe ID */
-	if (!nl_attr_put32(&req->n, buflen, NHA_ID, id))
+	if (!nl_attr_put32(&req->n, buflen, NHA_ID, dplane_id))
 		return 0;
 
-	if (cmd == RTM_NEWNHGFIB) {
-		/* Build C_NextHopGroupFull Object */
-		struct C_NextHopGroupFull c_nhg;
-		const struct C_NextHopGroupFull *c_nhg_ptr = &c_nhg;
+	ret = NLMSG_ALIGN(req->n.nlmsg_len);
 
-		memset(&c_nhg, 0, sizeof(c_nhg));
-
-		/* Defensive bounds check on array count */
-		if (dplane_ctx_get_nhe_nh_grp_full_count(ctx) >
-			    (MULTIPATH_NUM * MAX_NHG_RECURSION) + 1 ||
-		    dplane_ctx_get_nhe_depends_count(ctx) > MULTIPATH_NUM + 1 ||
-		    dplane_ctx_get_nhe_dependents_count(ctx) > MULTIPATH_NUM + 1) {
-			zlog_err(
-				"%s: C_NextHopGroupFull array count exceeds bounds: nh_grp_full_count=%u, depends_count=%u, dependents_count=%u",
-				__func__, dplane_ctx_get_nhe_nh_grp_full_count(ctx),
-				dplane_ctx_get_nhe_depends_count(ctx),
-				dplane_ctx_get_nhe_dependents_count(ctx));
-			free_c_nexthopgroupfull(&c_nhg);
-			return -1;
-		}
-
-		/*
-		 * We also distinguish between a "group" and a singleton similar
-		 * as what is done in netlink_nexthop_msg_encode.
-		 * For each case, we create C_NextHopGroupFull Object,
-		 * then convert it to C++ NextHopGroupFull Object and return its JSON string.
-		 *  multi case would be the following cases
-		 *   1. ctx has multiple paths
-		 *   2. single recursive path
-		 */
-		if (dplane_ctx_get_nhe_nh_grp_full_count(ctx) ||
-		    CHECK_FLAG(dplane_ctx_get_nhe_nhg_flags(ctx), NEXTHOP_GROUP_RECURSIVE)) {
-			/* multi nexthops case */
-			bool is_recursive = build_c_nexthopgroupfull_multi(&c_nhg, ctx);
-			json_str = nexthopgroupfull_json_from_c_nhg_multi(c_nhg_ptr, dplane_ctx_get_nhe_nh_grp_full_count(ctx),
-								   dplane_ctx_get_nhe_depends_count(ctx), dplane_ctx_get_nhe_dependents_count(ctx),
-								   is_recursive);
-
-			if (!json_str) {
-				zlog_err(
-					"%s:Failed to convert C_NextHopGroupFull to JSON string in multi-nexthop case",
-					__func__);
-				free_c_nexthopgroupfull(&c_nhg);
-				return -1;
-			}
-		} else {
-			/* singleton case */
-			afi_t afi = dplane_ctx_get_nhe_afi(ctx);
-			if (afi == AFI_IP)
-				req->nhm.nh_family = AF_INET;
-			else if (afi == AFI_IP6)
-				req->nhm.nh_family = AF_INET6;
-
-			build_c_nexthopgroupfull_singleton(&c_nhg, ctx);
-			json_str = nexthopgroupfull_json_from_c_nhg_singleton(c_nhg_ptr, dplane_ctx_get_nhe_depends_count(ctx),
-									   dplane_ctx_get_nhe_dependents_count(ctx));
-
-			if (!json_str) {
-				zlog_err(
-					"%s: Failed to convert C_NextHopGroupFull to JSON string in singleton case",
-					__func__);
-				free_c_nexthopgroupfull(&c_nhg);
-				return -1;
-			}
-		}
-
-		/* Encode JSON string as attribute in message */
-		if (!nl_attr_put(&req->n, buflen, FPM_NHA_JSON_STR,
-					json_str, strlen(json_str) + 1)) {
-			zlog_err(
-				"%s: Failed to put nexthop group JSON into netlink message",
-				__func__);
-			goto cleanup;
-		}
-
-		ret = NLMSG_ALIGN(req->n.nlmsg_len);
-
-cleanup:
-		free(json_str);
-		free_c_nexthopgroupfull(&c_nhg);
-
-	} else if (cmd == RTM_DELNHGFIB) {
-		/* Delete only needs NHA_ID, already encoded above */
-		ret = NLMSG_ALIGN(req->n.nlmsg_len);
-	} else {
-		zlog_err(
-			"%s: Nexthop group kernel update command (%d) does not exist",
-			__func__, cmd);
+	/* Same framing bound as the NEW encode; unreachable for this size. */
+	if ((size_t)ret + FPM_HEADER_SIZE > UINT16_MAX) {
+		zlog_err("%s: dplane NHG %u message is %zd bytes, too large to frame",
+			 __func__, dplane_id, ret);
 		return -1;
 	}
 
 	if (IS_ZEBRA_DEBUG_FPM)
-		zlog_debug("%s: %s, id=%u", __func__,
-			(cmd == RTM_NEWNHGFIB) ? "RTM_NEWNHGFIB" : "RTM_DELNHGFIB", id);
+		zlog_debug("%s: RTM_DELNHGFIB, id=%u", __func__, dplane_id);
 
 	return ret;
 }
@@ -3282,6 +2718,13 @@ struct fpm_frame_batch {
 	struct fpm_frame *frames;
 	uint32_t count, cap;
 	size_t total_len;   /* sum of len + FPM_HEADER_SIZE per frame */
+	/*
+	 * How many of those frames are NHGFIB messages. The nhgfib_sent
+	 * counter is bumped only once the batch reaches obuf, so it counts
+	 * frames actually written instead of frames assembled — an assembled
+	 * batch can still be rolled back.
+	 */
+	uint32_t nhgfib_count;
 };
 
 /**
@@ -3323,6 +2766,7 @@ static void fpm_frame_batch_free(struct fpm_frame_batch *batch)
 	batch->count = 0;
 	batch->cap = 0;
 	batch->total_len = 0;
+	batch->nhgfib_count = 0;
 }
 
 /**
@@ -3406,55 +2850,84 @@ static int fpm_frame_batch_write_locked(struct fpm_nl_ctx *fnc,
 	event_add_write(fnc->fthread->master, fpm_write, fnc, fnc->socket,
 			 &fnc->t_write);
 
+	/*
+	 * The batch is on the wire now: account its NHGFIB frames. Counting
+	 * here rather than at assembly time keeps the counter honest for
+	 * batches that end up rolled back or refused for lack of room.
+	 */
+	fnc->nhg_tables.nhgfib_sent += batch->nhgfib_count;
+
 	return 0;
 }
 
 /*
- * NHGFIB message emitters — the seam P9 fills in.
+ * NHGFIB message emitters.
  *
- * P8 owns state and ordering, P9 owns the bytes. Both emitters are called
- * with `fnc->obuf_mutex` held and in the design's flush order: the DELs
- * carried over from earlier contexts first, then every NEW of this context
- * (children before parents), then its route message. The DELs this context
- * produces are carried over in turn (see fnc->pending_dels).
+ * Both are called with `fnc->obuf_mutex` held and in the design's flush
+ * order: the DELs carried over from earlier contexts first, then every NEW of
+ * this context (children before parents), then its route message. The DELs
+ * this context produces are carried over in turn (see fnc->pending_dels).
  *
  * Emitters only APPEND to the caller's frame batch, they never touch obuf:
  * the batch is written in one piece afterwards, which is what makes the
  * whole context atomic on the wire — and what makes its size exactly known
  * before any byte is written.
  *
- * P9: replace the body with netlink_nhgfull_obj_msg_encode(RTM_NEWNHGFIB /
- * RTM_DELNHGFIB, ...) into a local buffer, then
- *	fpm_frame_batch_add(batch, buf, len);
- * P9 must keep every encoded NHGFIB frame within DPLANE_FPM_NL_BUF_SIZE
- * (64KiB), which is also what the FPM framing allows: fpm_frame_batch_add()
- * asserts len + FPM_HEADER_SIZE <= UINT16_MAX, the bound of the u16 length
- * field the FPM header carries. No tighter per-frame bound is needed — the
- * output space reservation is computed from the assembled batch itself.
+ * Each emitter encodes into its own scratch buffer: the caller's buffer
+ * already holds the route message of this context, which must survive until
+ * the batch is assembled. fpm_frame_batch_add() copies the bytes, so one
+ * buffer per call is enough. The encoders refuse anything the FPM framing
+ * cannot carry (len + FPM_HEADER_SIZE > UINT16_MAX), which is what keeps the
+ * assert in fpm_frame_batch_add() unreachable.
+ *
+ * @return false on encode failure; the caller then emits nothing at all and
+ *         reports the failure to zebra, exactly like a route encode failure.
  */
-static void fpm_emit_nhgfib_new(struct fpm_nl_ctx *fnc,
-				const struct fpm_dplane_nhg *obj,
+static bool fpm_emit_nhgfib_new(const struct fpm_dplane_nhg *obj,
 				struct fpm_frame_batch *batch)
 {
-	/* P9: encode RTM_NEWNHGFIB for `obj` and append it to `batch`. */
-	(void)batch;
-	fnc->nhg_tables.nhgfib_sent++;
+	uint8_t buf[DPLANE_FPM_NL_BUF_SIZE];
+	ssize_t rv;
+
+	rv = netlink_nhgfib_obj_msg_encode(obj, buf, sizeof(buf));
+	if (rv <= 0) {
+		zlog_err("%s: NEWNHGFIB encode failed for dplane NHG %u",
+			 __func__, obj->dplane_id);
+		return false;
+	}
+
+	fpm_frame_batch_add(batch, buf, (size_t)rv);
+	batch->nhgfib_count++;
 
 	if (IS_ZEBRA_DEBUG_FPM)
 		zlog_debug("%s: NEWNHGFIB id %u level %u flags 0x%x children %u refcount %u",
 			   __func__, obj->dplane_id, obj->level, obj->nhg_flags,
 			   obj->num_children, obj->refcount);
+
+	return true;
 }
 
-static void fpm_emit_nhgfib_del(struct fpm_nl_ctx *fnc, uint32_t dplane_id,
+static bool fpm_emit_nhgfib_del(uint32_t dplane_id,
 				struct fpm_frame_batch *batch)
 {
-	/* P9: encode RTM_DELNHGFIB for `dplane_id` and append it to `batch`. */
-	(void)batch;
-	fnc->nhg_tables.nhgfib_sent++;
+	/* A DEL carries nothing but the id: a small buffer covers it. */
+	uint8_t buf[128];
+	ssize_t rv;
+
+	rv = netlink_nhgfib_del_msg_encode(dplane_id, buf, sizeof(buf));
+	if (rv <= 0) {
+		zlog_err("%s: DELNHGFIB encode failed for dplane NHG %u",
+			 __func__, dplane_id);
+		return false;
+	}
+
+	fpm_frame_batch_add(batch, buf, (size_t)rv);
+	batch->nhgfib_count++;
 
 	if (IS_ZEBRA_DEBUG_FPM)
 		zlog_debug("%s: DELNHGFIB id %u", __func__, dplane_id);
+
+	return true;
 }
 
 /*
@@ -3490,15 +2963,21 @@ static void fpm_nhg_route_key_from_ctx(const struct zebra_dplane_ctx *ctx,
  * flush").
  *
  * Requires `fnc->obuf_mutex` to be held.
+ *
+ * @return false when a DEL failed to encode; the caller then emits nothing
+ *         and leaves the whole queue in place for the next attempt.
  */
-static void fpm_nhg_pending_dels_add(struct fpm_nl_ctx *fnc,
+static bool fpm_nhg_pending_dels_add(struct fpm_nl_ctx *fnc,
 				     struct fpm_frame_batch *batch)
 {
 	uint32_t i;
 
 	for (i = 0; i < fnc->pending_dels.count; i++)
-		fpm_emit_nhgfib_del(fnc, fnc->pending_dels.ids[i].dplane_id,
-				    batch);
+		if (!fpm_emit_nhgfib_del(fnc->pending_dels.ids[i].dplane_id,
+					 batch))
+			return false;
+
+	return true;
 }
 
 /**
@@ -3510,7 +2989,8 @@ static void fpm_nhg_pending_dels_add(struct fpm_nl_ctx *fnc,
  * first, admitted by a single room check, and the queue is only emptied once
  * the bytes are on the wire. With no room the DELs simply stay queued for the
  * next attempt — a lagging DEL is harmless, it only leaves the peer holding
- * an unreferenced NHG for a while longer.
+ * an unreferenced NHG for a while longer. An encode failure is handled the
+ * same way, for the same reason.
  *
  * Requires `fnc->obuf_mutex` to be held.
  */
@@ -3522,7 +3002,10 @@ static void fpm_nhg_pending_dels_flush_locked(struct fpm_nl_ctx *fnc,
 	if (fnc->pending_dels.count == 0)
 		return;
 
-	fpm_nhg_pending_dels_add(fnc, &batch);
+	if (!fpm_nhg_pending_dels_add(fnc, &batch)) {
+		fpm_frame_batch_free(&batch);
+		return;
+	}
 
 	if (!fpm_obuf_have_bytes_locked(fnc, batch.total_len, caller)) {
 		fpm_frame_batch_free(&batch);
@@ -3538,7 +3021,8 @@ static void fpm_nhg_pending_dels_flush_locked(struct fpm_nl_ctx *fnc,
 /**
  * Route operation handling in nhg-fib mode (design §4.2.1 "Per-op
  * handling"): the route event itself drives the dplane NHG object
- * lifecycle and the route message carries a plugin allocated RTA_NH_ID.
+ * lifecycle and the route message carries a plugin allocated RTA_NH_ID (or,
+ * for SRv6 VPN routes, the two SRv6 encap id attributes — design §3.2).
  *
  * The whole sequence runs under `obuf_mutex`, which also serializes the
  * NHG tables against the other thread enqueueing route ops, and keeps the
@@ -3551,7 +3035,8 @@ static void fpm_nhg_pending_dels_flush_locked(struct fpm_nl_ctx *fnc,
  *  2. assemble the whole batch: first the DELs carried over from earlier
  *     contexts, then this context's NEWs (children before parents), then its
  *     route frame. Nothing is written yet, so the context is still fully
- *     undoable;
+ *     undoable — an NHGFIB encode failure here is handled just like a route
+ *     encode failure (rollback, nothing emitted, REQUEST_FAILURE);
  *  3. admit the batch with ONE room check for its exact total length. On
  *     failure the build is rolled back, the map keeps pointing at the old
  *     object, the carried-over DELs stay queued and -1 is returned so the
@@ -3581,10 +3066,18 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	struct fpm_dplane_nhg *new_top = NULL, *old_top;
 	struct fpm_nhg_route_key key;
 	size_t nl_buf_len = 0, route_off;
+	bool encode_ok = true;
 	struct nlmsghdr *n;
 	ssize_t rv;
 	uint32_t i;
 	int ret;
+	/*
+	 * SRv6 VPN routes keep their own message pair
+	 * (RTM_NEW/DELSRV6VPNROUTE), which carries the NHG ids as two encap
+	 * attributes instead of RTA_NH_ID (design §3.2). Everything else about
+	 * this path — derivation, ordering, atomicity — is identical.
+	 */
+	bool srv6_vpn = has_srv6_sidlist_nexthop(ctx);
 
 	fpm_nhg_route_key_from_ctx(ctx, &key);
 
@@ -3595,12 +3088,26 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	 * are disabled (same message pair the legacy path emits).
 	 */
 	if (op == DPLANE_OP_ROUTE_DELETE || op == DPLANE_OP_ROUTE_UPDATE) {
-		rv = netlink_route_multipath_msg_encode(RTM_DELROUTE, ctx,
-						       nl_buf, nl_buf_size,
-						       true, false, false);
+		if (srv6_vpn) {
+			/*
+			 * The peer removes the route by prefix and ignores the
+			 * two ids on a delete, but both attributes must be
+			 * present for it to accept the message: send the object
+			 * this route currently references (0 when the plugin has
+			 * never seen it, e.g. after a reconnect flush).
+			 */
+			old_top = fpm_nhg_route_get(&fnc->nhg_tables, &key);
+			rv = netlink_vpn_route_msg_encode(RTM_DELROUTE, ctx, nl_buf,
+							  nl_buf_size,
+							  old_top ? old_top->dplane_id : 0,
+							  old_top ? old_top->dplane_id : 0);
+		} else {
+			rv = netlink_route_multipath_msg_encode(RTM_DELROUTE, ctx,
+							       nl_buf, nl_buf_size,
+							       true, false, false);
+		}
 		if (rv <= 0) {
-			zlog_err("%s: netlink_route_multipath_msg_encode failed",
-				 __func__);
+			zlog_err("%s: route delete encode failed", __func__);
 			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
 			return 0;
 		}
@@ -3620,40 +3127,58 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 		}
 
 		route_off = nl_buf_len;
-		/*
-		 * force_nhg is false on purpose: it would make the encoder
-		 * emit RTA_NH_ID from dplane_ctx_get_nhe_id(), which is the
-		 * zebra NHG id. The wire id must be the plugin allocated
-		 * dplane id, so the attribute is appended below instead.
-		 */
-		rv = netlink_route_multipath_msg_encode(RTM_NEWROUTE, ctx,
-						       &nl_buf[route_off],
-						       nl_buf_size - route_off,
-						       true, false,
-						       fnc->use_route_replace);
-		if (rv > 0) {
+		if (srv6_vpn) {
 			/*
-			 * Append RTA_NH_ID to the message just encoded. The
-			 * encoder builds the message through the very same
-			 * nl_attr_put*() helpers and returns
-			 * NLMSG_ALIGN(nlmsg_len), so the assembled header is
-			 * complete and every nested attribute is already
-			 * closed: one more top level attribute is exactly
-			 * what the encoder itself does for RTA_PREFSRC.
-			 * nl_attr_put32() appends at NLMSG_ALIGN(nlmsg_len)
-			 * and bounds itself by maxlen measured from the start
-			 * of the header, hence nl_buf_size - route_off.
-			 * Alignment of the cast is inherited from the encoder,
-			 * which casts the same address to its own header
-			 * struct (route_off is NLMSG_ALIGN'ed).
+			 * Received id = the L-A object; nh id = its resolved
+			 * view, which the peer derives from that very same NHGFIB
+			 * message, so both attributes carry the same dplane id
+			 * (design §3.2).
 			 */
-			n = (struct nlmsghdr *)&nl_buf[route_off];
-			if (!nl_attr_put32(n, nl_buf_size - route_off,
-					   RTA_NH_ID, new_top->dplane_id))
-				rv = 0;
-			else
-				nl_buf_len = route_off +
-					     NLMSG_ALIGN(n->nlmsg_len);
+			rv = netlink_vpn_route_msg_encode(RTM_NEWROUTE, ctx,
+							  &nl_buf[route_off],
+							  nl_buf_size - route_off,
+							  new_top->dplane_id,
+							  new_top->dplane_id);
+			if (rv > 0)
+				nl_buf_len = route_off + (size_t)rv;
+		} else {
+			/*
+			 * force_nhg is false on purpose: it would make the
+			 * encoder emit RTA_NH_ID from dplane_ctx_get_nhe_id(),
+			 * which is the zebra NHG id. The wire id must be the
+			 * plugin allocated dplane id, so the attribute is
+			 * appended below instead.
+			 */
+			rv = netlink_route_multipath_msg_encode(RTM_NEWROUTE, ctx,
+							       &nl_buf[route_off],
+							       nl_buf_size - route_off,
+							       true, false,
+							       fnc->use_route_replace);
+			if (rv > 0) {
+				/*
+				 * Append RTA_NH_ID to the message just encoded.
+				 * The encoder builds the message through the very
+				 * same nl_attr_put*() helpers and returns
+				 * NLMSG_ALIGN(nlmsg_len), so the assembled header
+				 * is complete and every nested attribute is
+				 * already closed: one more top level attribute is
+				 * exactly what the encoder itself does for
+				 * RTA_PREFSRC. nl_attr_put32() appends at
+				 * NLMSG_ALIGN(nlmsg_len) and bounds itself by
+				 * maxlen measured from the start of the header,
+				 * hence nl_buf_size - route_off. Alignment of the
+				 * cast is inherited from the encoder, which casts
+				 * the same address to its own header struct
+				 * (route_off is NLMSG_ALIGN'ed).
+				 */
+				n = (struct nlmsghdr *)&nl_buf[route_off];
+				if (!nl_attr_put32(n, nl_buf_size - route_off,
+						   RTA_NH_ID, new_top->dplane_id))
+					rv = 0;
+				else
+					nl_buf_len = route_off +
+						     NLMSG_ALIGN(n->nlmsg_len);
+			}
 		}
 		if (rv <= 0) {
 			/* Encode failure: roll back and emit nothing at all. */
@@ -3680,10 +3205,27 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	 * existed before this build (a newly built object cannot be a child of
 	 * the old top, so the unref cascade can never reach one).
 	 */
-	fpm_nhg_pending_dels_add(fnc, &batch);
+	if (!fpm_nhg_pending_dels_add(fnc, &batch))
+		encode_ok = false;
 
-	for (i = 0; i < newq.count; i++)
-		fpm_emit_nhgfib_new(fnc, newq.objs[i], &batch);
+	for (i = 0; encode_ok && i < newq.count; i++)
+		encode_ok = fpm_emit_nhgfib_new(newq.objs[i], &batch);
+
+	/*
+	 * An NHGFIB that cannot be encoded is handled exactly like a route that
+	 * cannot be encoded: nothing of this context goes out, the build is
+	 * rolled back, the carried-over DELs stay queued and zebra is told the
+	 * route was not programmed. Emitting the route alone would leave it
+	 * pointing at an id the peer never learned.
+	 */
+	if (!encode_ok) {
+		zlog_err("%s: NHGFIB encode failed, dropping ctx", __func__);
+		fpm_nhg_rollback(&fnc->nhg_tables, &newq);
+		fpm_nhg_staging_free(&newq);
+		fpm_frame_batch_free(&batch);
+		dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
+		return 0;
+	}
 
 	if (nl_buf_len)
 		fpm_frame_batch_add(&batch, nl_buf, nl_buf_len);
@@ -3742,10 +3284,11 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
  * DELNHGFIB ids for the next batch.
  *
  * Needed when a prefix leaves the nhg-fib path while keeping its identity,
- * i.e. a non-SRv6 route becoming an SRv6 route: SRv6 contexts go through the
- * legacy encoders, so without this the route_nhg_map would keep a stale
- * entry and the reference it holds would never be released — the top object
- * (and everything below it) would leak until the next reconnect flush.
+ * i.e. a route becoming an SRv6 local SID route: local SID contexts are the
+ * only route contexts still handled by the legacy encoders in nhg-fib mode,
+ * so without this the route_nhg_map would keep a stale entry and the
+ * reference it holds would never be released — the top object (and everything
+ * below it) would leak until the next reconnect flush.
  *
  * State only: no message is emitted here. Emitting the DELs at this point
  * would put them BEFORE the legacy route message this context is about to
@@ -3799,9 +3342,7 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 	 */
 	if ((!fnc->use_nhg)
 	    && (op == DPLANE_OP_NH_DELETE || op == DPLANE_OP_NH_INSTALL
-		|| op == DPLANE_OP_NH_UPDATE
-		|| op == DPLANE_OP_PIC_CONTEXT_DELETE || op == DPLANE_OP_PIC_CONTEXT_INSTALL
-		|| op == DPLANE_OP_PIC_CONTEXT_UPDATE))
+		|| op == DPLANE_OP_NH_UPDATE))
 			return 0;
  
 	/*
@@ -3830,19 +3371,24 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 	}
 
 	/*
-	 * nhg-fib mode: route events drive the dplane NHG object lifecycle
-	 * and the route message carries a plugin allocated RTA_NH_ID
-	 * (design §4.2.1). SRv6 routes keep the legacy encoders for now;
-	 * P9 folds them into the derived objects.
+	 * nhg-fib mode: route events drive the dplane NHG object lifecycle and
+	 * the route message carries a plugin allocated NHG id (design §4.2.1).
+	 * SRv6 VPN routes take the same path — they carry their ids in the two
+	 * SRv6 encap attributes instead of RTA_NH_ID (design §3.2).
+	 *
+	 * SRv6 local SID routes are the one exception: their message
+	 * (RTM_NEW/DELSRV6LOCALSID) references no NHG at all, so deriving
+	 * objects for them would publish NHGs nothing can ever reference —
+	 * real ASIC resources in fpmsyncd. They stay on the legacy encoder.
 	 */
 	if (fnc->use_nhg_fib &&
 	    (op == DPLANE_OP_ROUTE_INSTALL || op == DPLANE_OP_ROUTE_UPDATE ||
 	     op == DPLANE_OP_ROUTE_DELETE)) {
-		if (!has_srv6_nexthop(ctx))
+		if (!has_srv6_localsid_nexthop(ctx))
 			return fpm_nl_enqueue_route_nhg_fib(fnc, ctx, op, nl_buf,
 							    sizeof(nl_buf));
 		/*
-		 * A prefix can transition non-SRv6 -> SRv6: release the
+		 * A prefix can transition into a local SID route: release the
 		 * nhg-fib state it owned before handing it to the legacy
 		 * encoders below.
 		 */
@@ -3926,49 +3472,32 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		nl_buf_len = (size_t)rv;
 		break;
 
+	/*
+	 * Kernel NHG events. In nhg-fib mode they are ignored: NHGFIB objects
+	 * are derived from route events instead, and use_nhg (which gates this
+	 * whole group above) is mutually exclusive with use_nhg_fib.
+	 */
 	case DPLANE_OP_NH_DELETE:
-		if (fnc->use_nhg_fib) {
-			rv = netlink_nexthopgroupfull_msg_encode(RTM_DELNHGFIB, ctx, nl_buf,
-							sizeof(nl_buf), true);
-			if (rv <= 0) {
-				zlog_err("%s: netlink_nexthopgroupfull_msg_encode failed",
-					 __func__);
-				dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
-				return 0;
-			}
-		} else {
-			rv = netlink_nexthop_msg_encode(RTM_DELNEXTHOP, ctx, nl_buf,
-							sizeof(nl_buf), true);
-			if (rv <= 0) {
-				zlog_err("%s: netlink_nexthop_msg_encode failed",
-					 __func__);
-				dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
-				return 0;
-			}
+		rv = netlink_nexthop_msg_encode(RTM_DELNEXTHOP, ctx, nl_buf,
+						sizeof(nl_buf), true);
+		if (rv <= 0) {
+			zlog_err("%s: netlink_nexthop_msg_encode failed",
+				 __func__);
+			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
+			return 0;
 		}
 
 		nl_buf_len = (size_t)rv;
 		break;
 	case DPLANE_OP_NH_INSTALL:
 	case DPLANE_OP_NH_UPDATE:
-		if (fnc->use_nhg_fib) {
-			rv = netlink_nexthopgroupfull_msg_encode(RTM_NEWNHGFIB, ctx, nl_buf,
-							sizeof(nl_buf), true);
-			if (rv <= 0) {
-				zlog_err("%s: netlink_nexthopgroupfull_msg_encode failed",
-					 __func__);
-				dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
-				return 0;
-			}
-		} else {
-			rv = netlink_nexthop_msg_encode(RTM_NEWNEXTHOP, ctx, nl_buf,
-							sizeof(nl_buf), true);
-			if (rv <= 0) {
-				zlog_err("%s: netlink_nexthop_msg_encode failed",
-					 __func__);
-				dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
-				return 0;
-			}
+		rv = netlink_nexthop_msg_encode(RTM_NEWNEXTHOP, ctx, nl_buf,
+						sizeof(nl_buf), true);
+		if (rv <= 0) {
+			zlog_err("%s: netlink_nexthop_msg_encode failed",
+				 __func__);
+			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
+			return 0;
 		}
 
 		nl_buf_len = (size_t)rv;
@@ -3999,31 +3528,6 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 		nl_buf_len += (size_t)rv;
 		break;
 
-	case DPLANE_OP_PIC_CONTEXT_DELETE:
-		rv = netlink_pic_context_msg_encode(RTM_DELNEXTHOP, ctx, nl_buf,
-						sizeof(nl_buf));
-		if (rv <= 0) {
-			zlog_err("%s: netlink_nexthop_msg_encode failed",
-				 __func__);
-			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
-			return 0;
-		}
-
-		nl_buf_len = (size_t)rv;
-		break;
-	case DPLANE_OP_PIC_CONTEXT_INSTALL:
-	case DPLANE_OP_PIC_CONTEXT_UPDATE:
-		rv = netlink_pic_context_msg_encode(RTM_NEWNEXTHOP, ctx, nl_buf,
-						sizeof(nl_buf));
-		if (rv <= 0) {
-			zlog_err("%s: netlink_pic_context_msg_encode failed",
-				 __func__);
-			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
-			return 0;
-		}
-
-		nl_buf_len = (size_t)rv;
-		break;
 	case DPLANE_OP_LSP_INSTALL:
 	case DPLANE_OP_LSP_UPDATE:
 	case DPLANE_OP_LSP_DELETE:
@@ -4478,6 +3982,7 @@ static void fpm_process_queue(struct event *t)
 
 	while (true) {
 		size_t writeable_amount;
+		enum dplane_op_e ctx_op;
 
 		frr_with_mutex (&fnc->obuf_mutex) {
 			writeable_amount = STREAM_WRITEABLE(fnc->obuf);
@@ -4514,9 +4019,18 @@ static void fpm_process_queue(struct event *t)
 		 * Gated on use_nhg_fib: the legacy path can also return -1
 		 * (fpm_obuf_write_locked()) and has always ignored it, so its
 		 * behaviour is left exactly as it was.
+		 *
+		 * Gated on route ops as well: dplane_ctx_get_dest()/get_table()
+		 * read the ctx's route union arm, which a MAC / LSP / SID-list
+		 * context does not have — only a route context may be described
+		 * with them.
 		 */
+		ctx_op = dplane_ctx_get_op(ctx);
 		if (fnc->socket != -1 && fpm_nl_enqueue(fnc, ctx) == -1 &&
-		    fnc->use_nhg_fib) {
+		    fnc->use_nhg_fib &&
+		    (ctx_op == DPLANE_OP_ROUTE_INSTALL ||
+		     ctx_op == DPLANE_OP_ROUTE_UPDATE ||
+		     ctx_op == DPLANE_OP_ROUTE_DELETE)) {
 			zlog_warn("%s: output buffer full, route not programmed (%pFX table %u)",
 				  __func__, dplane_ctx_get_dest(ctx),
 				  dplane_ctx_get_table(ctx));
