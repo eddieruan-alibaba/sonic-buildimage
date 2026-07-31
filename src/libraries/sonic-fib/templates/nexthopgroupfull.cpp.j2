@@ -129,7 +129,7 @@ using namespace fib;
         ifname(other.ifname), nh_grp_full_list(other.nh_grp_full_list),
         depends(other.depends), dependents(other.dependents),
         type(other.type), vrf_id(other.vrf_id), ifindex(other.ifindex),
-        nh_label_type(other.nh_label_type), bh_type(other.bh_type), resolved_prefix(other.resolved_prefix)
+        nh_label_type(other.nh_label_type), bh_type(other.bh_type)
 {
     FIB_LOG(fib::LogLevel::DEBUG, "[CPP DEBUG] NextHopGroupFull copy constructor started for id: %d, key: %d, nhg_flags: %d",  other.id, other.key, other.nhg_flags);
 
@@ -201,8 +201,6 @@ using namespace fib;
     memcpy(&src, &other.src, sizeof(g_addr));
     memcpy(&rmap_src, &other.rmap_src, sizeof(g_addr));
 
-    resolved_prefix = other.resolved_prefix;
-
     /* Deep copy for nh_srv6 information */
     if (nh_srv6 != nullptr) {
         if (nh_srv6->seg6_segs != nullptr) {
@@ -254,8 +252,7 @@ bool {{ root_struct_name }}::operator==(const {{ root_struct_name }}& other) con
         type != other.type ||
         vrf_id != other.vrf_id ||
         ifindex != other.ifindex ||
-        nh_label_type != other.nh_label_type ||
-        resolved_prefix != other.resolved_prefix) {
+        nh_label_type != other.nh_label_type) {
             FIB_LOG(fib::LogLevel::DEBUG,  "[CPP DEBUG] NOT SAME plain values!");
             return false;
     }

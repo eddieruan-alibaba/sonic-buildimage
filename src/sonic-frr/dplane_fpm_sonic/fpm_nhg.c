@@ -760,10 +760,25 @@ fpm_nhg_build_group(struct fpm_nhg_tables *t, const struct nexthop *chain,
 	}
 	qsort(children, n, sizeof(*children), fpm_nhg_child_cmp);
 	key.level = level;
-	key.nhg_flags =
-		(level == FPM_NHG_L_B ? FPM_NHG_FLAG_RECURSIVE : 0) |
-		(level == FPM_NHG_L_A && any_recursive ? FPM_NHG_FLAG_RECEIVED
-						       : 0);
+	/*
+	 * nhg_flags feeds the group hash below, so it has to be decided here.
+	 *
+	 * Only L-B carries RECURSIVE. RECEIVED is deliberately NOT set on a
+	 * plain-IP L-A group: to fpmsyncd RECEIVED means "pre-resolution group,
+	 * do not program". nhgmgr.cpp RIBNHGEntry::checkNeedCreateSonicNHGObj()
+	 * bails out for a NORMAL (non-SRv6) entry that carries it —
+	 *   "NextHop %d is a received NHG without SRv6 info, skip create sonic
+	 *    object." -> m_create_sonic_nhg_obj = false
+	 * so the group would never get a SONiC NHG object id and every route
+	 * pointing at it would fail its RTA_NH_ID lookup.
+	 *
+	 * The one case where the consumer wants RECEIVED is SRv6:
+	 * checkNeedCreateSonicPICObj() turns SRv6 + RECEIVED into
+	 * SONIC_NHG_OBJ_TYPE_NHG_WITH_SRV6_PIC_CONTEXT. That path needs its own
+	 * SRv6 aware decision (which object level carries the VPN SID) and is
+	 * handled separately / still pending, so nothing sets RECEIVED yet.
+	 */
+	key.nhg_flags = (level == FPM_NHG_L_B ? FPM_NHG_FLAG_RECURSIVE : 0);
 	key.children = children;
 	key.count = n;
 	key.resolved = (level == FPM_NHG_L_B) ? resolved : NULL;

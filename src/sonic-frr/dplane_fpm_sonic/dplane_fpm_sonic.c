@@ -1289,6 +1289,56 @@ static bool has_srv6_localsid_nexthop(struct zebra_dplane_ctx *ctx)
 }
 
 /**
+ * Depth first flatten of one object's member subtree into an NHGFIB
+ * nh_grp_full_list, replicating zebra_nhg_nhe2grp_full_internal()
+ * (zebra/zebra_nhg.c): the node itself is never written, only its members —
+ * and a member that is itself a group is written with its direct member count
+ * and then immediately followed by its own (recursively flattened) members.
+ *
+ * fpmsyncd depends on exactly this "all depths" shape: nhgmgr.cpp
+ * RIBNHGEntry::getResolvedGroupFromNHGFull() builds a NORMAL group's resolved
+ * set from `if (nhg.num_direct == 0)` entries of nh_grp_full_list, so an
+ * L-A group listing only its immediate L-B members would resolve to an empty
+ * set and never reach the leaves that carry the actual forwarding info.
+ *
+ * Unlike zebra, which has no edge weight available for an inner group node
+ * and writes 0 there, we write the real edge weight: the consumer only reads
+ * `weight` on num_direct == 0 entries, so for inner nodes it is informational.
+ *
+ * \param[in] obj object whose member subtree is flattened.
+ * \param[out] list nh_grp_full array to fill.
+ * \param[in] max capacity of list.
+ * \param[in,out] index next free slot, advanced by every entry written.
+ *
+ * \returns false when the subtree does not fit into max entries.
+ */
+static bool flatten_nhgfull_members(const struct fpm_dplane_nhg *obj,
+				    struct C_nh_grp_full *list, size_t max,
+				    uint32_t *index)
+{
+	uint16_t i;
+
+	for (i = 0; i < obj->num_children; i++) {
+		const struct fpm_dplane_nhg *child = obj->children[i].obj;
+
+		if (*index >= max)
+			return false;
+
+		list[*index].id = child->dplane_id;
+		list[*index].weight = obj->children[i].weight;
+		list[*index].num_direct = child->num_children;
+		(*index)++;
+
+		/* a group member is followed by its own members */
+		if (child->num_children &&
+		    !flatten_nhgfull_members(child, list, max, index))
+			return false;
+	}
+
+	return true;
+}
+
+/**
  * Construct a C_NextHopGroupFull object from a derived dplane NHG object.
  *
  * One builder covers all three levels of the derived hierarchy: the C object
@@ -1299,27 +1349,32 @@ static bool has_srv6_localsid_nexthop(struct zebra_dplane_ctx *ctx)
  * Every id on the wire is a plugin allocated uint32 dplane id (design §3.1):
  * the object's own id and every depends / nh_grp_full_list entry.
  *
+ * depends[] holds the IMMEDIATE members only (what the ctx driven builder fed
+ * from dplane_ctx_get_nhe_depends()), while nh_grp_full_list holds the members
+ * of ALL depths, flattened depth first — see flatten_nhgfull_members().
+ *
  * @param c_nhg object to fill (fully overwritten).
  * @param obj derived dplane NHG object.
- * @return false when obj carries more members than the C arrays can hold.
+ * @param grp_full_count set to the number of nh_grp_full_list entries written
+ *		(the flattened member count, >= obj->num_children).
+ * @return false when obj's members do not fit into the C arrays.
  */
 static bool build_c_nhgfull_from_obj(struct C_NextHopGroupFull *c_nhg,
-				     const struct fpm_dplane_nhg *obj)
+				     const struct fpm_dplane_nhg *obj,
+				     uint32_t *grp_full_count)
 {
 	const struct nexthop *nh = obj->nh;
 	uint16_t i;
 
 	memset(c_nhg, 0, sizeof(*c_nhg));
+	*grp_full_count = 0;
 
 	/*
-	 * Both member arrays are indexed by the same loop below, so the
-	 * narrower one bounds it. Failing here (instead of clamping) keeps a
-	 * truncated group off the wire: fpmsyncd would install it as if it
-	 * were complete.
+	 * Failing here (instead of clamping) keeps a truncated group off the
+	 * wire: fpmsyncd would install it as if it were complete.
 	 */
-	if (obj->num_children > array_size(c_nhg->depends) ||
-	    obj->num_children > array_size(c_nhg->nh_grp_full_list)) {
-		zlog_err("%s: dplane NHG %u has %u members, C_NextHopGroupFull holds %zu",
+	if (obj->num_children > array_size(c_nhg->depends)) {
+		zlog_err("%s: dplane NHG %u has %u members, depends[] holds %zu",
 			 __func__, obj->dplane_id, obj->num_children,
 			 array_size(c_nhg->depends));
 		return false;
@@ -1334,16 +1389,19 @@ static bool build_c_nhgfull_from_obj(struct C_NextHopGroupFull *c_nhg,
 	 */
 	c_nhg->key = (uint32_t)obj->hash;
 	c_nhg->nhg_flags = obj->nhg_flags;
-	/* L-B: VRF of the resolving prefix. Overridden by the nexthop below. */
-	c_nhg->vrf_id = obj->vrf_id;
 
-	for (i = 0; i < obj->num_children; i++) {
-		const struct fpm_dplane_nhg *child = obj->children[i].obj;
+	/* depends[]: immediate members only */
+	for (i = 0; i < obj->num_children; i++)
+		c_nhg->depends[i] = obj->children[i].obj->dplane_id;
 
-		c_nhg->depends[i] = child->dplane_id;
-		c_nhg->nh_grp_full_list[i].id = child->dplane_id;
-		c_nhg->nh_grp_full_list[i].weight = obj->children[i].weight;
-		c_nhg->nh_grp_full_list[i].num_direct = child->num_children;
+	/* nh_grp_full_list: members of all depths, flattened depth first */
+	if (!flatten_nhgfull_members(obj, c_nhg->nh_grp_full_list,
+				     array_size(c_nhg->nh_grp_full_list),
+				     grp_full_count)) {
+		zlog_err("%s: dplane NHG %u member tree overflows the %zu entry nh_grp_full_list",
+			 __func__, obj->dplane_id,
+			 array_size(c_nhg->nh_grp_full_list));
+		return false;
 	}
 
 	/*
@@ -1373,8 +1431,17 @@ static bool build_c_nhgfull_from_obj(struct C_NextHopGroupFull *c_nhg,
 		c_nhg->weight = nh->weight;
 		c_nhg->flags = nh->flags;
 
-		/* set nexthop srv6 information if present */
-		if (nh->nh_srv6 != NULL) {
+		/*
+		 * set nexthop srv6 information if present. A nexthop_srv6 that
+		 * carries neither a segment list nor a seg6local action holds
+		 * nothing the peer can use (nhgmgr.cpp getNextHopFields() only
+		 * reads nh_srv6 when nh_srv6->seg6_segs is non null), so do not
+		 * allocate one for it.
+		 */
+		if (nh->nh_srv6 != NULL &&
+		    (nh->nh_srv6->seg6_segs != NULL ||
+		     nh->nh_srv6->seg6local_action !=
+			     ZEBRA_SEG6_LOCAL_ACTION_UNSPEC)) {
 			/* Get the default SRv6 context which contains seg6's src IP */
 			struct zebra_srv6 *srv6 = zebra_srv6_get_default();
 
@@ -1408,15 +1475,11 @@ static bool build_c_nhgfull_from_obj(struct C_NextHopGroupFull *c_nhg,
 	}
 
 	/*
-	 * Resolving prefix (L-B only). It travels as a self describing CIDR
-	 * string, so the peer needs no family/length fields of its own.
-	 * snprintfrr() is the printfrr aware bounded formatter (%pFX is an FRR
-	 * extension, unknown to libc snprintf) and char[64] cannot be filled
-	 * even by the longest IPv6 prefix.
+	 * obj->resolved_prefix / obj->vrf_id (L-B resolving info) are
+	 * deliberately NOT emitted: they are plugin internal state feeding the
+	 * dedupe hash and the future binding table (design D3). The NHGFIB
+	 * schema has no field for them and fpmsyncd never reads them.
 	 */
-	if (obj->resolved_prefix.family != AF_UNSPEC)
-		snprintfrr(c_nhg->resolved_prefix, sizeof(c_nhg->resolved_prefix),
-			   "%pFX", &obj->resolved_prefix);
 
 	return true;
 }
@@ -2234,13 +2297,14 @@ static ssize_t netlink_nhgfib_obj_msg_encode(const struct fpm_dplane_nhg *obj,
 	} *req = buf;
 
 	struct C_NextHopGroupFull c_nhg;
+	uint32_t grp_full_count = 0;
 	char *json_str = NULL;
 	ssize_t ret = -1;
 
 	if (buflen < sizeof(*req))
 		return 0;
 
-	if (!build_c_nhgfull_from_obj(&c_nhg, obj)) {
+	if (!build_c_nhgfull_from_obj(&c_nhg, obj, &grp_full_count)) {
 		free_c_nexthopgroupfull(&c_nhg);
 		return -1;
 	}
@@ -2261,12 +2325,14 @@ static ssize_t netlink_nhgfib_obj_msg_encode(const struct fpm_dplane_nhg *obj,
 
 	if (obj->num_children) {
 		/*
-		 * Group (L-A received set or L-B resolved set). The recursive
-		 * form additionally carries the resolving nexthop's gate/type,
-		 * which only an L-B object has.
+		 * Group (L-A top level set or L-B resolved set).
+		 * nh_grp_full_list is the all depths flattened member list
+		 * (grp_full_count entries), depends[] the immediate members.
+		 * The recursive form additionally carries the resolving
+		 * nexthop's gate/type, which only an L-B object has.
 		 */
 		json_str = nexthopgroupfull_json_from_c_nhg_multi(
-			&c_nhg, obj->num_children, obj->num_children, 0,
+			&c_nhg, grp_full_count, obj->num_children, 0,
 			CHECK_FLAG(obj->nhg_flags, FPM_NHG_FLAG_RECURSIVE));
 	} else {
 		/*

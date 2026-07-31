@@ -188,13 +188,7 @@ inline void to_json(nlohmann::ordered_json& j, const {{root_struct_name}}& nh) {
 inline void from_json(const nlohmann::ordered_json& j, {{ root_struct_name }}& nh) {
     {%- set sorted_fields = root_struct.fields | sort(attribute='position') %}
     {%- for field in sorted_fields %}
-    {%- if field.name == "resolved_prefix" %}
-    if (j.contains("resolved_prefix")) {
-        j.at("resolved_prefix").get_to(nh.resolved_prefix);
-    } else {
-        nh.resolved_prefix = "";
-    }
-    {%- elif field.name in ["gate", "src", "rmap_src"] %}
+    {%- if field.name in ["gate", "src", "rmap_src"] %}
     std::string {{ field.name }}_str = j.at("{{ field.name }}");
     string_to_gaddr({{ field.name }}_str, nh.{{ field.name }}, nh.type);
     {%- elif field.name == "bh_type" %}

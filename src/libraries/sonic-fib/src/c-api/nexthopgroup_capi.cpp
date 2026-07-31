@@ -13,17 +13,6 @@
 
 using namespace std;
 
-/*
- * resolved_prefix crosses the C ABI as a fixed size char array
- * (C_NextHopGroupFull.resolved_prefix, char[64]) holding a self describing
- * CIDR string. Read it with strnlen() so an unterminated array can never
- * make the std::string constructor run past the end of the field.
- */
-static std::string resolved_prefix_to_string(const char *field, size_t size)
-{
-    return std::string(field, strnlen(field, size));
-}
-
 extern "C" {
 
 const char* nexthopgroup_version(void) {
@@ -84,15 +73,6 @@ char* nexthopgroupfull_json_from_c_nhg_multi(const struct C_NextHopGroupFull* c_
             cpp_nhg = new fib::NextHopGroupFull(c_nhg->id, c_nhg->key, c_nhg->nhg_flags,
                                         cpp_nh_grp_full_list, cpp_depends, cpp_dependents);
         }
-
-        /*
-         * Neither group constructor takes the resolving info: a recursive
-         * group carries the prefix it resolved through plus that prefix's
-         * VRF, so set both after construction.
-         */
-        cpp_nhg->resolved_prefix = resolved_prefix_to_string(c_nhg->resolved_prefix,
-                                                            sizeof(c_nhg->resolved_prefix));
-        cpp_nhg->vrf_id = static_cast<fib::vrf_id_t>(c_nhg->vrf_id);
 
         /* Convert C++ Obj to JSON stirng */
         char* json_str = nexthopgroup_to_json(cpp_nhg);
@@ -161,13 +141,6 @@ char* nexthopgroupfull_json_from_c_nhg_singleton(const struct C_NextHopGroupFull
                                                          reinterpret_cast<const fib::nexthop_srv6*>(c_nhg->nh_srv6),
                                                          reinterpret_cast<const fib::seg6_seg_stack*>(c_nhg->nh_srv6 ? c_nhg->nh_srv6->seg6_segs : nullptr),
                                                          cpp_nh_segs);
-
-        /*
-         * The singleton constructor takes vrf_id but not the resolving
-         * prefix: copy it out of the fixed size C field.
-         */
-        cpp_nhg->resolved_prefix = resolved_prefix_to_string(c_nhg->resolved_prefix,
-                                                            sizeof(c_nhg->resolved_prefix));
 
         /* Convert C++ Obj to JSON string */
         char* json_str = nexthopgroup_to_json(cpp_nhg);

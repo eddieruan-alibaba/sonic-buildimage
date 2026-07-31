@@ -109,12 +109,6 @@
       "position" : 5,
       "description": "Route-map source address"
     },
-    "resolved_prefix": {
-      "type": "string",
-      "position" : 5,
-      "default_value" : "\"\"",
-      "description": "Resolving route prefix in CIDR notation, e.g. 10.0.0.0/24 or 2001:db8::/64; empty when not a recursive group (optional)"
-    },
 
     "nh_srv6": {
       "position" : 6,
