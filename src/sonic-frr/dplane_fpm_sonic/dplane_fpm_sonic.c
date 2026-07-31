@@ -1305,6 +1305,15 @@ static bool has_srv6_localsid_nexthop(struct zebra_dplane_ctx *ctx)
  * and writes 0 there, we write the real edge weight: the consumer only reads
  * `weight` on num_direct == 0 entries, so for inner nodes it is informational.
  *
+ * Binding convergence (design §5) is realized right here: an object marked
+ * `repaired` — its resolving prefix is currently gone — contributes NOTHING to
+ * this list. As the emitted object it yields an empty member list, and as a
+ * member of an ancestor it is skipped whole, entry and subtree alike, so the
+ * ancestor's flattened list is exactly the original one minus the dead
+ * recursive branch. The object model is untouched (children stay in place),
+ * which is what makes the restore nothing but clearing the flag and re-emitting
+ * the same dplane ids.
+ *
  * \param[in] obj object whose member subtree is flattened.
  * \param[out] list nh_grp_full array to fill.
  * \param[in] max capacity of list.
@@ -1318,8 +1327,16 @@ static bool flatten_nhgfull_members(const struct fpm_dplane_nhg *obj,
 {
 	uint16_t i;
 
+	/* repaired: members are treated as empty (design §5) */
+	if (obj->repaired)
+		return true;
+
 	for (i = 0; i < obj->num_children; i++) {
 		const struct fpm_dplane_nhg *child = obj->children[i].obj;
+
+		/* the dead recursive branch drops out of the flattened list */
+		if (child->repaired)
+			continue;
 
 		if (*index >= max)
 			return false;
@@ -1390,7 +1407,13 @@ static bool build_c_nhgfull_from_obj(struct C_NextHopGroupFull *c_nhg,
 	c_nhg->key = (uint32_t)obj->hash;
 	c_nhg->nhg_flags = obj->nhg_flags;
 
-	/* depends[]: immediate members only */
+	/*
+	 * depends[]: immediate members only. A `repaired` member stays listed:
+	 * the repair never deletes the object, it only empties its member list,
+	 * so the dependency the peer registered is still real. The forwarding
+	 * set fpmsyncd derives comes from nh_grp_full_list, which is where the
+	 * dead branch disappears.
+	 */
 	for (i = 0; i < obj->num_children; i++)
 		c_nhg->depends[i] = obj->children[i].obj->dplane_id;
 
@@ -3015,6 +3038,179 @@ static void fpm_nhg_route_key_from_ctx(const struct zebra_dplane_ctx *ctx,
 		prefix_copy(&key->src_p, src);
 }
 
+/*
+ * Binding convergence (design §5): the plugin's NHT equivalent.
+ *
+ * A route event on a prefix that some L-B object resolved through is the
+ * repair (delete) or restore (install) signal. Flipping the object's
+ * `repaired` flag changes what the JSON emission writes as its member list —
+ * and, because a parent's flattened list embeds its whole subtree, the JSON of
+ * every ancestor as well. So one flag flip turns into a re-emission of
+ * RTM_NEWNHGFIB for the object AND its transitive ancestors, each under its
+ * own unchanged dplane id: to fpmsyncd these are ordinary NHG updates with a
+ * reduced (or restored) member list, which is what converges every dependent
+ * route at once.
+ */
+
+/* Growable object list with dedup; used as the ancestor walk's visited set. */
+struct fpm_nhg_obj_list {
+	struct fpm_dplane_nhg **objs;
+	uint32_t count, cap;
+};
+
+static bool fpm_nhg_obj_list_push(struct fpm_nhg_obj_list *l,
+				  struct fpm_dplane_nhg *obj)
+{
+	uint32_t i;
+
+	for (i = 0; i < l->count; i++)
+		if (l->objs[i] == obj)
+			return false;
+
+	if (l->count == l->cap) {
+		l->cap = l->cap ? l->cap * 2 : 8;
+		l->objs = XREALLOC(MTYPE_FPM_FRAME, l->objs,
+				   (size_t)l->cap * sizeof(*l->objs));
+	}
+	l->objs[l->count++] = obj;
+	return true;
+}
+
+static void fpm_nhg_obj_list_free(struct fpm_nhg_obj_list *l)
+{
+	XFREE(MTYPE_FPM_FRAME, l->objs);
+	l->count = 0;
+	l->cap = 0;
+}
+
+/*
+ * Undo record for the `repaired` flag.
+ *
+ * The flag has to be flipped BEFORE the frames are encoded, because the
+ * encoder reads it — but the batch can still be refused afterwards (encode
+ * failure, or no room in obuf), and then nothing of this context may take
+ * effect. Every flip is therefore journalled with its previous value and
+ * reverted on those paths.
+ */
+struct fpm_nhg_repair_undo_entry {
+	struct fpm_dplane_nhg *obj;
+	bool prev;
+};
+
+struct fpm_nhg_repair_undo {
+	struct fpm_nhg_repair_undo_entry *entries;
+	uint32_t count, cap;
+};
+
+static void fpm_nhg_repair_undo_push(struct fpm_nhg_repair_undo *u,
+				     struct fpm_dplane_nhg *obj, bool prev)
+{
+	if (u->count == u->cap) {
+		u->cap = u->cap ? u->cap * 2 : 8;
+		u->entries = XREALLOC(MTYPE_FPM_FRAME, u->entries,
+				      (size_t)u->cap * sizeof(*u->entries));
+	}
+	u->entries[u->count].obj = obj;
+	u->entries[u->count].prev = prev;
+	u->count++;
+}
+
+static void fpm_nhg_repair_undo_revert(struct fpm_nhg_repair_undo *u)
+{
+	uint32_t i;
+
+	for (i = u->count; i > 0; i--)
+		u->entries[i - 1].obj->repaired = u->entries[i - 1].prev;
+	u->count = 0;
+}
+
+static void fpm_nhg_repair_undo_free(struct fpm_nhg_repair_undo *u)
+{
+	XFREE(MTYPE_FPM_FRAME, u->entries);
+	u->count = 0;
+	u->cap = 0;
+}
+
+/**
+ * Repair (gone == true) or restore (gone == false) every L-B object bound to
+ * the route key's prefix, and append the resulting RTM_NEWNHGFIB frames to
+ * `batch`.
+ *
+ * The binding table is keyed on (afi, prefix) only — no vrf, see
+ * fpm_nhg_binding_key: the route key carries a table_id while the L-B records
+ * a nexthop vrf_id, and the plugin keeps no mapping between the two. A
+ * same-prefix event in an unrelated vrf therefore repairs one object too many;
+ * that is the conservative direction (zebra's own re-resolution restores it)
+ * and it never misses an object that must be repaired.
+ *
+ * Nothing is written here: the frames join the caller's batch, so the trigger
+ * and the route operation of the same context share ONE reservation and ONE
+ * write. Flag mutation happens before the encode (the encoder reads it) and is
+ * journalled in `undo`, which the caller reverts if the batch is refused.
+ *
+ * Requires `fnc->obuf_mutex` to be held (it guards both the tables and obuf).
+ *
+ * @return false when a re-emitted object failed to encode; the caller then
+ *         drops the whole context and reverts `undo`.
+ */
+static bool fpm_nhg_fib_reresolve(struct fpm_nl_ctx *fnc,
+				  const struct fpm_nhg_route_key *k, bool gone,
+				  struct fpm_frame_batch *batch,
+				  struct fpm_nhg_repair_undo *undo)
+{
+	struct fpm_nhg_obj_list changed = {};
+	struct fpm_nhg_binding_entry *e;
+	struct fpm_dplane_nhg *obj;
+	bool encode_ok = true;
+	uint32_t i, head;
+
+	e = fpm_nhg_binding_lookup(&fnc->nhg_tables, k->afi, &k->p);
+	if (e == NULL)
+		return true;
+
+	for (i = 0; i < e->count; i++) {
+		obj = e->objs[i];
+
+		/* already in the requested state: nothing to say about it */
+		if (obj->repaired == gone)
+			continue;
+
+		fpm_nhg_repair_undo_push(undo, obj, obj->repaired);
+		obj->repaired = gone;
+		fpm_nhg_obj_list_push(&changed, obj);
+	}
+
+	if (changed.count == 0)
+		return true; /* nothing flipped: the list never allocated */
+
+	/*
+	 * Transitive ancestor closure over the reverse edges: a parent's
+	 * flattened member list embeds this subtree, so its JSON changed too.
+	 * The list doubles as the visited set (push dedups), so the walk is
+	 * bounded by the number of objects reachable upwards and terminates on
+	 * the shared subtrees a DAG has.
+	 */
+	for (head = 0; head < changed.count; head++)
+		for (i = 0; i < changed.objs[head]->num_parents; i++)
+			fpm_nhg_obj_list_push(&changed,
+					      changed.objs[head]->parents[i]);
+
+	/*
+	 * Same dplane ids, so order among these frames does not matter: every
+	 * one of them is an update of an object the peer already knows.
+	 */
+	for (i = 0; encode_ok && i < changed.count; i++)
+		encode_ok = fpm_emit_nhgfib_new(changed.objs[i], batch);
+
+	if (IS_ZEBRA_DEBUG_FPM)
+		zlog_debug("%s: %s %pFX: %u dplane NHG object(s) re-emitted",
+			   __func__, gone ? "repair" : "restore", &k->p,
+			   changed.count);
+
+	fpm_nhg_obj_list_free(&changed);
+	return encode_ok;
+}
+
 /**
  * Append every DEL carried over from earlier contexts to `batch`, in queue
  * order (parent before child, oldest context first).
@@ -3099,14 +3295,17 @@ static void fpm_nhg_pending_dels_flush_locked(struct fpm_nl_ctx *fnc,
  *  1. build the object tree (pure state, rollback-able) and encode the
  *     route frame into the caller's scratch buffer;
  *  2. assemble the whole batch: first the DELs carried over from earlier
- *     contexts, then this context's NEWs (children before parents), then its
- *     route frame. Nothing is written yet, so the context is still fully
- *     undoable — an NHGFIB encode failure here is handled just like a route
- *     encode failure (rollback, nothing emitted, REQUEST_FAILURE);
+ *     contexts, then the binding repair/restore re-emissions this prefix
+ *     triggers (design §5), then this context's NEWs (children before
+ *     parents), then its route frame. Nothing is written yet, so the context
+ *     is still fully undoable — an NHGFIB encode failure here is handled just
+ *     like a route encode failure (rollback, nothing emitted,
+ *     REQUEST_FAILURE);
  *  3. admit the batch with ONE room check for its exact total length. On
- *     failure the build is rolled back, the map keeps pointing at the old
- *     object, the carried-over DELs stay queued and -1 is returned so the
- *     caller can retry (or report the failure to zebra);
+ *     failure the build is rolled back, every `repaired` flag the trigger
+ *     flipped is put back, the map keeps pointing at the old object, the
+ *     carried-over DELs stay queued and -1 is returned so the caller can retry
+ *     (or report the failure to zebra);
  *  4. write the batch in one piece and drop the carried-over DELs: they are
  *     on the wire now;
  *  5. only then mutate state (map upsert, ref of the new top, unref of the
@@ -3129,6 +3328,12 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 {
 	struct fpm_nhg_staging newq = {};
 	struct fpm_frame_batch batch = {};
+	/*
+	 * Journal of the `repaired` flag flips the binding trigger performs
+	 * below. Allocated lazily by the first flip, so the early returns ahead
+	 * of the trigger have nothing to release.
+	 */
+	struct fpm_nhg_repair_undo undo = {};
 	struct fpm_dplane_nhg *new_top = NULL, *old_top;
 	struct fpm_nhg_route_key key;
 	size_t nl_buf_len = 0, route_off;
@@ -3274,6 +3479,21 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	if (!fpm_nhg_pending_dels_add(fnc, &batch))
 		encode_ok = false;
 
+	/*
+	 * Binding convergence for this very prefix (design §5), ahead of this
+	 * context's own NEWs: a delete is the repair signal, an install/update
+	 * the restore signal. Sharing the batch is the point — the repair
+	 * frames, the NEWs and the route frame ride out under one reservation
+	 * and one write, so the peer never sees a half-converged state.
+	 *
+	 * The flips happen before the NEWs are encoded on purpose: a parent
+	 * built by this very context must flatten with the new flag value.
+	 */
+	if (encode_ok &&
+	    !fpm_nhg_fib_reresolve(fnc, &key, op == DPLANE_OP_ROUTE_DELETE,
+				   &batch, &undo))
+		encode_ok = false;
+
 	for (i = 0; encode_ok && i < newq.count; i++)
 		encode_ok = fpm_emit_nhgfib_new(newq.objs[i], &batch);
 
@@ -3286,6 +3506,8 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	 */
 	if (!encode_ok) {
 		zlog_err("%s: NHGFIB encode failed, dropping ctx", __func__);
+		fpm_nhg_repair_undo_revert(&undo);
+		fpm_nhg_repair_undo_free(&undo);
 		fpm_nhg_rollback(&fnc->nhg_tables, &newq);
 		fpm_nhg_staging_free(&newq);
 		fpm_frame_batch_free(&batch);
@@ -3300,10 +3522,13 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	 * batch.total_len is now the EXACT byte count of the write, so this
 	 * single check is the whole reservation — no upper bound heuristic is
 	 * involved anymore. On failure nothing is emitted, no state moves, the
-	 * map keeps pointing at the old object and the carried-over DELs stay
-	 * queued, so the caller can retry the whole context.
+	 * map keeps pointing at the old object, every `repaired` flag the
+	 * trigger flipped goes back to its previous value and the carried-over
+	 * DELs stay queued, so the caller can retry the whole context.
 	 */
 	if (!fpm_obuf_have_bytes_locked(fnc, batch.total_len, __func__)) {
+		fpm_nhg_repair_undo_revert(&undo);
+		fpm_nhg_repair_undo_free(&undo);
 		fpm_nhg_rollback(&fnc->nhg_tables, &newq);
 		fpm_nhg_staging_free(&newq);
 		fpm_frame_batch_free(&batch);
@@ -3314,6 +3539,8 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	ret = fpm_frame_batch_write_locked(fnc, &batch, __func__);
 	fpm_frame_batch_free(&batch);
 	fpm_nhg_staging_free(&newq);
+	/* The repair/restore frames are on the wire: the flips stand. */
+	fpm_nhg_repair_undo_free(&undo);
 
 	/*
 	 * The carried-over DELs are on the wire (or a resync was forced, which
