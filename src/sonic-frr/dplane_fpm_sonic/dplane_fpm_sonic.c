@@ -570,6 +570,35 @@ DEFUN(fpm_reset_counters, fpm_reset_counters_cmd,
 	return CMD_SUCCESS;
 }
 
+/*
+ * NHG mode currently in effect. The two modes are mutually exclusive: enabling
+ * one disables the other (see fpm_use_nhg / fpm_use_nhg_fib above), so a single
+ * string describes the state.
+ */
+static const char *fpm_nhg_mode_str(const struct fpm_nl_ctx *fnc)
+{
+	if (fnc->use_nhg_fib)
+		return "nhg-fib";
+	if (fnc->use_nhg)
+		return "next-hop-groups";
+	return "plain";
+}
+
+/* Level of a derived dplane NHG object, as shown by `show fpm nhg-fib`. */
+static const char *fpm_nhg_level_str(uint8_t level)
+{
+	switch (level) {
+	case FPM_NHG_L_C:
+		return "L-C";
+	case FPM_NHG_L_B:
+		return "L-B";
+	case FPM_NHG_L_A:
+		return "L-A";
+	default:
+		return "L-?";
+	}
+}
+
 DEFUN(fpm_show_status,
       fpm_show_status_cmd,
       "show fpm status [json]$json",
@@ -581,6 +610,8 @@ DEFUN(fpm_show_status,
 	struct sockaddr_in *sin;
 	struct sockaddr_in6 *sin6;
 	char buf[BUFSIZ];
+	uint32_t nhg_live;
+	uint64_t nhg_created, nhg_deleted, nhgfib_sent, nhg_dedupe_hits;
 
 	bool json = false;
 	if (argc == 4 && !strcmp(argv[3]->arg, "json")) {
@@ -605,6 +636,20 @@ DEFUN(fpm_show_status,
 		break;
 	}
 
+	/*
+	 * Derivation state (design D13). nhg_tables and its counters are
+	 * written under obuf_mutex from two threads (the FPM pthread and the
+	 * zebra main thread via the fpm_rib_send() resync walk), so this vty
+	 * thread must read them holding the same mutex.
+	 */
+	frr_with_mutex (&gfnc->obuf_mutex) {
+		nhg_live = fpm_nhg_count(&gfnc->nhg_tables);
+		nhg_created = gfnc->nhg_tables.obj_created;
+		nhg_deleted = gfnc->nhg_tables.obj_deleted;
+		nhgfib_sent = gfnc->nhg_tables.nhgfib_sent;
+		nhg_dedupe_hits = gfnc->nhg_tables.dedupe_hits;
+	}
+
 	if (json) {
 		j = json_object_new_object();
 
@@ -616,6 +661,12 @@ DEFUN(fpm_show_status,
 		json_object_boolean_add(j, "disabled", gfnc->disabled);
 		json_object_string_add(j, "address", buf);
 		json_object_int_add(j, "port", port);
+		json_object_string_add(j, "nhgMode", fpm_nhg_mode_str(gfnc));
+		json_object_int_add(j, "dplaneNhgLive", nhg_live);
+		json_object_int_add(j, "dplaneNhgCreated", nhg_created);
+		json_object_int_add(j, "dplaneNhgDeleted", nhg_deleted);
+		json_object_int_add(j, "nhgFibSent", nhgfib_sent);
+		json_object_int_add(j, "nhgDedupeHits", nhg_dedupe_hits);
 
 		vty_json(vty, j);
 	} else {
@@ -634,6 +685,16 @@ DEFUN(fpm_show_status,
 			       gfnc->use_route_replace ? "Yes" : "No");
 		ttable_add_row(table, "Disabled|%s",
 			       gfnc->disabled ? "Yes" : "No");
+		ttable_add_row(table, "NHG Mode|%s", fpm_nhg_mode_str(gfnc));
+		ttable_add_row(table, "Dplane NHG objects live|%u", nhg_live);
+		ttable_add_row(table, "Dplane NHG objects created|%" PRIu64,
+			       nhg_created);
+		ttable_add_row(table, "Dplane NHG objects deleted|%" PRIu64,
+			       nhg_deleted);
+		ttable_add_row(table, "NHGFIB messages sent|%" PRIu64,
+			       nhgfib_sent);
+		ttable_add_row(table, "Dplane NHG dedupe hits|%" PRIu64,
+			       nhg_dedupe_hits);
 
 		out = ttable_dump(table, "\n");
 		vty_out(vty, "%s\n", out);
@@ -716,6 +777,158 @@ DEFUN(fpm_show_counters_json, fpm_show_counters_json_cmd,
 			    gfnc->counters.user_configures);
 	json_object_int_add(jo, "user-disables", gfnc->counters.user_disables);
 	vty_json(vty, jo);
+
+	return CMD_SUCCESS;
+}
+
+/*
+ * `show fpm nhg-fib` printer (design D13). One of the two output sinks is
+ * active: `jarray` set means JSON, otherwise plain text goes to `vty`.
+ */
+struct fpm_nhg_show_args {
+	struct vty *vty;
+	struct json_object *jarray;
+};
+
+static void fpm_nhg_show_obj(const struct fpm_dplane_nhg *obj, void *arg)
+{
+	struct fpm_nhg_show_args *sa = arg;
+	struct vty *vty = sa->vty;
+	char hashbuf[32];
+	uint16_t i;
+
+	snprintfrr(hashbuf, sizeof(hashbuf), "0x%016" PRIx64, obj->hash);
+
+	if (sa->jarray) {
+		struct json_object *jo = json_object_new_object();
+		struct json_object *jchildren, *jrib;
+
+		json_object_int_add(jo, "dplaneId", obj->dplane_id);
+		json_object_string_add(jo, "level",
+				       fpm_nhg_level_str(obj->level));
+		json_object_int_add(jo, "flags", obj->nhg_flags);
+		json_object_int_add(jo, "refcount", obj->refcount);
+		json_object_string_add(jo, "hash", hashbuf);
+
+		jchildren = json_object_new_array();
+		for (i = 0; i < obj->num_children; i++) {
+			struct json_object *jc = json_object_new_object();
+
+			json_object_int_add(jc, "id",
+					    obj->children[i].obj->dplane_id);
+			json_object_int_add(jc, "weight",
+					    obj->children[i].weight);
+			json_object_array_add(jchildren, jc);
+		}
+		json_object_object_add(jo, "children", jchildren);
+
+		/* L-B only: omitted entirely when there is no resolving info. */
+		if (obj->resolved_prefix.family != AF_UNSPEC) {
+			char pbuf[PREFIX_STRLEN];
+
+			snprintfrr(pbuf, sizeof(pbuf), "%pFX",
+				   &obj->resolved_prefix);
+			json_object_string_add(jo, "resolvedVia", pbuf);
+		}
+		json_object_int_add(jo, "vrfId", obj->vrf_id);
+
+		jrib = json_object_new_array();
+		for (i = 0; i < obj->rib_nhg_id_count; i++)
+			json_object_array_add(
+				jrib,
+				json_object_new_int64(obj->rib_nhg_ids[i]));
+		json_object_object_add(jo, "ribNhgIds", jrib);
+
+		json_object_array_add(sa->jarray, jo);
+		return;
+	}
+
+	vty_out(vty, "Dplane NHG %u (%s) flags 0x%04x refcount %u hash %s\n",
+		obj->dplane_id, fpm_nhg_level_str(obj->level), obj->nhg_flags,
+		obj->refcount, hashbuf);
+
+	if (obj->resolved_prefix.family != AF_UNSPEC)
+		vty_out(vty, "  resolved via %pFX vrf %u\n",
+			&obj->resolved_prefix, obj->vrf_id);
+
+	if (obj->num_children) {
+		vty_out(vty, "  children:");
+		for (i = 0; i < obj->num_children; i++)
+			vty_out(vty, " %u(w%u)",
+				obj->children[i].obj->dplane_id,
+				obj->children[i].weight);
+		vty_out(vty, "\n");
+	}
+
+	if (obj->rib_nhg_id_count) {
+		vty_out(vty, "  rib nhg ids:");
+		for (i = 0; i < obj->rib_nhg_id_count; i++)
+			vty_out(vty, " %u", obj->rib_nhg_ids[i]);
+		vty_out(vty, "\n");
+	}
+}
+
+DEFUN(fpm_show_nhg_fib, fpm_show_nhg_fib_cmd,
+      "show fpm nhg-fib [id (1-4294967295)] [json]",
+      SHOW_STR
+      FPM_STR
+      "Dplane next hop groups derived from route events\n"
+      "Filter by dplane next hop group id\n"
+      "Identifier\n"
+      JSON_STR)
+{
+	struct fpm_nhg_show_args sa = {};
+	bool json = false, filter = false, found = true;
+	uint32_t filter_id = 0;
+	int idx;
+
+	for (idx = 3; idx < argc; idx++) {
+		if (!strcmp(argv[idx]->text, "id") && idx + 1 < argc) {
+			filter = true;
+			filter_id = strtoul(argv[idx + 1]->arg, NULL, 10);
+			idx++;
+		} else if (!strcmp(argv[idx]->text, "json"))
+			json = true;
+	}
+
+	if (gfnc == NULL || !gfnc->use_nhg_fib) {
+		vty_out(vty, "FPM nhg-fib mode is not enabled\n");
+		return CMD_SUCCESS;
+	}
+
+	sa.vty = vty;
+	if (json)
+		sa.jarray = json_object_new_array();
+
+	/*
+	 * nhg_tables is written under obuf_mutex by two threads — the FPM
+	 * pthread processing dplane contexts and the zebra main thread calling
+	 * fpm_nl_enqueue() from the fpm_rib_send() resync walk — together with
+	 * the messages describing those mutations. A reader that skipped the
+	 * mutex could see half-built objects (children array swapped in, count
+	 * not yet bumped) or follow a child pointer an unref just freed, so the
+	 * whole walk stays inside the same critical section.
+	 */
+	frr_with_mutex (&gfnc->obuf_mutex) {
+		if (filter) {
+			const struct fpm_dplane_nhg *obj;
+
+			obj = fpm_nhg_lookup_id(&gfnc->nhg_tables, filter_id);
+			if (obj)
+				fpm_nhg_show_obj(obj, &sa);
+			else
+				found = false;
+		} else
+			fpm_nhg_walk(&gfnc->nhg_tables, fpm_nhg_show_obj, &sa);
+	}
+
+	if (sa.jarray) {
+		vty_json(vty, sa.jarray);
+		return CMD_SUCCESS;
+	}
+
+	if (!found)
+		vty_out(vty, "%% Dplane NHG %u not found\n", filter_id);
 
 	return CMD_SUCCESS;
 }
@@ -4432,6 +4645,7 @@ static int fpm_nl_new(struct event_loop *tm)
 	install_element(ENABLE_NODE, &fpm_show_status_cmd);
 	install_element(ENABLE_NODE, &fpm_show_counters_cmd);
 	install_element(ENABLE_NODE, &fpm_show_counters_json_cmd);
+	install_element(ENABLE_NODE, &fpm_show_nhg_fib_cmd);
 	install_element(ENABLE_NODE, &fpm_show_fib_log_level_cmd);
 	install_element(ENABLE_NODE, &fpm_reset_counters_cmd);
 	install_element(CONFIG_NODE, &fpm_set_address_cmd);

@@ -981,3 +981,66 @@ void fpm_nhg_record_rib_id(struct fpm_dplane_nhg *obj, uint32_t rib_id)
 		(FPM_NHG_RIB_ID_TRACK - 1) * sizeof(obj->rib_nhg_ids[0]));
 	obj->rib_nhg_ids[FPM_NHG_RIB_ID_TRACK - 1] = rib_id;
 }
+
+/*
+ * Show helpers (design D13). Callers MUST hold `fnc->obuf_mutex` — see the
+ * declarations in fpm_nhg.h for the rationale.
+ */
+uint32_t fpm_nhg_count(struct fpm_nhg_tables *t)
+{
+	return (uint32_t)hashcount(t->by_id);
+}
+
+struct fpm_nhg_walk_state {
+	const struct fpm_dplane_nhg **objs;
+	uint32_t count, cap;
+};
+
+static void fpm_nhg_walk_collect(struct hash_bucket *bucket, void *arg)
+{
+	struct fpm_nhg_walk_state *w = arg;
+
+	/*
+	 * cap comes from hashcount() taken under the same lock as this walk,
+	 * so it can never be exceeded; the guard is pure belt and braces.
+	 */
+	if (w->count >= w->cap)
+		return;
+	w->objs[w->count++] = bucket->data;
+}
+
+static int fpm_nhg_walk_id_cmp(const void *a, const void *b)
+{
+	const struct fpm_dplane_nhg *oa = *(const struct fpm_dplane_nhg *const *)a;
+	const struct fpm_dplane_nhg *ob = *(const struct fpm_dplane_nhg *const *)b;
+
+	if (oa->dplane_id < ob->dplane_id)
+		return -1;
+	if (oa->dplane_id > ob->dplane_id)
+		return 1;
+	return 0;
+}
+
+/*
+ * hash_iterate() yields buckets in table order, i.e. arbitrary as far as the
+ * dplane id is concerned. Show output has to be stable and comparable across
+ * invocations, so collect the pointers first, sort them by id, and only then
+ * hand them to the callback. The temporary array borrows the pointers; the
+ * objects themselves stay owned by the tables.
+ */
+void fpm_nhg_walk(struct fpm_nhg_tables *t, fpm_nhg_walk_cb cb, void *arg)
+{
+	struct fpm_nhg_walk_state w = {};
+	uint32_t i;
+
+	w.cap = (uint32_t)hashcount(t->by_id);
+	if (w.cap == 0)
+		return;
+
+	w.objs = XCALLOC(MTYPE_FPM_NHG, w.cap * sizeof(*w.objs));
+	hash_iterate(t->by_id, fpm_nhg_walk_collect, &w);
+	qsort(w.objs, w.count, sizeof(*w.objs), fpm_nhg_walk_id_cmp);
+	for (i = 0; i < w.count; i++)
+		cb(w.objs[i], arg);
+	XFREE(MTYPE_FPM_NHG, w.objs);
+}

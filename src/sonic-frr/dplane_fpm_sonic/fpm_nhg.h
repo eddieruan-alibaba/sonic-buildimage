@@ -168,4 +168,18 @@ struct fpm_dplane_nhg *fpm_nhg_route_pop(struct fpm_nhg_tables *t,
 					 const struct fpm_nhg_route_key *k);
 void fpm_nhg_record_rib_id(struct fpm_dplane_nhg *obj, uint32_t rib_id);
 
+/*
+ * Show helpers (design D13).
+ *
+ * The caller MUST hold `fnc->obuf_mutex` across the whole call: the tables
+ * and the counters in `struct fpm_nhg_tables` are written under that mutex
+ * by both the FPM pthread and the zebra main thread, so a vty-thread reader
+ * has to take it too. The callback runs inside that critical section, so it
+ * must not block or re-enter the tables.
+ */
+/* Callback invoked once per object, ascending dplane id. */
+typedef void (*fpm_nhg_walk_cb)(const struct fpm_dplane_nhg *obj, void *arg);
+void fpm_nhg_walk(struct fpm_nhg_tables *t, fpm_nhg_walk_cb cb, void *arg);
+uint32_t fpm_nhg_count(struct fpm_nhg_tables *t);
+
 #endif /* _FPM_NHG_H */
