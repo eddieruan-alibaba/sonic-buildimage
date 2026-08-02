@@ -502,6 +502,28 @@ static struct fpm_dplane_nhg *fpm_nhg_obj_new(struct fpm_nhg_tables *t,
 	return obj;
 }
 
+/*
+ * A nexthop carrying SRv6 information the peer can actually consume.
+ *
+ * The guard mirrors exactly what nexthop_copy_no_recurse() (lib/nexthop.c)
+ * preserves into the leaf's dup'd nexthop — a segment list only when num_segs
+ * is non zero and the SIDs are not all zeroes — so the RECEIVED flag derived
+ * from this predicate can never disagree with the SRv6 content the NHGFIB
+ * message ends up carrying. An SRv6-less nexthop, and one whose nh_srv6 holds
+ * neither a usable segment list nor a seg6local action, keep the normal
+ * recursive treatment. sid_zero() asserts on NULL and dereferences seg[0],
+ * hence the two checks ahead of it.
+ */
+static bool fpm_nhg_nh_has_srv6(const struct nexthop *nh)
+{
+	if (!nh->nh_srv6)
+		return false;
+	if (nh->nh_srv6->seg6local_action != ZEBRA_SEG6_LOCAL_ACTION_UNSPEC)
+		return true;
+	return nh->nh_srv6->seg6_segs && nh->nh_srv6->seg6_segs->num_segs &&
+	       !sid_zero(nh->nh_srv6->seg6_segs);
+}
+
 static struct fpm_dplane_nhg *fpm_nhg_get_leaf(struct fpm_nhg_tables *t,
 					       const struct nexthop *nh,
 					       struct fpm_nhg_staging *newq)
@@ -518,6 +540,15 @@ static struct fpm_dplane_nhg *fpm_nhg_get_leaf(struct fpm_nhg_tables *t,
 	obj = fpm_nhg_obj_new(t, hash, FPM_NHG_L_C, newq);
 	/* leaves have no ->resolved subtree; no_recurse dup == plain dup */
 	obj->nh = nexthop_dup_no_recurse(nh, NULL);
+	/*
+	 * An SRv6 leaf is the "received" object fpmsyncd turns into an SRv6 PIC
+	 * context object (nhgmgr.cpp checkNeedCreateSonicPICObj(): SRv6 info
+	 * plus RECEIVED). The flag is a pure function of the SRv6 fields the
+	 * leaf key already digests, so a dedupe hit above necessarily carries
+	 * the same value and needs no fixup here.
+	 */
+	if (fpm_nhg_nh_has_srv6(nh))
+		obj->nhg_flags = FPM_NHG_FLAG_RECEIVED;
 	return obj;
 }
 
@@ -655,7 +686,22 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 	uint16_t i = 0;
 
 	for (nh = chain; nh; nh = nh->next) {
-		if (CHECK_FLAG(nh->flags, NEXTHOP_FLAG_RECURSIVE)) {
+		if (fpm_nhg_nh_has_srv6(nh)) {
+			/*
+			 * SRv6: derive the top level object only. The SID list
+			 * lives on this nexthop, and fpmsyncd builds its PIC
+			 * context object from SRv6 info plus RECEIVED, which
+			 * fpm_nhg_get_leaf() stamps here. Recursing would emit
+			 * objects the consumer discards anyway: the resolved
+			 * children inherit the SID list from this parent
+			 * (nexthop_set_resolved(), zebra_nhg.c) but carry no
+			 * RECEIVED, and nhgmgr.cpp checkNeedCreateSonicNHGObj()
+			 * skips a NHG that has SRv6 info without RECEIVED.
+			 */
+			child = fpm_nhg_get_leaf(t, nh, newq);
+			if (!child)
+				return -1;
+		} else if (CHECK_FLAG(nh->flags, NEXTHOP_FLAG_RECURSIVE)) {
 			if (!nh->resolved)
 				continue; /* unresolved: not installable */
 			fpm_nhg_resolved_prefix(nh->resolved, &rp);
@@ -780,9 +826,12 @@ fpm_nhg_build_group(struct fpm_nhg_tables *t, const struct nexthop *chain,
 	 *
 	 * The one case where the consumer wants RECEIVED is SRv6:
 	 * checkNeedCreateSonicPICObj() turns SRv6 + RECEIVED into
-	 * SONIC_NHG_OBJ_TYPE_NHG_WITH_SRV6_PIC_CONTEXT. That path needs its own
-	 * SRv6 aware decision (which object level carries the VPN SID) and is
-	 * handled separately / still pending, so nothing sets RECEIVED yet.
+	 * SONIC_NHG_OBJ_TYPE_NHG_WITH_SRV6_PIC_CONTEXT. That flag is carried by
+	 * the SRv6 leaf itself (fpm_nhg_get_leaf()), which is the object holding
+	 * the SID list the PIC context is built from; a group over several SRv6
+	 * leaves inherits the PIC object from its members instead
+	 * (checkNeedCreateSonicPICObj() scans them first). No group level object
+	 * ever sets RECEIVED.
 	 */
 	key.nhg_flags = (level == FPM_NHG_L_B ? FPM_NHG_FLAG_RECURSIVE : 0);
 	key.children = children;
