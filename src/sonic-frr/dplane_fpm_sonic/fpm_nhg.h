@@ -36,8 +36,6 @@ enum fpm_nhg_level { FPM_NHG_L_C = 0, FPM_NHG_L_B, FPM_NHG_L_A };
 #define FPM_NHG_FLAG_RECURSIVE (1 << 3)
 #define FPM_NHG_FLAG_RECEIVED (1 << 12)
 
-#define FPM_NHG_RIB_ID_TRACK 4
-
 struct fpm_dplane_nhg;
 
 struct fpm_nhg_child {
@@ -54,8 +52,16 @@ struct fpm_dplane_nhg {
 	struct nexthop *nh;   /* defining nexthop (dup'd) */
 	struct prefix resolved_prefix; /* L-B only */
 	vrf_id_t vrf_id;
-	uint32_t rib_nhg_ids[FPM_NHG_RIB_ID_TRACK]; /* show only */
-	uint8_t rib_nhg_id_count;
+	/*
+	 * Distinct zebra NHG ids that referenced this object, mirrored by the
+	 * tables' by_rib_id reverse index (fpm_nhg_record_rib_id()). Grown one
+	 * id at a time and never evicted: the index is only trustworthy if the
+	 * object remembers every id pointing at it, both to answer a reverse
+	 * lookup and to release exactly its own entries when it dies. Bounded
+	 * by the number of zebra NHEs that map here, 4 bytes each.
+	 */
+	uint32_t *rib_nhg_ids;
+	uint16_t rib_nhg_id_count, rib_nhg_id_cap;
 	uint16_t num_children;
 	struct fpm_nhg_child *children; /* sorted by obj->hash */
 };
@@ -82,6 +88,7 @@ struct fpm_nhg_tables {
 	struct hash *by_hash;
 	struct hash *by_id;
 	struct hash *route_map; /* fpm_nhg_route_key -> top (L-A) object */
+	struct hash *by_rib_id; /* zebra NHG id -> object (reverse index) */
 	uint32_t next_id;
 	uint32_t *free_ids;
 	uint32_t free_id_count, free_id_cap;
@@ -166,7 +173,17 @@ void fpm_nhg_route_set(struct fpm_nhg_tables *t,
 		       struct fpm_dplane_nhg *obj);
 struct fpm_dplane_nhg *fpm_nhg_route_pop(struct fpm_nhg_tables *t,
 					 const struct fpm_nhg_route_key *k);
-void fpm_nhg_record_rib_id(struct fpm_dplane_nhg *obj, uint32_t rib_id);
+/*
+ * Record that zebra NHG id `rib_id` maps to `obj`, and point the by_rib_id
+ * reverse index at it. A zebra id resolves to one object at a time, so the
+ * newest recorder wins; the losing object keeps the id in its own list (it
+ * was referenced by it) but no longer owns the index entry.
+ */
+void fpm_nhg_record_rib_id(struct fpm_nhg_tables *t,
+			   struct fpm_dplane_nhg *obj, uint32_t rib_id);
+/* Reverse lookup: zebra NHG id -> dplane object, NULL when unmapped. */
+struct fpm_dplane_nhg *fpm_nhg_lookup_rib_id(struct fpm_nhg_tables *t,
+					     uint32_t rib_id);
 
 /*
  * Show helpers (design D13).

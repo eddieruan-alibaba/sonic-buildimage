@@ -790,6 +790,9 @@ struct fpm_nhg_show_args {
 	struct json_object *jarray;
 };
 
+/* Max zebra NHG ids printed per object in the text form of `show fpm nhg-fib`. */
+#define FPM_NHG_SHOW_RIB_IDS 8
+
 static void fpm_nhg_show_obj(const struct fpm_dplane_nhg *obj, void *arg)
 {
 	struct fpm_nhg_show_args *sa = arg;
@@ -861,9 +864,20 @@ static void fpm_nhg_show_obj(const struct fpm_dplane_nhg *obj, void *arg)
 	}
 
 	if (obj->rib_nhg_id_count) {
+		/*
+		 * The id list is uncapped (a widely shared object can collect
+		 * many), so bound the text form to keep one object on one
+		 * line. The json form above stays complete.
+		 */
+		uint16_t shown = MIN(obj->rib_nhg_id_count,
+				     FPM_NHG_SHOW_RIB_IDS);
+
 		vty_out(vty, "  rib nhg ids:");
-		for (i = 0; i < obj->rib_nhg_id_count; i++)
+		for (i = 0; i < shown; i++)
 			vty_out(vty, " %u", obj->rib_nhg_ids[i]);
+		if (shown < obj->rib_nhg_id_count)
+			vty_out(vty, " +%u more",
+				obj->rib_nhg_id_count - shown);
 		vty_out(vty, "\n");
 	}
 }
@@ -3538,7 +3552,8 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	if (op == DPLANE_OP_ROUTE_DELETE) {
 		old_top = fpm_nhg_route_pop(&fnc->nhg_tables, &key);
 	} else {
-		fpm_nhg_record_rib_id(new_top, dplane_ctx_get_nhe_id(ctx));
+		fpm_nhg_record_rib_id(&fnc->nhg_tables, new_top,
+				      dplane_ctx_get_nhe_id(ctx));
 		old_top = fpm_nhg_route_get(&fnc->nhg_tables, &key);
 		fpm_nhg_route_set(&fnc->nhg_tables, &key, new_top);
 		fpm_nhg_ref(new_top);

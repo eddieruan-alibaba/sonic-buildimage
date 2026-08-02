@@ -289,6 +289,28 @@ static bool fpm_nhg_route_key_cmp(const void *data1, const void *data2)
 	       fpm_nhg_src_same(&a->key.src_p, &b->key.src_p);
 }
 
+/*
+ * by_rib_id: zebra NHG id -> object. Like route_map, entries are their own
+ * small allocation holding a borrowed object pointer — the index takes no
+ * refcount, and every entry is released before its object is freed
+ * (fpm_nhg_rib_ids_purge()).
+ */
+struct fpm_nhg_rib_entry {
+	uint32_t rib_id;
+	struct fpm_dplane_nhg *obj;
+};
+
+static unsigned int fpm_nhg_rib_id_key(const void *data)
+{
+	return ((const struct fpm_nhg_rib_entry *)data)->rib_id;
+}
+
+static bool fpm_nhg_rib_id_cmp(const void *data1, const void *data2)
+{
+	return ((const struct fpm_nhg_rib_entry *)data1)->rib_id ==
+	       ((const struct fpm_nhg_rib_entry *)data2)->rib_id;
+}
+
 void fpm_nhg_tables_init(struct fpm_nhg_tables *t)
 {
 	memset(t, 0, sizeof(*t));
@@ -299,6 +321,8 @@ void fpm_nhg_tables_init(struct fpm_nhg_tables *t)
 	t->route_map = hash_create(fpm_nhg_route_key_hash,
 				   fpm_nhg_route_key_cmp,
 				   "FPM dplane NHG route map");
+	t->by_rib_id = hash_create(fpm_nhg_rib_id_key, fpm_nhg_rib_id_cmp,
+				   "FPM dplane NHG by rib id");
 	t->next_id = 1;
 }
 
@@ -345,8 +369,38 @@ static void fpm_nhg_obj_free(void *data)
 	 */
 	if (obj->nh)
 		nexthop_free(obj->nh);
+	XFREE(MTYPE_FPM_NHG, obj->rib_nhg_ids);
 	XFREE(MTYPE_FPM_NHG, obj->children);
 	XFREE(MTYPE_FPM_NHG, obj);
+}
+
+static void fpm_nhg_rib_entry_free(void *data)
+{
+	XFREE(MTYPE_FPM_NHG, data);
+}
+
+/*
+ * Drop the by_rib_id entries this object still owns, before it is freed.
+ *
+ * An id in obj's list does not imply the index still points here: a later
+ * object may have claimed that id (see fpm_nhg_record_rib_id()). Releasing
+ * such an entry would erase a live mapping, so each candidate is checked
+ * against the object first.
+ */
+static void fpm_nhg_rib_ids_purge(struct fpm_nhg_tables *t,
+				  struct fpm_dplane_nhg *obj)
+{
+	struct fpm_nhg_rib_entry ref, *e;
+	uint16_t i;
+
+	for (i = 0; i < obj->rib_nhg_id_count; i++) {
+		ref.rib_id = obj->rib_nhg_ids[i];
+		e = hash_lookup(t->by_rib_id, &ref);
+		if (!e || e->obj != obj)
+			continue;
+		hash_release(t->by_rib_id, &ref);
+		XFREE(MTYPE_FPM_NHG, e);
+	}
 }
 
 static void fpm_nhg_route_entry_free(void *data)
@@ -363,6 +417,7 @@ void fpm_nhg_tables_flush(struct fpm_nhg_tables *t)
 	 * borrowed object pointers, so they go first.
 	 */
 	hash_clean(t->route_map, fpm_nhg_route_entry_free);
+	hash_clean(t->by_rib_id, fpm_nhg_rib_entry_free);
 	hash_clean(t->by_id, NULL);
 	hash_clean(t->by_hash, fpm_nhg_obj_free);
 	XFREE(MTYPE_FPM_NHG, t->free_ids);
@@ -385,6 +440,7 @@ void fpm_nhg_tables_fini(struct fpm_nhg_tables *t)
 {
 	fpm_nhg_tables_flush(t);
 	hash_clean_and_free(&t->route_map, NULL);
+	hash_clean_and_free(&t->by_rib_id, NULL);
 	hash_clean_and_free(&t->by_id, NULL);
 	hash_clean_and_free(&t->by_hash, NULL);
 }
@@ -889,6 +945,7 @@ void fpm_nhg_rollback(struct fpm_nhg_tables *t, struct fpm_nhg_staging *newq)
 			assert(obj->children[c].obj->refcount > 0);
 			obj->children[c].obj->refcount--;
 		}
+		fpm_nhg_rib_ids_purge(t, obj);
 		fpm_nhg_remove(t, obj);
 		fpm_nhg_id_free(t, obj->dplane_id);
 		fpm_nhg_obj_free(obj);
@@ -960,6 +1017,7 @@ void fpm_nhg_unref(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj,
 	fpm_nhg_del_queue_push(delq, obj->dplane_id);
 	for (i = 0; i < obj->num_children; i++)
 		fpm_nhg_unref(t, obj->children[i].obj, delq);
+	fpm_nhg_rib_ids_purge(t, obj);
 	fpm_nhg_remove(t, obj);
 	fpm_nhg_id_free(t, obj->dplane_id);
 	fpm_nhg_obj_free(obj);
@@ -1015,26 +1073,77 @@ struct fpm_dplane_nhg *fpm_nhg_route_pop(struct fpm_nhg_tables *t,
 }
 
 /*
- * Remember which zebra (rib) NHG ids were seen referencing this object.
- * Show-only mapping (design D13): a small dedup ring, oldest dropped
- * when full. Id 0 means "no zebra NHG" and is never recorded.
+ * zebra (rib) NHG id <-> object mapping. Every id seen referencing an object
+ * is remembered on the object and indexed in by_rib_id, so the relation can be
+ * walked in both directions: object -> ids for `show fpm nhg-fib`, id -> object
+ * for a reverse lookup. Id 0 means "no zebra NHG" and is never recorded.
+ *
+ * Dedupe makes this many-to-one: several zebra NHG ids commonly share one
+ * dplane object.
  */
-void fpm_nhg_record_rib_id(struct fpm_dplane_nhg *obj, uint32_t rib_id)
+static void *fpm_nhg_rib_entry_alloc(void *arg)
 {
-	uint8_t i;
+	const struct fpm_nhg_rib_entry *ref = arg;
+	struct fpm_nhg_rib_entry *e;
+
+	e = XCALLOC(MTYPE_FPM_NHG, sizeof(*e));
+	e->rib_id = ref->rib_id;
+	return e;
+}
+
+void fpm_nhg_record_rib_id(struct fpm_nhg_tables *t,
+			   struct fpm_dplane_nhg *obj, uint32_t rib_id)
+{
+	struct fpm_nhg_rib_entry ref = { .rib_id = rib_id }, *e;
+	bool known = false;
+	uint16_t i;
 
 	if (rib_id == 0)
 		return;
-	for (i = 0; i < obj->rib_nhg_id_count; i++)
-		if (obj->rib_nhg_ids[i] == rib_id)
-			return;
-	if (obj->rib_nhg_id_count < FPM_NHG_RIB_ID_TRACK) {
-		obj->rib_nhg_ids[obj->rib_nhg_id_count++] = rib_id;
-		return;
+
+	for (i = 0; i < obj->rib_nhg_id_count; i++) {
+		if (obj->rib_nhg_ids[i] == rib_id) {
+			known = true;
+			break;
+		}
 	}
-	memmove(&obj->rib_nhg_ids[0], &obj->rib_nhg_ids[1],
-		(FPM_NHG_RIB_ID_TRACK - 1) * sizeof(obj->rib_nhg_ids[0]));
-	obj->rib_nhg_ids[FPM_NHG_RIB_ID_TRACK - 1] = rib_id;
+	if (!known) {
+		if (obj->rib_nhg_id_count == obj->rib_nhg_id_cap) {
+			/*
+			 * cap doubles only when count reaches it, so it stays
+			 * the smallest power of two >= count. count is bounded
+			 * by the number of distinct zebra NHG ids mapping to
+			 * this object, far below the uint16 range.
+			 */
+			obj->rib_nhg_id_cap = obj->rib_nhg_id_cap
+						      ? obj->rib_nhg_id_cap * 2
+						      : 4;
+			obj->rib_nhg_ids =
+				XREALLOC(MTYPE_FPM_NHG, obj->rib_nhg_ids,
+					 obj->rib_nhg_id_cap *
+						 sizeof(*obj->rib_nhg_ids));
+		}
+		obj->rib_nhg_ids[obj->rib_nhg_id_count++] = rib_id;
+	}
+
+	/*
+	 * Repoint unconditionally, including when the id was already known:
+	 * another object may have claimed it in between, and the recorder of
+	 * the route event just processed is the current mapping.
+	 */
+	e = hash_get(t->by_rib_id, &ref, fpm_nhg_rib_entry_alloc);
+	e->obj = obj;
+}
+
+struct fpm_dplane_nhg *fpm_nhg_lookup_rib_id(struct fpm_nhg_tables *t,
+					     uint32_t rib_id)
+{
+	struct fpm_nhg_rib_entry ref = { .rib_id = rib_id }, *e;
+
+	if (rib_id == 0)
+		return NULL;
+	e = hash_lookup(t->by_rib_id, &ref);
+	return e ? e->obj : NULL;
 }
 
 /*
