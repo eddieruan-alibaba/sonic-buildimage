@@ -582,10 +582,16 @@ static int fpm_nhg_child_cmp(const void *a, const void *b)
 }
 
 /*
- * The L-B resolving info (PR #19252 resolved_addr/resolved_len on the
- * recursive parent nexthop) participates in the L-B group hash, so it
- * is derived from the parent BEFORE recursing and passed down —
- * never patched onto the child object after hashing.
+ * The L-B resolving info (PR #19252 resolved_addr/resolved_len) participates in
+ * the L-B group hash, so it is derived BEFORE recursing and passed down — never
+ * patched onto the child object after hashing.
+ *
+ * zebra stamps these fields on the *resolved children*, not on the recursive
+ * parent: nexthop_set_resolved() (zebra/zebra_nhg.c) allocates the child,
+ * appends it to parent->resolved and returns it, and get_resolving_info() then
+ * writes the resolving prefix onto that child. Every child of one parent is
+ * produced by a single loop over one (rn, match) pair, so they all carry the
+ * same resolving prefix and the head child is representative.
  */
 static void fpm_nhg_resolved_prefix(const struct nexthop *nh,
 				    struct prefix *p)
@@ -652,7 +658,7 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 		if (CHECK_FLAG(nh->flags, NEXTHOP_FLAG_RECURSIVE)) {
 			if (!nh->resolved)
 				continue; /* unresolved: not installable */
-			fpm_nhg_resolved_prefix(nh, &rp);
+			fpm_nhg_resolved_prefix(nh->resolved, &rp);
 			staged = newq->count;
 			child = fpm_nhg_build_group(t, nh->resolved,
 						    FPM_NHG_L_B, nh, &rp,
