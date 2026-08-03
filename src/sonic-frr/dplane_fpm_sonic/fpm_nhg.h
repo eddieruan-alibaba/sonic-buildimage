@@ -50,8 +50,16 @@ struct fpm_dplane_nhg {
 	uint8_t level;        /* enum fpm_nhg_level */
 	uint32_t nhg_flags;   /* RECEIVED / RECURSIVE subset for JSON */
 	struct nexthop *nh;   /* defining nexthop (dup'd) */
-	struct prefix resolved_prefix; /* L-B only */
+	struct prefix resolved_prefix; /* resolving prefix, when known */
 	vrf_id_t vrf_id;
+	/*
+	 * Zebra NHG id this object resolved through (PR #19252 resolved_via).
+	 * Not part of identity — it is derivable from the resolution, which is
+	 * already reflected in the children (L-B) or in the gate (SRv6 leaf).
+	 * Kept because by_rib_id maps it straight onto the dplane object of the
+	 * resolving group, which is the cheap handle for a PIC-style repair.
+	 */
+	uint32_t resolved_via;
 	/*
 	 * Distinct zebra NHG ids that referenced this object, mirrored by the
 	 * tables' by_rib_id reverse index (fpm_nhg_record_rib_id()). Grown one
@@ -170,7 +178,7 @@ struct fpm_dplane_nhg *fpm_nhg_route_get(struct fpm_nhg_tables *t,
 					 const struct fpm_nhg_route_key *k);
 void fpm_nhg_route_set(struct fpm_nhg_tables *t,
 		       const struct fpm_nhg_route_key *k,
-		       struct fpm_dplane_nhg *obj);
+		       struct fpm_dplane_nhg *obj, uint32_t rib_id);
 struct fpm_dplane_nhg *fpm_nhg_route_pop(struct fpm_nhg_tables *t,
 					 const struct fpm_nhg_route_key *k);
 /*
@@ -181,6 +189,12 @@ struct fpm_dplane_nhg *fpm_nhg_route_pop(struct fpm_nhg_tables *t,
  */
 void fpm_nhg_record_rib_id(struct fpm_nhg_tables *t,
 			   struct fpm_dplane_nhg *obj, uint32_t rib_id);
+/*
+ * Release one route's claim on a (rib id -> object) mapping. Called from the
+ * route_map accessors; the mapping disappears once the last route drops it.
+ */
+void fpm_nhg_release_rib_id(struct fpm_nhg_tables *t,
+			    struct fpm_dplane_nhg *obj, uint32_t rib_id);
 /* Reverse lookup: zebra NHG id -> dplane object, NULL when unmapped. */
 struct fpm_dplane_nhg *fpm_nhg_lookup_rib_id(struct fpm_nhg_tables *t,
 					     uint32_t rib_id);

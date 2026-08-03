@@ -252,6 +252,13 @@ static bool fpm_nhg_id_cmp(const void *data1, const void *data2)
 struct fpm_nhg_route_entry {
 	struct fpm_nhg_route_key key;
 	struct fpm_dplane_nhg *obj;
+	/*
+	 * The zebra NHG id this route carried when it was installed. Kept so
+	 * the (rib id -> object) association can be released when the route
+	 * goes away or re-points, which is the only way that mapping can be
+	 * known to be dead: the object itself may still serve other routes.
+	 */
+	uint32_t rib_id;
 };
 
 static unsigned int fpm_nhg_route_key_hash(const void *data)
@@ -298,6 +305,8 @@ static bool fpm_nhg_route_key_cmp(const void *data1, const void *data2)
 struct fpm_nhg_rib_entry {
 	uint32_t rib_id;
 	struct fpm_dplane_nhg *obj;
+	/* Routes currently mapping this rib id onto obj. */
+	uint32_t refcount;
 };
 
 static unsigned int fpm_nhg_rib_id_key(const void *data)
@@ -582,6 +591,9 @@ static bool fpm_nhg_nh_has_srv6(const struct nexthop *nh)
 
 static struct fpm_dplane_nhg *fpm_nhg_get_leaf(struct fpm_nhg_tables *t,
 					       const struct nexthop *nh,
+					       const struct prefix *resolved,
+					       vrf_id_t resolved_vrf,
+					       uint32_t resolved_via,
 					       struct fpm_nhg_staging *newq)
 {
 	struct fpm_dplane_nhg *obj;
@@ -591,6 +603,20 @@ static struct fpm_dplane_nhg *fpm_nhg_get_leaf(struct fpm_nhg_tables *t,
 	obj = fpm_nhg_probe(t, &hash, fpm_nhg_leaf_match, nh);
 	if (obj) {
 		t->dedupe_hits++;
+		/*
+		 * Refresh the resolving info on reuse. An equal leaf key means
+		 * the same gate, so the caller's values describe this object's
+		 * *current* resolution while the stored ones may predate a
+		 * re-resolution (e.g. a /128 endpoint route withdrawn and the
+		 * gate now covered by a less specific locator prefix). Identity
+		 * is untouched — neither field is in the leaf key — and neither
+		 * reaches the wire, so no message follows from the update.
+		 */
+		if (resolved && resolved->family != AF_UNSPEC) {
+			obj->resolved_prefix = *resolved;
+			obj->vrf_id = resolved_vrf;
+			obj->resolved_via = resolved_via;
+		}
 		return obj;
 	}
 	obj = fpm_nhg_obj_new(t, hash, FPM_NHG_L_C, newq);
@@ -605,6 +631,19 @@ static struct fpm_dplane_nhg *fpm_nhg_get_leaf(struct fpm_nhg_tables *t,
 	 */
 	if (fpm_nhg_nh_has_srv6(nh))
 		obj->nhg_flags = FPM_NHG_FLAG_RECEIVED;
+	/*
+	 * Resolving info for a leaf that stands in for a recursive nexthop
+	 * (the SRv6 top-level-only path): that nexthop still resolved through a
+	 * prefix, and the resolved-via view plus any future NHT repair need to
+	 * know which one. Set only on creation, never patched onto a dedupe
+	 * hit: the resolving prefix follows from the gate, which the leaf key
+	 * already digests, so every sharer of this object resolved the same way.
+	 */
+	if (resolved && resolved->family != AF_UNSPEC) {
+		obj->resolved_prefix = *resolved;
+		obj->vrf_id = resolved_vrf;
+		obj->resolved_via = resolved_via;
+	}
 	return obj;
 }
 
@@ -738,7 +777,7 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 	const struct nexthop *nh;
 	struct fpm_dplane_nhg *child;
 	struct prefix rp;
-	uint32_t staged;
+	uint32_t staged, rvia;
 	uint16_t i = 0;
 
 	for (nh = chain; nh; nh = nh->next) {
@@ -753,8 +792,21 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 			 * (nexthop_set_resolved(), zebra_nhg.c) but carry no
 			 * RECEIVED, and nhgmgr.cpp checkNeedCreateSonicNHGObj()
 			 * skips a NHG that has SRv6 info without RECEIVED.
+			 *
+			 * The subtree is skipped but the resolving prefix is
+			 * not: a recursive SRv6 nexthop still resolved through
+			 * one, and resolved-via / NHT repair need it, so it is
+			 * handed to the leaf.
 			 */
-			child = fpm_nhg_get_leaf(t, nh, newq);
+			memset(&rp, 0, sizeof(rp));
+			rvia = 0;
+			if (CHECK_FLAG(nh->flags, NEXTHOP_FLAG_RECURSIVE) &&
+			    nh->resolved) {
+				fpm_nhg_resolved_prefix(nh->resolved, &rp);
+				rvia = nh->resolved->resolved_via;
+			}
+			child = fpm_nhg_get_leaf(t, nh, &rp, nh->vrf_id, rvia,
+						 newq);
 			if (!child)
 				return -1;
 		} else if (CHECK_FLAG(nh->flags, NEXTHOP_FLAG_RECURSIVE)) {
@@ -780,7 +832,7 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 			/* only a member that contributed makes the group recursive */
 			*any_recursive = true;
 		} else {
-			child = fpm_nhg_get_leaf(t, nh, newq);
+			child = fpm_nhg_get_leaf(t, nh, NULL, 0, 0, newq);
 			if (!child)
 				return -1;
 		}
@@ -818,6 +870,9 @@ fpm_nhg_group_new(struct fpm_nhg_tables *t,
 	if (key->level == FPM_NHG_L_B) {
 		obj->resolved_prefix = *key->resolved;
 		obj->vrf_id = key->vrf_id;
+		/* resolving NHG id lives on the resolved children, not the parent */
+		if (defining_nh && defining_nh->resolved)
+			obj->resolved_via = defining_nh->resolved->resolved_via;
 	}
 	obj->num_children = key->count;
 	obj->children = children; /* ownership transferred, sorted */
@@ -890,6 +945,24 @@ fpm_nhg_build_group(struct fpm_nhg_tables *t, const struct nexthop *chain,
 	 * ever sets RECEIVED.
 	 */
 	key.nhg_flags = (level == FPM_NHG_L_B ? FPM_NHG_FLAG_RECURSIVE : 0);
+	/*
+	 * A group over SRv6 members is itself a "received" group: fpmsyncd
+	 * needs RECEIVED next to the SRv6 info to build the PIC context object
+	 * for it (checkNeedCreateSonicPICObj()). Only SRv6 leaves ever carry
+	 * RECEIVED, so a plain-IP group still comes out flagless as D14
+	 * requires. Set before hashing — nhg_flags is part of group identity.
+	 */
+	if (level == FPM_NHG_L_A) {
+		uint16_t c;
+
+		for (c = 0; c < n; c++) {
+			if (children[c].obj->nhg_flags &
+			    FPM_NHG_FLAG_RECEIVED) {
+				key.nhg_flags |= FPM_NHG_FLAG_RECEIVED;
+				break;
+			}
+		}
+	}
 	key.children = children;
 	key.count = n;
 	key.resolved = (level == FPM_NHG_L_B) ? resolved : NULL;
@@ -1050,12 +1123,22 @@ struct fpm_dplane_nhg *fpm_nhg_route_get(struct fpm_nhg_tables *t,
 
 void fpm_nhg_route_set(struct fpm_nhg_tables *t,
 		       const struct fpm_nhg_route_key *k,
-		       struct fpm_dplane_nhg *obj)
+		       struct fpm_dplane_nhg *obj, uint32_t rib_id)
 {
 	struct fpm_nhg_route_entry ref = { .key = *k }, *e;
 
 	e = hash_get(t->route_map, &ref, fpm_nhg_route_entry_alloc);
+	/*
+	 * Release whatever this route mapped before overwriting it, otherwise
+	 * a re-pointed or re-numbered route would leak its old association and
+	 * the object would keep advertising a stale zebra NHG id.
+	 */
+	if (e->obj && (e->obj != obj || e->rib_id != rib_id))
+		fpm_nhg_release_rib_id(t, e->obj, e->rib_id);
+
 	e->obj = obj; /* replaces any previous object: caller unrefs the old */
+	e->rib_id = rib_id;
+	fpm_nhg_record_rib_id(t, obj, rib_id);
 }
 
 struct fpm_dplane_nhg *fpm_nhg_route_pop(struct fpm_nhg_tables *t,
@@ -1068,6 +1151,7 @@ struct fpm_dplane_nhg *fpm_nhg_route_pop(struct fpm_nhg_tables *t,
 	if (!e)
 		return NULL;
 	obj = e->obj;
+	fpm_nhg_release_rib_id(t, obj, e->rib_id);
 	XFREE(MTYPE_FPM_NHG, e);
 	return obj;
 }
@@ -1132,7 +1216,55 @@ void fpm_nhg_record_rib_id(struct fpm_nhg_tables *t,
 	 * the route event just processed is the current mapping.
 	 */
 	e = hash_get(t->by_rib_id, &ref, fpm_nhg_rib_entry_alloc);
-	e->obj = obj;
+	if (e->obj != obj) {
+		/* re-pointed at a different object: the old one keeps the id in
+		 * its own list until its last route releases it below.
+		 */
+		e->obj = obj;
+		e->refcount = 0;
+	}
+	e->refcount++;
+}
+
+/*
+ * Undo one fpm_nhg_record_rib_id(): the route that established this
+ * (rib id -> obj) mapping is gone or has re-pointed. On the last release the
+ * index entry goes away and the id is dropped from the object's own list, so
+ * `show fpm nhg-fib` never reports a zebra NHG that no longer refers here.
+ */
+void fpm_nhg_release_rib_id(struct fpm_nhg_tables *t,
+			    struct fpm_dplane_nhg *obj, uint32_t rib_id)
+{
+	struct fpm_nhg_rib_entry ref = { .rib_id = rib_id }, *e;
+	uint16_t i;
+
+	if (rib_id == 0 || obj == NULL)
+		return;
+
+	e = hash_lookup(t->by_rib_id, &ref);
+	if (e && e->obj == obj) {
+		if (e->refcount > 0)
+			e->refcount--;
+		if (e->refcount == 0) {
+			hash_release(t->by_rib_id, &ref);
+			XFREE(MTYPE_FPM_NHG, e);
+		} else {
+			/* still referenced by another route: keep the id */
+			return;
+		}
+	} else if (e) {
+		/* another object owns the mapping now; only drop our own list */
+	}
+
+	for (i = 0; i < obj->rib_nhg_id_count; i++) {
+		if (obj->rib_nhg_ids[i] != rib_id)
+			continue;
+		memmove(&obj->rib_nhg_ids[i], &obj->rib_nhg_ids[i + 1],
+			(obj->rib_nhg_id_count - i - 1) *
+				sizeof(*obj->rib_nhg_ids));
+		obj->rib_nhg_id_count--;
+		break;
+	}
 }
 
 struct fpm_dplane_nhg *fpm_nhg_lookup_rib_id(struct fpm_nhg_tables *t,

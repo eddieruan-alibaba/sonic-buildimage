@@ -832,6 +832,8 @@ static void fpm_nhg_show_obj(const struct fpm_dplane_nhg *obj, void *arg)
 			snprintfrr(pbuf, sizeof(pbuf), "%pFX",
 				   &obj->resolved_prefix);
 			json_object_string_add(jo, "resolvedVia", pbuf);
+			json_object_int_add(jo, "resolvingRibNhgId",
+					    obj->resolved_via);
 		}
 		json_object_int_add(jo, "vrfId", obj->vrf_id);
 
@@ -851,8 +853,8 @@ static void fpm_nhg_show_obj(const struct fpm_dplane_nhg *obj, void *arg)
 		obj->refcount, hashbuf);
 
 	if (obj->resolved_prefix.family != AF_UNSPEC)
-		vty_out(vty, "  resolved via %pFX vrf %u\n",
-			&obj->resolved_prefix, obj->vrf_id);
+		vty_out(vty, "  resolved via %pFX vrf %u rib nhg %u\n",
+			&obj->resolved_prefix, obj->vrf_id, obj->resolved_via);
 
 	if (obj->num_children) {
 		vty_out(vty, "  children:");
@@ -897,6 +899,7 @@ static void fpm_nhg_show_obj(const struct fpm_dplane_nhg *obj, void *arg)
 struct fpm_nhg_rv_entry {
 	struct prefix p;
 	vrf_id_t vrf_id;
+	uint32_t resolved_via; /* zebra NHG id of the resolution, 0 if unknown */
 	uint32_t dplane_id;
 };
 
@@ -919,11 +922,17 @@ static void fpm_nhg_rv_collect_cb(const struct fpm_dplane_nhg *obj, void *arg)
 	}
 	c->ents[c->count].p = obj->resolved_prefix;
 	c->ents[c->count].vrf_id = obj->vrf_id;
+	c->ents[c->count].resolved_via = obj->resolved_via;
 	c->ents[c->count].dplane_id = obj->dplane_id;
 	c->count++;
 }
 
-/* Group key is (vrf, prefix); dplane id only orders within a group. */
+/*
+ * Group key is (vrf, prefix, resolving NHG id); dplane id only orders within a
+ * group. The resolving id is part of the key so a prefix that is reached
+ * through two different resolutions is reported as two rows rather than one
+ * misleading merged row.
+ */
 static int fpm_nhg_rv_cmp(const void *a, const void *b)
 {
 	const struct fpm_nhg_rv_entry *ea = a, *eb = b;
@@ -934,6 +943,8 @@ static int fpm_nhg_rv_cmp(const void *a, const void *b)
 	rv = prefix_cmp(&ea->p, &eb->p);
 	if (rv != 0)
 		return rv;
+	if (ea->resolved_via != eb->resolved_via)
+		return ea->resolved_via < eb->resolved_via ? -1 : 1;
 	if (ea->dplane_id != eb->dplane_id)
 		return ea->dplane_id < eb->dplane_id ? -1 : 1;
 	return 0;
@@ -944,6 +955,8 @@ static void fpm_nhg_show_resolved_via(struct vty *vty,
 {
 	struct fpm_nhg_rv_collect c = {};
 	char pbuf[PREFIX_STRLEN];
+	char viabuf[32];
+	const struct fpm_dplane_nhg *via_obj;
 	uint32_t i, j, k;
 
 	fpm_nhg_walk(&gfnc->nhg_tables, fpm_nhg_rv_collect_cb, &c);
@@ -955,18 +968,29 @@ static void fpm_nhg_show_resolved_via(struct vty *vty,
 	qsort(c.ents, c.count, sizeof(*c.ents), fpm_nhg_rv_cmp);
 
 	if (!jarray)
-		vty_out(vty, "%-44s %-5s %s\n", "Resolving prefix", "VRF",
-			"Dplane NHG ids");
+		vty_out(vty, "%-40s %-4s %-14s %s\n", "Resolving prefix",
+			"VRF", "Via rib>dplane", "Dplane NHG ids");
 
 	for (i = 0; i < c.count; i = j) {
 		/* collapse the run of entries sharing this (vrf, prefix) */
 		for (j = i + 1; j < c.count; j++) {
 			if (c.ents[j].vrf_id != c.ents[i].vrf_id ||
+			    c.ents[j].resolved_via != c.ents[i].resolved_via ||
 			    prefix_cmp(&c.ents[j].p, &c.ents[i].p) != 0)
 				break;
 		}
 
 		snprintfrr(pbuf, sizeof(pbuf), "%pFX", &c.ents[i].p);
+
+		/*
+		 * Map the resolving zebra NHG id onto its dplane object: that
+		 * object is the resolution shared by every id in this row, and
+		 * therefore the handle a PIC-style repair would re-point at.
+		 */
+		via_obj = c.ents[i].resolved_via
+				  ? fpm_nhg_lookup_rib_id(&gfnc->nhg_tables,
+							  c.ents[i].resolved_via)
+				  : NULL;
 
 		if (jarray) {
 			struct json_object *jo = json_object_new_object();
@@ -974,6 +998,11 @@ static void fpm_nhg_show_resolved_via(struct vty *vty,
 
 			json_object_string_add(jo, "resolvedVia", pbuf);
 			json_object_int_add(jo, "vrfId", c.ents[i].vrf_id);
+			json_object_int_add(jo, "resolvingRibNhgId",
+					    c.ents[i].resolved_via);
+			if (via_obj)
+				json_object_int_add(jo, "resolvingDplaneId",
+						    via_obj->dplane_id);
 			for (k = i; k < j; k++)
 				json_object_array_add(
 					jids,
@@ -982,7 +1011,18 @@ static void fpm_nhg_show_resolved_via(struct vty *vty,
 			json_object_object_add(jo, "dplaneIds", jids);
 			json_object_array_add(jarray, jo);
 		} else {
-			vty_out(vty, "%-44s %-5u", pbuf, c.ents[i].vrf_id);
+			if (c.ents[i].resolved_via == 0)
+				snprintf(viabuf, sizeof(viabuf), "-");
+			else if (via_obj)
+				snprintf(viabuf, sizeof(viabuf), "%u>%u",
+					 c.ents[i].resolved_via,
+					 via_obj->dplane_id);
+			else
+				snprintf(viabuf, sizeof(viabuf), "%u>?",
+					 c.ents[i].resolved_via);
+
+			vty_out(vty, "%-40s %-4u %-14s", pbuf,
+				c.ents[i].vrf_id, viabuf);
 			for (k = i; k < j; k++)
 				vty_out(vty, " %u", c.ents[k].dplane_id);
 			vty_out(vty, "\n");
@@ -3686,10 +3726,9 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	if (op == DPLANE_OP_ROUTE_DELETE) {
 		old_top = fpm_nhg_route_pop(&fnc->nhg_tables, &key);
 	} else {
-		fpm_nhg_record_rib_id(&fnc->nhg_tables, new_top,
-				      dplane_ctx_get_nhe_id(ctx));
 		old_top = fpm_nhg_route_get(&fnc->nhg_tables, &key);
-		fpm_nhg_route_set(&fnc->nhg_tables, &key, new_top);
+		fpm_nhg_route_set(&fnc->nhg_tables, &key, new_top,
+				  dplane_ctx_get_nhe_id(ctx));
 		fpm_nhg_ref(new_top);
 	}
 	/*
