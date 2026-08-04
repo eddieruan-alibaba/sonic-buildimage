@@ -51,6 +51,7 @@
 #include "zebra/zebra_dplane.h"
 #include "zebra/zebra_mpls.h"
 #include "zebra/zebra_router.h"
+#include "zebra/zebra_vrf.h"
 #include "zebra/zebra_vxlan_private.h"
 #include "zebra/kernel_netlink.h"
 #include "zebra/rt_netlink.h"
@@ -955,8 +956,6 @@ static void fpm_nhg_show_resolved_via(struct vty *vty,
 {
 	struct fpm_nhg_rv_collect c = {};
 	char pbuf[PREFIX_STRLEN];
-	char viabuf[32];
-	const struct fpm_dplane_nhg *via_obj;
 	uint32_t i, j, k;
 
 	fpm_nhg_walk(&gfnc->nhg_tables, fpm_nhg_rv_collect_cb, &c);
@@ -968,8 +967,8 @@ static void fpm_nhg_show_resolved_via(struct vty *vty,
 	qsort(c.ents, c.count, sizeof(*c.ents), fpm_nhg_rv_cmp);
 
 	if (!jarray)
-		vty_out(vty, "%-40s %-4s %-14s %s\n", "Resolving prefix",
-			"VRF", "Via rib>dplane", "Dplane NHG ids");
+		vty_out(vty, "%-40s %-4s %-12s %s\n", "Resolving prefix",
+			"VRF", "Resolved by", "Dplane NHG ids");
 
 	for (i = 0; i < c.count; i = j) {
 		/* collapse the run of entries sharing this (vrf, prefix) */
@@ -983,15 +982,14 @@ static void fpm_nhg_show_resolved_via(struct vty *vty,
 		snprintfrr(pbuf, sizeof(pbuf), "%pFX", &c.ents[i].p);
 
 		/*
-		 * Map the resolving zebra NHG id onto its dplane object: that
-		 * object is the resolution shared by every id in this row, and
-		 * therefore the handle a PIC-style repair would re-point at.
+		 * Only the resolving zebra NHG id is reported. It deliberately
+		 * is NOT translated through by_rib_id: that index is keyed by
+		 * the id a *route* reported (dplane_ctx_get_nhe_id, i.e. the
+		 * resolved NHE), and zebra_nhg_resolve() collapses several
+		 * distinct NHEs onto one such id, so more than one dplane
+		 * object can claim it and the index would answer with whichever
+		 * recorded it last — not with the resolution.
 		 */
-		via_obj = c.ents[i].resolved_via
-				  ? fpm_nhg_lookup_rib_id(&gfnc->nhg_tables,
-							  c.ents[i].resolved_via)
-				  : NULL;
-
 		if (jarray) {
 			struct json_object *jo = json_object_new_object();
 			struct json_object *jids = json_object_new_array();
@@ -1000,9 +998,6 @@ static void fpm_nhg_show_resolved_via(struct vty *vty,
 			json_object_int_add(jo, "vrfId", c.ents[i].vrf_id);
 			json_object_int_add(jo, "resolvingRibNhgId",
 					    c.ents[i].resolved_via);
-			if (via_obj)
-				json_object_int_add(jo, "resolvingDplaneId",
-						    via_obj->dplane_id);
 			for (k = i; k < j; k++)
 				json_object_array_add(
 					jids,
@@ -1011,18 +1006,13 @@ static void fpm_nhg_show_resolved_via(struct vty *vty,
 			json_object_object_add(jo, "dplaneIds", jids);
 			json_object_array_add(jarray, jo);
 		} else {
-			if (c.ents[i].resolved_via == 0)
-				snprintf(viabuf, sizeof(viabuf), "-");
-			else if (via_obj)
-				snprintf(viabuf, sizeof(viabuf), "%u>%u",
-					 c.ents[i].resolved_via,
-					 via_obj->dplane_id);
+			if (c.ents[i].resolved_via)
+				vty_out(vty, "%-40s %-4u rib %-8u", pbuf,
+					c.ents[i].vrf_id,
+					c.ents[i].resolved_via);
 			else
-				snprintf(viabuf, sizeof(viabuf), "%u>?",
-					 c.ents[i].resolved_via);
-
-			vty_out(vty, "%-40s %-4u %-14s", pbuf,
-				c.ents[i].vrf_id, viabuf);
+				vty_out(vty, "%-40s %-4u %-12s", pbuf,
+					c.ents[i].vrf_id, "-");
 			for (k = i; k < j; k++)
 				vty_out(vty, " %u", c.ents[k].dplane_id);
 			vty_out(vty, "\n");
@@ -1032,8 +1022,65 @@ static void fpm_nhg_show_resolved_via(struct vty *vty,
 	XFREE(MTYPE_TMP, c.ents);
 }
 
+/*
+ * `show fpm nhg-fib route <prefix> [vrf NAME]`: the object a specific route
+ * references, straight out of route_nhg_map.
+ *
+ * This is the only unambiguous route -> dplane id answer. Going through
+ * by-rib-id instead is unsound: that index is keyed by the id a route reported
+ * (dplane_ctx_get_nhe_id, i.e. the *resolved* NHE), and zebra_nhg_resolve()
+ * collapses several distinct NHEs onto one such id, so two routes with
+ * different trees — and therefore different dplane objects — can report the
+ * same id.
+ *
+ * The key must be built exactly as fpm_nhg_route_key_from_ctx() does, hence
+ * the table id lookup: a VRF route is keyed on that VRF's table, not on the
+ * VRF id.
+ */
+static void fpm_nhg_show_route(struct vty *vty, struct json_object *jarray,
+			       const char *prefix_str, const char *vrf_name)
+{
+	struct fpm_nhg_show_args sa = { .vty = vty, .jarray = jarray };
+	const struct fpm_dplane_nhg *obj;
+	struct fpm_nhg_route_key key;
+	struct zebra_vrf *zvrf;
+	struct prefix p;
+
+	if (str2prefix(prefix_str, &p) == 0) {
+		vty_out(vty, "%% Malformed prefix %s\n", prefix_str);
+		return;
+	}
+
+	if (vrf_name)
+		zvrf = zebra_vrf_lookup_by_name(vrf_name);
+	else
+		zvrf = zebra_vrf_lookup_by_id(VRF_DEFAULT);
+	if (zvrf == NULL) {
+		vty_out(vty, "%% VRF %s not found\n",
+			vrf_name ? vrf_name : VRF_DEFAULT_NAME);
+		return;
+	}
+
+	memset(&key, 0, sizeof(key));
+	key.table_id = zvrf->table_id;
+	key.afi = (p.family == AF_INET6) ? AFI_IP6 : AFI_IP;
+	prefix_copy(&key.p, &p);
+	/* src_p stays AF_UNSPEC: srcdest routes are not addressable here. */
+
+	obj = fpm_nhg_route_get(&gfnc->nhg_tables, &key);
+	if (obj == NULL) {
+		if (!jarray)
+			vty_out(vty, "%% No dplane NHG for %pFX in vrf %s (table %u)\n",
+				&p, vrf_name ? vrf_name : VRF_DEFAULT_NAME,
+				key.table_id);
+		return;
+	}
+
+	fpm_nhg_show_obj(obj, &sa);
+}
+
 DEFUN(fpm_show_nhg_fib, fpm_show_nhg_fib_cmd,
-      "show fpm nhg-fib [<id (1-4294967295)|by-rib-id (1-4294967295)|resolved-via>] [json]",
+      "show fpm nhg-fib [<id (1-4294967295)|by-rib-id (1-4294967295)|resolved-via|route WORD [vrf WORD]>] [json]",
       SHOW_STR
       FPM_STR
       "Dplane next hop groups derived from route events\n"
@@ -1042,11 +1089,16 @@ DEFUN(fpm_show_nhg_fib, fpm_show_nhg_fib_cmd,
       "Filter by zebra (rib) next hop group id\n"
       "Identifier\n"
       "Resolving prefix to dplane next hop group id mapping\n"
+      "Look up the object a specific route references\n"
+      "IP prefix (A.B.C.D/M or X:X::X:X/M)\n"
+      VRF_CMD_HELP_STR
+      "VRF name\n"
       JSON_STR)
 {
 	struct fpm_nhg_show_args sa = {};
 	bool json = false, filter = false, rib_filter = false;
 	bool resolved_via = false, found = true;
+	const char *route_str = NULL, *vrf_str = NULL;
 	uint32_t filter_id = 0;
 	int idx;
 
@@ -1062,7 +1114,13 @@ DEFUN(fpm_show_nhg_fib, fpm_show_nhg_fib_cmd,
 			idx++;
 		} else if (!strcmp(argv[idx]->text, "resolved-via"))
 			resolved_via = true;
-		else if (!strcmp(argv[idx]->text, "json"))
+		else if (!strcmp(argv[idx]->text, "route") && idx + 1 < argc) {
+			route_str = argv[idx + 1]->arg;
+			idx++;
+		} else if (!strcmp(argv[idx]->text, "vrf") && idx + 1 < argc) {
+			vrf_str = argv[idx + 1]->arg;
+			idx++;
+		} else if (!strcmp(argv[idx]->text, "json"))
 			json = true;
 	}
 
@@ -1085,7 +1143,9 @@ DEFUN(fpm_show_nhg_fib, fpm_show_nhg_fib_cmd,
 	 * whole walk stays inside the same critical section.
 	 */
 	frr_with_mutex (&gfnc->obuf_mutex) {
-		if (resolved_via) {
+		if (route_str) {
+			fpm_nhg_show_route(vty, sa.jarray, route_str, vrf_str);
+		} else if (resolved_via) {
 			fpm_nhg_show_resolved_via(vty, sa.jarray);
 		} else if (filter || rib_filter) {
 			const struct fpm_dplane_nhg *obj;
