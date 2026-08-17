@@ -708,36 +708,44 @@ static int fpm_nhg_child_cmp(const void *a, const void *b)
 }
 
 /*
- * The L-B resolving info (PR #19252 resolved_addr/resolved_len) participates in
- * the L-B group hash, so it is derived BEFORE recursing and passed down — never
- * patched onto the child object after hashing.
+ * The L-B resolving info (PR #19252 struct nh_res_info) participates in the L-B
+ * group hash, so it is derived BEFORE recursing and passed down — never patched
+ * onto the child object after hashing.
  *
- * zebra stamps these fields on the *resolved children*, not on the recursive
+ * zebra stamps this info on the *resolved children*, not on the recursive
  * parent: nexthop_set_resolved() (zebra/zebra_nhg.c) allocates the child,
  * appends it to parent->resolved and returns it, and get_resolving_info() then
  * writes the resolving prefix onto that child. Every child of one parent is
  * produced by a single loop over one (rn, match) pair, so they all carry the
  * same resolving prefix and the head child is representative.
+ *
+ * res_info is a heap pointer and is NULL whenever zebra recorded no resolution
+ * for this nexthop; that yields an AF_UNSPEC prefix, which the group hash
+ * already treats as "unset".
  */
 static void fpm_nhg_resolved_prefix(const struct nexthop *nh,
 				    struct prefix *p)
 {
 	/* lib ipaddr2prefix() is static in prefix.c: convert manually */
 	memset(p, 0, sizeof(*p));
-	switch (nh->resolved_addr.ipa_type) {
+	if (nh->res_info == NULL) {
+		p->family = AF_UNSPEC;
+		return;
+	}
+	switch (nh->res_info->addr.ipa_type) {
 	case IPADDR_V4:
 		p->family = AF_INET;
-		p->u.prefix4 = nh->resolved_addr.ipaddr_v4;
+		p->u.prefix4 = nh->res_info->addr.ipaddr_v4;
 		break;
 	case IPADDR_V6:
 		p->family = AF_INET6;
-		p->u.prefix6 = nh->resolved_addr.ipaddr_v6;
+		p->u.prefix6 = nh->res_info->addr.ipaddr_v6;
 		break;
 	case IPADDR_NONE:
 		p->family = AF_UNSPEC;
 		break;
 	}
-	p->prefixlen = nh->resolved_len;
+	p->prefixlen = nh->res_info->pfxlen;
 }
 
 static struct fpm_dplane_nhg *
@@ -803,7 +811,8 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 			if (CHECK_FLAG(nh->flags, NEXTHOP_FLAG_RECURSIVE) &&
 			    nh->resolved) {
 				fpm_nhg_resolved_prefix(nh->resolved, &rp);
-				rvia = nh->resolved->resolved_via;
+				if (nh->resolved->res_info)
+					rvia = nh->resolved->res_info->id;
 			}
 			child = fpm_nhg_get_leaf(t, nh, &rp, nh->vrf_id, rvia,
 						 newq);
@@ -859,11 +868,12 @@ fpm_nhg_group_new(struct fpm_nhg_tables *t,
 	/*
 	 * Defining nexthop: L-B = the recursive parent (JSON needs its
 	 * gate/type), L-A = none (JSON multi-builder walks children).
-	 * nexthop_dup_no_recurse() (lib/nexthop.h) copies scalar fields
-	 * incl. resolved_addr/len but not the ->resolved subtree — that
+	 * nexthop_dup_no_recurse() (lib/nexthop.h) copies scalar fields and
+	 * deep-copies res_info, but not the ->resolved subtree — that
 	 * subtree is already modeled as obj->children, so a recursing
 	 * dup would only waste memory. NEXTHOP_FLAG_RECURSIVE stays set
 	 * in the copy (JSON consumers use gate/type/flags only).
+	 * nexthop_free() releases the copied res_info.
 	 */
 	if (defining_nh)
 		obj->nh = nexthop_dup_no_recurse(defining_nh, NULL);
@@ -871,8 +881,9 @@ fpm_nhg_group_new(struct fpm_nhg_tables *t,
 		obj->resolved_prefix = *key->resolved;
 		obj->vrf_id = key->vrf_id;
 		/* resolving NHG id lives on the resolved children, not the parent */
-		if (defining_nh && defining_nh->resolved)
-			obj->resolved_via = defining_nh->resolved->resolved_via;
+		if (defining_nh && defining_nh->resolved &&
+		    defining_nh->resolved->res_info)
+			obj->resolved_via = defining_nh->resolved->res_info->id;
 	}
 	obj->num_children = key->count;
 	obj->children = children; /* ownership transferred, sorted */
