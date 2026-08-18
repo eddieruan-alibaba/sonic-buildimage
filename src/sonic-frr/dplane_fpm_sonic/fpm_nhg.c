@@ -712,40 +712,54 @@ static int fpm_nhg_child_cmp(const void *a, const void *b)
  * group hash, so it is derived BEFORE recursing and passed down — never patched
  * onto the child object after hashing.
  *
- * zebra stamps this info on the *resolved children*, not on the recursive
- * parent: nexthop_set_resolved() (zebra/zebra_nhg.c) allocates the child,
- * appends it to parent->resolved and returns it, and get_resolving_info() then
- * writes the resolving prefix onto that child. Every child of one parent is
- * produced by a single loop over one (rn, match) pair, so they all carry the
- * same resolving prefix and the head child is representative.
+ * zebra stamps this info on the *recursive parent*: set_resolving_info()
+ * (zebra/zebra_nhg.c) is called as set_resolving_info(nexthop, rn, match) right
+ * after nexthop_set_resolved() allocated the child, i.e. with the parent, and
+ * "show nexthop rib" prints "res via" on the recursive line for that reason.
  *
- * res_info is a heap pointer and is NULL whenever zebra recorded no resolution
- * for this nexthop; that yields an AF_UNSPEC prefix, which the group hash
- * already treats as "unset".
+ * An earlier revision of the same upstream PR passed the freshly allocated
+ * child instead, so the head child is checked as a fallback: getting this
+ * backwards silently empties every resolving prefix (the resolved-via view
+ * then reports nothing), which is expensive to notice. Both placements agree
+ * on the value, since one (rn, match) pair produces the whole child list.
+ *
+ * res_info is a heap pointer and is NULL whenever zebra recorded no resolution;
+ * that yields an AF_UNSPEC prefix, which the group hash treats as "unset".
  */
+static const struct nh_res_info *fpm_nhg_res_info(const struct nexthop *nh)
+{
+	if (nh->res_info)
+		return nh->res_info;
+	if (nh->resolved && nh->resolved->res_info)
+		return nh->resolved->res_info;
+	return NULL;
+}
+
 static void fpm_nhg_resolved_prefix(const struct nexthop *nh,
 				    struct prefix *p)
 {
+	const struct nh_res_info *info = fpm_nhg_res_info(nh);
+
 	/* lib ipaddr2prefix() is static in prefix.c: convert manually */
 	memset(p, 0, sizeof(*p));
-	if (nh->res_info == NULL) {
+	if (info == NULL) {
 		p->family = AF_UNSPEC;
 		return;
 	}
-	switch (nh->res_info->addr.ipa_type) {
+	switch (info->addr.ipa_type) {
 	case IPADDR_V4:
 		p->family = AF_INET;
-		p->u.prefix4 = nh->res_info->addr.ipaddr_v4;
+		p->u.prefix4 = info->addr.ipaddr_v4;
 		break;
 	case IPADDR_V6:
 		p->family = AF_INET6;
-		p->u.prefix6 = nh->res_info->addr.ipaddr_v6;
+		p->u.prefix6 = info->addr.ipaddr_v6;
 		break;
 	case IPADDR_NONE:
 		p->family = AF_UNSPEC;
 		break;
 	}
-	p->prefixlen = nh->res_info->pfxlen;
+	p->prefixlen = info->pfxlen;
 }
 
 static struct fpm_dplane_nhg *
@@ -810,9 +824,12 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 			rvia = 0;
 			if (CHECK_FLAG(nh->flags, NEXTHOP_FLAG_RECURSIVE) &&
 			    nh->resolved) {
-				fpm_nhg_resolved_prefix(nh->resolved, &rp);
-				if (nh->resolved->res_info)
-					rvia = nh->resolved->res_info->id;
+				const struct nh_res_info *info;
+
+				fpm_nhg_resolved_prefix(nh, &rp);
+				info = fpm_nhg_res_info(nh);
+				if (info)
+					rvia = info->id;
 			}
 			child = fpm_nhg_get_leaf(t, nh, &rp, nh->vrf_id, rvia,
 						 newq);
@@ -821,7 +838,7 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 		} else if (CHECK_FLAG(nh->flags, NEXTHOP_FLAG_RECURSIVE)) {
 			if (!nh->resolved)
 				continue; /* unresolved: not installable */
-			fpm_nhg_resolved_prefix(nh->resolved, &rp);
+			fpm_nhg_resolved_prefix(nh, &rp);
 			staged = newq->count;
 			child = fpm_nhg_build_group(t, nh->resolved,
 						    FPM_NHG_L_B, nh, &rp,
@@ -880,10 +897,16 @@ fpm_nhg_group_new(struct fpm_nhg_tables *t,
 	if (key->level == FPM_NHG_L_B) {
 		obj->resolved_prefix = *key->resolved;
 		obj->vrf_id = key->vrf_id;
-		/* resolving NHG id lives on the resolved children, not the parent */
-		if (defining_nh && defining_nh->resolved &&
-		    defining_nh->resolved->res_info)
-			obj->resolved_via = defining_nh->resolved->res_info->id;
+		/* resolving NHG id lives on the recursive parent (see
+		 * fpm_nhg_res_info(), which also tolerates the child)
+		 */
+		if (defining_nh) {
+			const struct nh_res_info *info =
+				fpm_nhg_res_info(defining_nh);
+
+			if (info)
+				obj->resolved_via = info->id;
+		}
 	}
 	obj->num_children = key->count;
 	obj->children = children; /* ownership transferred, sorted */
