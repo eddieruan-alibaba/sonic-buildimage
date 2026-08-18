@@ -858,7 +858,23 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 			/* only a member that contributed makes the group recursive */
 			*any_recursive = true;
 		} else {
-			child = fpm_nhg_get_leaf(t, nh, NULL, 0, 0, newq);
+			const struct nh_res_info *info;
+
+			/*
+			 * A leaf resolves too: zebra stamps the connected
+			 * prefix it was reached through (e.g. "res via
+			 * fc06::/120"), so record it rather than dropping it.
+			 * Identity is unaffected — resolved_prefix is not in
+			 * the leaf key — and nothing here reaches the wire.
+			 */
+			memset(&rp, 0, sizeof(rp));
+			rvia = 0;
+			fpm_nhg_resolved_prefix(nh, &rp);
+			info = fpm_nhg_res_info(nh);
+			if (info)
+				rvia = info->id;
+			child = fpm_nhg_get_leaf(t, nh, &rp, nh->vrf_id, rvia,
+						 newq);
 			if (!child)
 				return -1;
 		}
