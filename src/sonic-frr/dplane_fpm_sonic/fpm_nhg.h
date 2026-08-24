@@ -255,4 +255,7 @@ typedef void (*fpm_nhg_walk_cb)(const struct fpm_dplane_nhg *obj, void *arg);
 void fpm_nhg_walk(struct fpm_nhg_tables *t, fpm_nhg_walk_cb cb, void *arg);
 uint32_t fpm_nhg_count(struct fpm_nhg_tables *t);
 
+/* Level of a derived dplane NHG object, as shown by `show fpm nhg-fib`. */
+const char *fpm_nhg_level_str(uint8_t level);
+
 #endif /* _FPM_NHG_H */

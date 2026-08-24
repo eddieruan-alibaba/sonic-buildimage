@@ -31,10 +31,36 @@
 #include "lib/mpls.h"
 #include "lib/srv6.h"
 #include "zebra/rib.h" /* DECLARE_MGROUP(ZEBRA) */
+#include "zebra/debug.h" /* IS_ZEBRA_DEBUG_FPM */
 
 #include "zebra/fpm_nhg.h"
 
 DEFINE_MTYPE_STATIC(ZEBRA, FPM_NHG, "FPM dplane nexthop group");
+
+/*
+ * All object lifecycle tracing goes through here so a single `debug zebra fpm`
+ * turns the whole dplane NHG layer verbose, and so no call site pays for
+ * argument formatting while the flag is off.
+ */
+#define FPM_NHG_DEBUG(...)                                                     \
+	do {                                                                   \
+		if (IS_ZEBRA_DEBUG_FPM)                                        \
+			zlog_debug("nhg-fib: " __VA_ARGS__);                    \
+	} while (0)
+
+const char *fpm_nhg_level_str(uint8_t level)
+{
+	switch (level) {
+	case FPM_NHG_L_C:
+		return "L-C";
+	case FPM_NHG_L_B:
+		return "L-B";
+	case FPM_NHG_L_A:
+		return "L-A";
+	default:
+		return "L-?";
+	}
+}
 
 /* Bytes per encoded group member: child hash u64 + weight u16 BE */
 #define FPM_NHG_CHILD_ENC_LEN 10
@@ -386,6 +412,10 @@ static void fpm_nhg_resolved_add(struct fpm_nhg_tables *t,
 				   b->cap * sizeof(*b->objs));
 	}
 	b->objs[b->count++] = obj;
+
+	FPM_NHG_DEBUG("resolved-index add %pFX vrf %u -> dplane NHG %u (%s), bucket now %u",
+		      &obj->resolved_prefix, obj->vrf_id, obj->dplane_id,
+		      fpm_nhg_level_str(obj->level), b->count);
 }
 
 /*
@@ -413,6 +443,9 @@ static void fpm_nhg_resolved_del_key(struct fpm_nhg_tables *t, vrf_id_t vrf_id,
 		if (b->objs[i] != obj)
 			continue;
 		b->objs[i] = b->objs[--b->count];
+		FPM_NHG_DEBUG("resolved-index del %pFX vrf %u -> dplane NHG %u (%s), bucket now %u",
+			      p, vrf_id, obj->dplane_id,
+			      fpm_nhg_level_str(obj->level), b->count);
 		break;
 	}
 
@@ -538,6 +571,8 @@ static void fpm_nhg_route_entry_free(void *data)
 
 void fpm_nhg_tables_flush(struct fpm_nhg_tables *t)
 {
+	FPM_NHG_DEBUG("flush: discarding %u dplane NHG object(s) and every binding",
+		      fpm_nhg_count(t));
 	/*
 	 * Objects live in both tables: empty by_id without freeing, then
 	 * free each object once via by_hash. The tables themselves are
@@ -685,6 +720,10 @@ static struct fpm_dplane_nhg *fpm_nhg_obj_new(struct fpm_nhg_tables *t,
 	fpm_nhg_insert(t, obj);
 	fpm_nhg_staging_push(newq, obj);
 	t->obj_created++;
+	FPM_NHG_DEBUG("create dplane NHG %u (%s) hash %" PRIx64
+		      ", staged, %" PRIu64 " object(s) live",
+		      obj->dplane_id, fpm_nhg_level_str(level), hash,
+		      t->obj_created - t->obj_deleted);
 	return obj;
 }
 
@@ -724,6 +763,9 @@ static struct fpm_dplane_nhg *fpm_nhg_get_leaf(struct fpm_nhg_tables *t,
 	obj = fpm_nhg_probe(t, &hash, fpm_nhg_leaf_match, nh);
 	if (obj) {
 		t->dedupe_hits++;
+		FPM_NHG_DEBUG("reuse leaf dplane NHG %u hash %" PRIx64
+			      ", refcount %u",
+			      obj->dplane_id, hash, obj->refcount);
 		/*
 		 * Refresh the resolving info on reuse. An equal leaf key means
 		 * the same gate, so the caller's values describe this object's
@@ -734,6 +776,13 @@ static struct fpm_dplane_nhg *fpm_nhg_get_leaf(struct fpm_nhg_tables *t,
 		 * reaches the wire, so no message follows from the update.
 		 */
 		if (resolved && resolved->family != AF_UNSPEC) {
+			if (obj->resolved_prefix.family != AF_UNSPEC &&
+			    (obj->vrf_id != resolved_vrf ||
+			     !prefix_same(&obj->resolved_prefix, resolved)))
+				FPM_NHG_DEBUG("leaf dplane NHG %u re-resolved: %pFX vrf %u -> %pFX vrf %u",
+					      obj->dplane_id,
+					      &obj->resolved_prefix, obj->vrf_id,
+					      resolved, resolved_vrf);
 			/*
 			 * The refresh can move this leaf to a different
 			 * resolving prefix, so the index entry moves with it.
@@ -1064,6 +1113,19 @@ fpm_nhg_group_new(struct fpm_nhg_tables *t,
 	obj->children = children; /* ownership transferred, sorted */
 	for (i = 0; i < key->count; i++)
 		fpm_nhg_ref(children[i].obj);
+
+	if (IS_ZEBRA_DEBUG_FPM) {
+		for (i = 0; i < key->count; i++)
+			zlog_debug("nhg-fib: group dplane NHG %u (%s) member %u/%u: dplane NHG %u weight %u",
+				   obj->dplane_id,
+				   fpm_nhg_level_str(obj->level), i + 1,
+				   key->count, children[i].obj->dplane_id,
+				   children[i].weight);
+		if (key->level == FPM_NHG_L_B)
+			zlog_debug("nhg-fib: group dplane NHG %u resolves via %pFX vrf %u (rib nhg %u)",
+				   obj->dplane_id, &obj->resolved_prefix,
+				   obj->vrf_id, obj->resolved_via);
+	}
 	return obj;
 }
 
@@ -1159,6 +1221,10 @@ fpm_nhg_build_group(struct fpm_nhg_tables *t, const struct nexthop *chain,
 	if (obj) {
 		/* cache hit stops recursion: no message, no new refs */
 		t->dedupe_hits++;
+		FPM_NHG_DEBUG("reuse group dplane NHG %u (%s) hash %" PRIx64
+			      ", %u member(s), refcount %u",
+			      obj->dplane_id, fpm_nhg_level_str(level), hash, n,
+			      obj->refcount);
 		XFREE(MTYPE_FPM_NHG, children);
 		return obj;
 	}
@@ -1180,6 +1246,8 @@ struct fpm_dplane_nhg *fpm_nhg_build(struct fpm_nhg_tables *t,
 void fpm_nhg_ref(struct fpm_dplane_nhg *obj)
 {
 	obj->refcount++;
+	FPM_NHG_DEBUG("ref dplane NHG %u (%s), refcount %u", obj->dplane_id,
+		      fpm_nhg_level_str(obj->level), obj->refcount);
 }
 
 /*
@@ -1197,9 +1265,14 @@ void fpm_nhg_rollback(struct fpm_nhg_tables *t, struct fpm_nhg_staging *newq)
 	uint32_t i;
 	uint16_t c;
 
+	FPM_NHG_DEBUG("rollback: destroying %u newly created object(s)",
+		      newq->count);
+
 	for (i = newq->count; i > 0; i--) {
 		obj = newq->objs[i - 1];
 		assert(obj->refcount == 0);
+		FPM_NHG_DEBUG("rollback: destroy dplane NHG %u (%s)",
+			      obj->dplane_id, fpm_nhg_level_str(obj->level));
 		for (c = 0; c < obj->num_children; c++) {
 			assert(obj->children[c].obj->refcount > 0);
 			obj->children[c].obj->refcount--;
@@ -1270,8 +1343,16 @@ void fpm_nhg_unref(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj,
 	uint16_t i;
 
 	assert(obj->refcount > 0);
-	if (--obj->refcount > 0)
+	if (--obj->refcount > 0) {
+		FPM_NHG_DEBUG("unref dplane NHG %u (%s), refcount %u",
+			      obj->dplane_id, fpm_nhg_level_str(obj->level),
+			      obj->refcount);
 		return;
+	}
+
+	FPM_NHG_DEBUG("unref dplane NHG %u (%s), last reference: staging DEL and destroying, %u child(ren) to follow",
+		      obj->dplane_id, fpm_nhg_level_str(obj->level),
+		      obj->num_children);
 
 	fpm_nhg_del_queue_push(delq, obj->dplane_id);
 	for (i = 0; i < obj->num_children; i++)
@@ -1322,6 +1403,15 @@ void fpm_nhg_route_set(struct fpm_nhg_tables *t,
 	if (e->obj && (e->obj != obj || e->rib_id != rib_id))
 		fpm_nhg_release_rib_id(t, e->obj, e->rib_id);
 
+	if (e->obj == NULL)
+		FPM_NHG_DEBUG("bind route %pFX table %u -> dplane NHG %u (%s), rib nhg %u",
+			      &k->p, k->table_id, obj->dplane_id,
+			      fpm_nhg_level_str(obj->level), rib_id);
+	else if (e->obj != obj || e->rib_id != rib_id)
+		FPM_NHG_DEBUG("rebind route %pFX table %u: dplane NHG %u (rib nhg %u) -> dplane NHG %u (rib nhg %u)",
+			      &k->p, k->table_id, e->obj->dplane_id, e->rib_id,
+			      obj->dplane_id, rib_id);
+
 	e->obj = obj; /* replaces any previous object: caller unrefs the old */
 	e->rib_id = rib_id;
 	fpm_nhg_record_rib_id(t, obj, rib_id);
@@ -1337,6 +1427,8 @@ struct fpm_dplane_nhg *fpm_nhg_route_pop(struct fpm_nhg_tables *t,
 	if (!e)
 		return NULL;
 	obj = e->obj;
+	FPM_NHG_DEBUG("unbind route %pFX table %u from dplane NHG %u, rib nhg %u",
+		      &k->p, k->table_id, obj ? obj->dplane_id : 0, e->rib_id);
 	fpm_nhg_release_rib_id(t, obj, e->rib_id);
 	XFREE(MTYPE_FPM_NHG, e);
 	return obj;
@@ -1394,6 +1486,10 @@ void fpm_nhg_record_rib_id(struct fpm_nhg_tables *t,
 						 sizeof(*obj->rib_nhg_ids));
 		}
 		obj->rib_nhg_ids[obj->rib_nhg_id_count++] = rib_id;
+		FPM_NHG_DEBUG("record rib nhg %u on dplane NHG %u (%s), %u id(s) mapped",
+			      rib_id, obj->dplane_id,
+			      fpm_nhg_level_str(obj->level),
+			      obj->rib_nhg_id_count);
 	}
 
 	/*
@@ -1403,6 +1499,9 @@ void fpm_nhg_record_rib_id(struct fpm_nhg_tables *t,
 	 */
 	e = hash_get(t->by_rib_id, &ref, fpm_nhg_rib_entry_alloc);
 	if (e->obj != obj) {
+		if (e->obj)
+			FPM_NHG_DEBUG("rib nhg %u re-pointed: dplane NHG %u -> dplane NHG %u",
+				      rib_id, e->obj->dplane_id, obj->dplane_id);
 		/* re-pointed at a different object: the old one keeps the id in
 		 * its own list until its last route releases it below.
 		 */
@@ -1449,6 +1548,10 @@ void fpm_nhg_release_rib_id(struct fpm_nhg_tables *t,
 			(obj->rib_nhg_id_count - i - 1) *
 				sizeof(*obj->rib_nhg_ids));
 		obj->rib_nhg_id_count--;
+		FPM_NHG_DEBUG("release rib nhg %u from dplane NHG %u (%s), %u id(s) left",
+			      rib_id, obj->dplane_id,
+			      fpm_nhg_level_str(obj->level),
+			      obj->rib_nhg_id_count);
 		break;
 	}
 }

@@ -585,21 +585,6 @@ static const char *fpm_nhg_mode_str(const struct fpm_nl_ctx *fnc)
 	return "plain";
 }
 
-/* Level of a derived dplane NHG object, as shown by `show fpm nhg-fib`. */
-static const char *fpm_nhg_level_str(uint8_t level)
-{
-	switch (level) {
-	case FPM_NHG_L_C:
-		return "L-C";
-	case FPM_NHG_L_B:
-		return "L-B";
-	case FPM_NHG_L_A:
-		return "L-A";
-	default:
-		return "L-?";
-	}
-}
-
 DEFUN(fpm_show_status,
       fpm_show_status_cmd,
       "show fpm status [json]$json",
@@ -3581,22 +3566,22 @@ static void fpm_nhg_rv_probe_route(struct fpm_nl_ctx *fnc,
 	if (b == NULL)
 		return;
 
-	if (!IS_ZEBRA_DEBUG_FPM)
-		return;
-
-	zlog_debug("nhg-fib backwalk: %s %pFX vrf %u is a resolving prefix for %u dplane NHG(s), trigger not wired yet",
-		   dplane_op2str(op), p, vrf_id, b->count);
+	if (IS_ZEBRA_DEBUG_FPM)
+		zlog_debug("nhg-fib backwalk: %s %pFX vrf %u is a resolving prefix for %u dplane NHG(s), trigger not wired yet",
+			   dplane_op2str(op), p, vrf_id, b->count);
 
 	for (i = 0; i < b->count; i++) {
 		const struct fpm_dplane_nhg *obj = b->objs[i];
 
-		if (obj->nh)
-			nexthop2str(obj->nh, nhbuf, sizeof(nhbuf));
-		else
-			strlcpy(nhbuf, "(none)", sizeof(nhbuf));
+		if (IS_ZEBRA_DEBUG_FPM) {
+			if (obj->nh)
+				nexthop2str(obj->nh, nhbuf, sizeof(nhbuf));
+			else
+				strlcpy(nhbuf, "(none)", sizeof(nhbuf));
 
-		zlog_debug("nhg-fib backwalk:   dplane NHG %u (rib nhg %u), nexthop %s",
-			   obj->dplane_id, obj->resolved_via, nhbuf);
+			zlog_debug("nhg-fib backwalk:   dplane NHG %u (rib nhg %u), nexthop %s",
+				   obj->dplane_id, obj->resolved_via, nhbuf);
+		}
 	}
 }
 
