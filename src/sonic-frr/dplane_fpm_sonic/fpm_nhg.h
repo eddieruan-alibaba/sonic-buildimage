@@ -97,6 +97,11 @@ struct fpm_nhg_tables {
 	struct hash *by_id;
 	struct hash *route_map; /* fpm_nhg_route_key -> top (L-A) object */
 	struct hash *by_rib_id; /* zebra NHG id -> object (reverse index) */
+	/*
+	 * (vrf, resolving prefix) -> the objects that resolved through it; see
+	 * struct fpm_nhg_resolved_bucket.
+	 */
+	struct hash *by_resolved;
 	uint32_t next_id;
 	uint32_t *free_ids;
 	uint32_t free_id_count, free_id_cap;
@@ -198,6 +203,43 @@ void fpm_nhg_release_rib_id(struct fpm_nhg_tables *t,
 /* Reverse lookup: zebra NHG id -> dplane object, NULL when unmapped. */
 struct fpm_dplane_nhg *fpm_nhg_lookup_rib_id(struct fpm_nhg_tables *t,
 					     uint32_t rib_id);
+
+/*
+ * Resolving-prefix index: (vrf, resolving prefix) -> every live dplane NHG
+ * object that resolved through that prefix. The dplane-side equivalent of
+ * zebra's NHT registration list, and the reason a route event can find its
+ * blast radius with one hash probe instead of a table scan.
+ *
+ * Maintained wherever obj->resolved_prefix is set: on object creation, on the
+ * leaf dedupe refresh that can re-point a resolution, and on object removal
+ * (fpm_nhg_remove(), which every destruction path goes through). Objects
+ * without a resolving prefix are not indexed, so the table is bounded by the
+ * number of distinct resolving prefixes rather than by the object count.
+ *
+ * Like route_map and by_rib_id, a bucket holds borrowed object pointers and
+ * takes no refcount; every object is unindexed before it is freed.
+ */
+struct fpm_nhg_resolved_bucket {
+	vrf_id_t vrf_id;
+	struct prefix p;
+	struct fpm_dplane_nhg **objs;
+	/*
+	 * Same growth rule as the other arrays here: cap doubles from 8 only
+	 * when count reaches it. count is the number of objects resolving
+	 * through one prefix, bounded by the live object count.
+	 */
+	uint32_t count, cap;
+};
+
+/*
+ * Every object resolving through (vrf_id, p), or NULL when none does. The
+ * bucket is owned by the tables and is invalidated by the next object
+ * creation or removal, so it must be consumed before the tables are touched
+ * again.
+ */
+const struct fpm_nhg_resolved_bucket *
+fpm_nhg_resolved_lookup(struct fpm_nhg_tables *t, vrf_id_t vrf_id,
+			const struct prefix *p);
 
 /*
  * Show helpers (design D13).

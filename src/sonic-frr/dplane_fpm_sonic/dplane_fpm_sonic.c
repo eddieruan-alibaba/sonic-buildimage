@@ -3549,77 +3549,55 @@ static void fpm_nhg_pending_dels_flush_locked(struct fpm_nl_ctx *fnc,
  * Debug probe for the resolving-prefix backwalk: the dplane-side replay of
  * zebra's NHT.
  *
- * A route event whose prefix is the resolving prefix of a live dplane NHG is
- * the signal that will eventually make fpmsyncd backwalk — on DELETE the
- * resolution is gone and the peer has to converge away from it, on
- * INSTALL/UPDATE it has to repair the resolution against the new route. No
- * trigger message is generated yet; the match is only logged so the wire
+ * A route event whose prefix is a resolving prefix in the index is the signal
+ * that will eventually make fpmsyncd backwalk — on DELETE the resolution is
+ * gone and the peer has to converge away from it, on INSTALL/UPDATE it has to
+ * repair the resolution against the new route. The objects to act on are
+ * exactly the bucket's contents; for now they are only logged, so the wire
  * signal can be designed against observed behaviour.
  *
  * Only an exact prefix match is reported. A more specific route taking over as
  * the resolver is a separate case that zebra re-resolves itself, and it is
  * deliberately outside this probe.
  *
- * The match is a full object walk, hence gated on IS_ZEBRA_DEBUG_FPM: it costs
- * nothing until FPM debugging is turned on. The real trigger cannot reuse the
- * walk — it needs the dedicated resolving-prefix index.
- */
-struct fpm_nhg_rv_probe {
-	const struct prefix *p;
-	vrf_id_t vrf_id;
-	const char *op;
-	uint32_t hits;
-};
-
-static void fpm_nhg_rv_probe_cb(const struct fpm_dplane_nhg *obj, void *arg)
-{
-	struct fpm_nhg_rv_probe *pr = arg;
-	char nhbuf[NEXTHOP_STRLEN];
-
-	if (obj->resolved_prefix.family == AF_UNSPEC)
-		return;
-	/*
-	 * obj->vrf_id is the VRF the nexthop resolved in, which is the VRF the
-	 * resolving route lives in — so it is the route event's VRF even when
-	 * the route that owns the NHG sits in another one (VRF leak).
-	 */
-	if (obj->vrf_id != pr->vrf_id)
-		return;
-	if (prefix_cmp(&obj->resolved_prefix, pr->p) != 0)
-		return;
-
-	if (obj->nh)
-		nexthop2str(obj->nh, nhbuf, sizeof(nhbuf));
-	else
-		strlcpy(nhbuf, "(none)", sizeof(nhbuf));
-
-	pr->hits++;
-	zlog_debug("nhg-fib backwalk: %s %pFX vrf %u resolves dplane NHG %u (rib nhg %u), nexthop %s",
-		   pr->op, pr->p, pr->vrf_id, obj->dplane_id, obj->resolved_via,
-		   nhbuf);
-}
-
-/*
- * Requires `fnc->obuf_mutex` (fpm_nhg_walk contract).
+ * Requires `fnc->obuf_mutex`, which is what serializes the tables.
  */
 static void fpm_nhg_rv_probe_route(struct fpm_nl_ctx *fnc,
 				   const struct zebra_dplane_ctx *ctx,
 				   enum dplane_op_e op)
 {
-	struct fpm_nhg_rv_probe pr = {};
+	const struct fpm_nhg_resolved_bucket *b;
+	const struct prefix *p = dplane_ctx_get_dest(ctx);
+	vrf_id_t vrf_id = dplane_ctx_get_vrf(ctx);
+	char nhbuf[NEXTHOP_STRLEN];
+	uint32_t i;
+
+	/*
+	 * The index is keyed by the VRF the nexthop resolved in, which is the
+	 * VRF the resolving route lives in — so it is this event's VRF even
+	 * when the route owning the NHG sits in another one (VRF leak).
+	 */
+	b = fpm_nhg_resolved_lookup(&fnc->nhg_tables, vrf_id, p);
+	if (b == NULL)
+		return;
 
 	if (!IS_ZEBRA_DEBUG_FPM)
 		return;
 
-	pr.p = dplane_ctx_get_dest(ctx);
-	pr.vrf_id = dplane_ctx_get_vrf(ctx);
-	pr.op = dplane_op2str(op);
+	zlog_debug("nhg-fib backwalk: %s %pFX vrf %u is a resolving prefix for %u dplane NHG(s), trigger not wired yet",
+		   dplane_op2str(op), p, vrf_id, b->count);
 
-	fpm_nhg_walk(&fnc->nhg_tables, fpm_nhg_rv_probe_cb, &pr);
+	for (i = 0; i < b->count; i++) {
+		const struct fpm_dplane_nhg *obj = b->objs[i];
 
-	if (pr.hits)
-		zlog_debug("nhg-fib backwalk: %s %pFX vrf %u matched %u resolving prefix(es), trigger not wired yet",
-			   pr.op, pr.p, pr.vrf_id, pr.hits);
+		if (obj->nh)
+			nexthop2str(obj->nh, nhbuf, sizeof(nhbuf));
+		else
+			strlcpy(nhbuf, "(none)", sizeof(nhbuf));
+
+		zlog_debug("nhg-fib backwalk:   dplane NHG %u (rib nhg %u), nexthop %s",
+			   obj->dplane_id, obj->resolved_via, nhbuf);
+	}
 }
 
 /**

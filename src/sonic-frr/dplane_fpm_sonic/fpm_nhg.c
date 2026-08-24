@@ -320,6 +320,122 @@ static bool fpm_nhg_rib_id_cmp(const void *data1, const void *data2)
 	       ((const struct fpm_nhg_rib_entry *)data2)->rib_id;
 }
 
+/*
+ * by_resolved: (vrf, resolving prefix) -> bucket of objects resolving through
+ * it (see struct fpm_nhg_resolved_bucket in fpm_nhg.h).
+ */
+static unsigned int fpm_nhg_resolved_key(const void *data)
+{
+	const struct fpm_nhg_resolved_bucket *b = data;
+
+	return jhash_1word(b->vrf_id, prefix_hash_key(&b->p));
+}
+
+static bool fpm_nhg_resolved_cmp(const void *data1, const void *data2)
+{
+	const struct fpm_nhg_resolved_bucket *a = data1, *b = data2;
+
+	return a->vrf_id == b->vrf_id && a->p.family == b->p.family &&
+	       a->p.prefixlen == b->p.prefixlen && prefix_same(&a->p, &b->p);
+}
+
+static void *fpm_nhg_resolved_alloc(void *arg)
+{
+	const struct fpm_nhg_resolved_bucket *ref = arg;
+	struct fpm_nhg_resolved_bucket *b;
+
+	b = XCALLOC(MTYPE_FPM_NHG, sizeof(*b));
+	b->vrf_id = ref->vrf_id;
+	b->p = ref->p;
+	return b;
+}
+
+static void fpm_nhg_resolved_bucket_free(void *data)
+{
+	struct fpm_nhg_resolved_bucket *b = data;
+
+	XFREE(MTYPE_FPM_NHG, b->objs);
+	XFREE(MTYPE_FPM_NHG, b);
+}
+
+/*
+ * Index `obj` under its current resolving prefix. A no-op for an object
+ * without one, and idempotent: the same object is never listed twice, so a
+ * refresh that does not actually move the resolution costs nothing.
+ */
+static void fpm_nhg_resolved_add(struct fpm_nhg_tables *t,
+				 struct fpm_dplane_nhg *obj)
+{
+	struct fpm_nhg_resolved_bucket ref = {}, *b;
+	uint32_t i;
+
+	if (obj->resolved_prefix.family == AF_UNSPEC)
+		return;
+
+	ref.vrf_id = obj->vrf_id;
+	ref.p = obj->resolved_prefix;
+	b = hash_get(t->by_resolved, &ref, fpm_nhg_resolved_alloc);
+
+	for (i = 0; i < b->count; i++)
+		if (b->objs[i] == obj)
+			return;
+
+	if (b->count == b->cap) {
+		b->cap = b->cap ? b->cap * 2 : 8;
+		b->objs = XREALLOC(MTYPE_FPM_NHG, b->objs,
+				   b->cap * sizeof(*b->objs));
+	}
+	b->objs[b->count++] = obj;
+}
+
+/*
+ * Drop `obj` from the bucket of `p` in `vrf_id`, releasing the bucket once it
+ * holds nothing. Order inside a bucket carries no meaning, so the vacated slot
+ * is filled from the tail.
+ */
+static void fpm_nhg_resolved_del_key(struct fpm_nhg_tables *t, vrf_id_t vrf_id,
+				     const struct prefix *p,
+				     struct fpm_dplane_nhg *obj)
+{
+	struct fpm_nhg_resolved_bucket ref = {}, *b;
+	uint32_t i;
+
+	if (p->family == AF_UNSPEC)
+		return;
+
+	ref.vrf_id = vrf_id;
+	ref.p = *p;
+	b = hash_lookup(t->by_resolved, &ref);
+	if (!b)
+		return;
+
+	for (i = 0; i < b->count; i++) {
+		if (b->objs[i] != obj)
+			continue;
+		b->objs[i] = b->objs[--b->count];
+		break;
+	}
+
+	if (b->count == 0) {
+		hash_release(t->by_resolved, b);
+		fpm_nhg_resolved_bucket_free(b);
+	}
+}
+
+const struct fpm_nhg_resolved_bucket *
+fpm_nhg_resolved_lookup(struct fpm_nhg_tables *t, vrf_id_t vrf_id,
+			const struct prefix *p)
+{
+	struct fpm_nhg_resolved_bucket ref = {};
+
+	if (p == NULL || p->family == AF_UNSPEC)
+		return NULL;
+
+	ref.vrf_id = vrf_id;
+	ref.p = *p;
+	return hash_lookup(t->by_resolved, &ref);
+}
+
 void fpm_nhg_tables_init(struct fpm_nhg_tables *t)
 {
 	memset(t, 0, sizeof(*t));
@@ -332,6 +448,8 @@ void fpm_nhg_tables_init(struct fpm_nhg_tables *t)
 				   "FPM dplane NHG route map");
 	t->by_rib_id = hash_create(fpm_nhg_rib_id_key, fpm_nhg_rib_id_cmp,
 				   "FPM dplane NHG by rib id");
+	t->by_resolved = hash_create(fpm_nhg_resolved_key, fpm_nhg_resolved_cmp,
+				     "FPM dplane NHG by resolving prefix");
 	t->next_id = 1;
 }
 
@@ -362,6 +480,7 @@ void fpm_nhg_insert(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj)
 
 void fpm_nhg_remove(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj)
 {
+	fpm_nhg_resolved_del_key(t, obj->vrf_id, &obj->resolved_prefix, obj);
 	hash_release(t->by_hash, obj);
 	hash_release(t->by_id, obj);
 }
@@ -427,6 +546,7 @@ void fpm_nhg_tables_flush(struct fpm_nhg_tables *t)
 	 */
 	hash_clean(t->route_map, fpm_nhg_route_entry_free);
 	hash_clean(t->by_rib_id, fpm_nhg_rib_entry_free);
+	hash_clean(t->by_resolved, fpm_nhg_resolved_bucket_free);
 	hash_clean(t->by_id, NULL);
 	hash_clean(t->by_hash, fpm_nhg_obj_free);
 	XFREE(MTYPE_FPM_NHG, t->free_ids);
@@ -450,6 +570,7 @@ void fpm_nhg_tables_fini(struct fpm_nhg_tables *t)
 	fpm_nhg_tables_flush(t);
 	hash_clean_and_free(&t->route_map, NULL);
 	hash_clean_and_free(&t->by_rib_id, NULL);
+	hash_clean_and_free(&t->by_resolved, NULL);
 	hash_clean_and_free(&t->by_id, NULL);
 	hash_clean_and_free(&t->by_hash, NULL);
 }
@@ -613,9 +734,17 @@ static struct fpm_dplane_nhg *fpm_nhg_get_leaf(struct fpm_nhg_tables *t,
 		 * reaches the wire, so no message follows from the update.
 		 */
 		if (resolved && resolved->family != AF_UNSPEC) {
+			/*
+			 * The refresh can move this leaf to a different
+			 * resolving prefix, so the index entry moves with it.
+			 * Both calls are no-ops when nothing actually changed.
+			 */
+			fpm_nhg_resolved_del_key(t, obj->vrf_id,
+						 &obj->resolved_prefix, obj);
 			obj->resolved_prefix = *resolved;
 			obj->vrf_id = resolved_vrf;
 			obj->resolved_via = resolved_via;
+			fpm_nhg_resolved_add(t, obj);
 		}
 		return obj;
 	}
@@ -643,6 +772,7 @@ static struct fpm_dplane_nhg *fpm_nhg_get_leaf(struct fpm_nhg_tables *t,
 		obj->resolved_prefix = *resolved;
 		obj->vrf_id = resolved_vrf;
 		obj->resolved_via = resolved_via;
+		fpm_nhg_resolved_add(t, obj);
 	}
 	return obj;
 }
@@ -923,6 +1053,12 @@ fpm_nhg_group_new(struct fpm_nhg_tables *t,
 			if (info)
 				obj->resolved_via = info->id;
 		}
+		/*
+		 * Creation is the only place an L-B needs indexing: the
+		 * resolving prefix is part of the group hash, so a dedupe hit
+		 * necessarily carries the same one.
+		 */
+		fpm_nhg_resolved_add(t, obj);
 	}
 	obj->num_children = key->count;
 	obj->children = children; /* ownership transferred, sorted */
