@@ -248,6 +248,23 @@ struct fpm_nl_ctx {
 	struct dplane_ctx_list_head ctxqueue;
 	pthread_mutex_t ctxqueue_mutex;
 
+	/*
+	 * Context that was dequeued but did not fit in obuf, held for retry.
+	 *
+	 * This is a one-slot extension of the head of ctxqueue, and exists
+	 * because the dplane queue API this plugin has offers no head
+	 * insertion: pushing the context back on the tail would reorder it
+	 * behind later operations on the same prefix, and dropping it loses the
+	 * route. It is filled and consumed only by fpm_process_queue(), which
+	 * always drains it before dequeuing anything newer, so ordering is
+	 * preserved with no locking of its own.
+	 *
+	 * Only a transient failure gets stashed. A batch larger than obuf will
+	 * never fit (fpm_obuf_can_ever_fit()) and is failed to zebra instead, so
+	 * this slot cannot become a permanent blockage.
+	 */
+	struct zebra_dplane_ctx *stashed_ctx;
+
 	/* data plane events. */
 	struct zebra_dplane_provider *prov;
 	struct frr_pthread *fthread;
@@ -3122,6 +3139,54 @@ dplane_fpm_nl_handle_br_port_update(const struct zebra_dplane_ctx *ctx,
 
 #define DPLANE_FPM_NL_BUF_SIZE 65536
 
+/*
+ * Free space fpm_process_queue() insists on before it dequeues a context.
+ *
+ * A legacy context writes exactly one FPM frame, and the wire format caps a
+ * frame at UINT16_MAX (65535) bytes, so one DPLANE_FPM_NL_BUF_SIZE of room was
+ * a proof that a context which cleared this gate could not then fail its own
+ * room check. An nhg-fib context writes a batch -- carried-over DELs, this
+ * context's NEWs, then the route message -- so that proof no longer holds at
+ * one frame's worth of room.
+ *
+ * This restores it in practice rather than by construction: with
+ * FPM_NHG_PENDING_DELS_MAX bounding the DEL term (~135KiB) and the route frame
+ * bounded at 64KiB, only a context building several hundred near-maximal NHGFIB
+ * frames of its own can still exceed this window, and that context is caught by
+ * the stash-and-retry path instead of being lost. 1MiB of the 8MiB obuf, so the
+ * gate costs no meaningful throughput.
+ */
+#define DPLANE_FPM_NL_MIN_WRITEABLE (DPLANE_FPM_NL_BUF_SIZE * 16)
+
+/*
+ * Upper bound on carried-over DELNHGFIB ids before they are flushed as a batch
+ * of their own, instead of waiting for the next context (or end of drain) to
+ * carry them.
+ *
+ * pending_dels is the only term of a batch that grows across an entire drain
+ * pass -- a churn burst freeing tens of thousands of NHGs would otherwise let a
+ * later batch's head alone dwarf the admission window. Bounding it is what
+ * makes the retry in fpm_process_queue() provably terminate: every term of
+ * batch.total_len then has a ceiling.
+ *
+ * A DEL frame costs well under 132 bytes on the wire, so this is ~135KiB.
+ */
+#define FPM_NHG_PENDING_DELS_MAX 1024
+
+/**
+ * Whether `bytes` could ever fit in the output buffer, empty or not.
+ *
+ * Separates "full right now, worth retrying" from "will not fit however long we
+ * wait". A batch bigger than the buffer itself is a permanent failure: retrying
+ * it forever would park it at the head of the queue and starve every context
+ * behind it until the wedge timer forced a reconnect, whose resync would only
+ * rebuild the same oversized batch.
+ */
+static bool fpm_obuf_can_ever_fit(struct fpm_nl_ctx *fnc, size_t bytes)
+{
+	return bytes <= STREAM_SIZE(fnc->obuf);
+}
+
 /**
  * Check that `bytes` more bytes (FPM headers included) still fit in the
  * output buffer, accounting the buffer-full event when they do not.
@@ -3805,9 +3870,28 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	 * queued, so the caller can retry the whole context.
 	 */
 	if (!fpm_obuf_have_bytes_locked(fnc, batch.total_len, __func__)) {
+		size_t batch_len = batch.total_len;
+		bool never = !fpm_obuf_can_ever_fit(fnc, batch_len);
+
 		fpm_nhg_rollback(&fnc->nhg_tables, &newq);
 		fpm_nhg_staging_free(&newq);
 		fpm_frame_batch_free(&batch);
+
+		/*
+		 * Bigger than the buffer will ever be: waiting cannot help, and
+		 * asking the caller to retry would block every context behind
+		 * this one. Report it like an encode failure instead — one loud
+		 * error, and zebra learns the route is not programmed.
+		 */
+		if (never) {
+			zlog_err("%s: batch of %zu bytes exceeds the %zu byte output buffer, dropping ctx (%pFX table %u)",
+				 __func__, batch_len, STREAM_SIZE(fnc->obuf),
+				 dplane_ctx_get_dest(ctx),
+				 dplane_ctx_get_table(ctx));
+			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
+			return 0;
+		}
+
 		return -1;
 	}
 
@@ -3842,6 +3926,18 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	 */
 	if (old_top)
 		fpm_nhg_unref(&fnc->nhg_tables, old_top, &fnc->pending_dels);
+
+	/*
+	 * Keep the deferred DEL list bounded. Left alone it grows for as long as
+	 * the drain pass runs, and its frames are emitted at the HEAD of the
+	 * next batch — so a churn burst freeing tens of thousands of NHGs would
+	 * make a later, unrelated context's batch huge for reasons that have
+	 * nothing to do with that context. Flushing here is legal for the same
+	 * reason the end-of-drain flush is: this context's route message is
+	 * already on the wire, so these DELs still arrive strictly after it.
+	 */
+	if (fnc->pending_dels.count >= FPM_NHG_PENDING_DELS_MAX)
+		fpm_nhg_pending_dels_flush_locked(fnc, __func__);
 
 	/*
 	 * Probed only for a committed context: an event that was rolled back or
@@ -4555,48 +4651,67 @@ static void fpm_process_queue(struct event *t)
 
 	while (true) {
 		size_t writeable_amount;
+		size_t needed;
 		enum dplane_op_e ctx_op;
 
 		frr_with_mutex (&fnc->obuf_mutex) {
 			writeable_amount = STREAM_WRITEABLE(fnc->obuf);
 		}
 
-		/* No space available yet. */
-		if (writeable_amount < DPLANE_FPM_NL_BUF_SIZE) {
+		/*
+		 * No space available yet. Legacy contexts write exactly one
+		 * frame, which one DPLANE_FPM_NL_BUF_SIZE of room already proves
+		 * will fit, so that threshold is left as it was. Only nhg-fib
+		 * contexts write batches and need the wider window.
+		 */
+		needed = fnc->use_nhg_fib ? DPLANE_FPM_NL_MIN_WRITEABLE
+					  : DPLANE_FPM_NL_BUF_SIZE;
+		if (writeable_amount < needed) {
 			no_bufs = true;
 			break;
 		}
 
-		/* Dequeue next item or quit processing. */
-		frr_with_mutex (&fnc->ctxqueue_mutex) {
-			ctx = dplane_ctx_dequeue(&fnc->ctxqueue);
+		/*
+		 * A context held over from a previous run is the head of the
+		 * queue: retry it before anything newer, or operations on the
+		 * same prefix would be reordered.
+		 *
+		 * Only the nhg-fib path ever fills the slot, so the flag test is
+		 * redundant on its own — it is here so the legacy path reads as
+		 * the plain dequeue it has always been.
+		 */
+		if (fnc->use_nhg_fib && fnc->stashed_ctx != NULL) {
+			ctx = fnc->stashed_ctx;
+			fnc->stashed_ctx = NULL;
+		} else {
+			/* Dequeue next item or quit processing. */
+			frr_with_mutex (&fnc->ctxqueue_mutex) {
+				ctx = dplane_ctx_dequeue(&fnc->ctxqueue);
+			}
 		}
 		if (ctx == NULL)
 			break;
 
 		/*
 		 * -1 means the context did not fit in the output buffer, so
-		 * nothing of it was emitted.
+		 * nothing of it was emitted and no state moved: it is wholly
+		 * retryable. Hold it in the stash and stop draining rather than
+		 * telling zebra the route failed — zebra treats an install
+		 * failure as terminal (rib_process_result() has no retry), so a
+		 * transient buffer shortage would otherwise cost the route.
 		 *
-		 * The context cannot be retried here: it has already been
-		 * dequeued and the dplane queue API this plugin has offers no
-		 * head insertion, so putting it back would reorder it behind
-		 * later operations on the same prefix. Tell zebra the route was
-		 * not programmed instead — silently dropping it (what the old
-		 * "intentionally ignoring the return value" comment did) loses
-		 * the route with nobody noticing. The STREAM_WRITEABLE check
-		 * above only guarantees one DPLANE_FPM_NL_BUF_SIZE of room,
-		 * which an nhg-fib batch (NHGFIB frames plus the route frame)
-		 * can legitimately exceed.
+		 * This terminates. The batch is bounded (FPM_NHG_PENDING_DELS_MAX
+		 * plus one route frame plus this context's own NEWs), the check
+		 * that rejected it is against free space in the 8MiB obuf, and
+		 * fpm_write() grows that space as the peer reads. A batch that
+		 * could never fit is failed inside fpm_nl_enqueue() instead of
+		 * returning -1, so it never reaches this slot. If the peer stops
+		 * reading altogether, t_wedged (armed below, since no_bufs is
+		 * set) forces a reconnect and full resync.
 		 *
-		 * Gated on use_nhg_fib: the legacy path can also return -1
-		 * (fpm_obuf_write_locked()) and has always ignored it, so its
-		 * behaviour is left exactly as it was.
-		 *
-		 * Gated on route ops as well: dplane_ctx_get_dest()/get_table()
-		 * read the ctx's route union arm, which a MAC / LSP / SID-list
-		 * context does not have — only a route context may be described
-		 * with them.
+		 * Gated on use_nhg_fib and on the route ops: the legacy path can
+		 * also return -1 and has always ignored it, and only a route
+		 * context builds a batch, so nothing else is worth holding.
 		 */
 		ctx_op = dplane_ctx_get_op(ctx);
 		if (fnc->socket != -1 && fpm_nl_enqueue(fnc, ctx) == -1 &&
@@ -4604,10 +4719,13 @@ static void fpm_process_queue(struct event *t)
 		    (ctx_op == DPLANE_OP_ROUTE_INSTALL ||
 		     ctx_op == DPLANE_OP_ROUTE_UPDATE ||
 		     ctx_op == DPLANE_OP_ROUTE_DELETE)) {
-			zlog_warn("%s: output buffer full, route not programmed (%pFX table %u)",
-				  __func__, dplane_ctx_get_dest(ctx),
-				  dplane_ctx_get_table(ctx));
-			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
+			if (IS_ZEBRA_DEBUG_FPM)
+				zlog_debug("%s: output buffer full, holding ctx for retry (%pFX table %u)",
+					   __func__, dplane_ctx_get_dest(ctx),
+					   dplane_ctx_get_table(ctx));
+			fnc->stashed_ctx = ctx;
+			no_bufs = true;
+			break;
 		}
 
 		/* Account the processed entries. */
@@ -4812,6 +4930,9 @@ static int fpm_nl_finish_late(struct fpm_nl_ctx *fnc)
 	 */
 	fpm_nhg_tables_fini(&fnc->nhg_tables);
 	fpm_nhg_del_queue_free(&fnc->pending_dels);
+	/* Runs after frr_pthread_stop(), so nothing can be racing the slot. */
+	if (fnc->stashed_ctx != NULL)
+		dplane_ctx_fini(&fnc->stashed_ctx);
 	stream_free(fnc->ibuf);
 	stream_free(fnc->obuf);
 	free(gfnc);
