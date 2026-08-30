@@ -3140,34 +3140,15 @@ dplane_fpm_nl_handle_br_port_update(const struct zebra_dplane_ctx *ctx,
 #define DPLANE_FPM_NL_BUF_SIZE 65536
 
 /*
- * Free space fpm_process_queue() insists on before it dequeues a context.
- *
- * A legacy context writes exactly one FPM frame, and the wire format caps a
- * frame at UINT16_MAX (65535) bytes, so one DPLANE_FPM_NL_BUF_SIZE of room was
- * a proof that a context which cleared this gate could not then fail its own
- * room check. An nhg-fib context writes a batch -- carried-over DELs, this
- * context's NEWs, then the route message -- so that proof no longer holds at
- * one frame's worth of room.
- *
- * This restores it in practice rather than by construction: with
- * FPM_NHG_PENDING_DELS_MAX bounding the DEL term (~135KiB) and the route frame
- * bounded at 64KiB, only a context building several hundred near-maximal NHGFIB
- * frames of its own can still exceed this window, and that context is caught by
- * the stash-and-retry path instead of being lost. 1MiB of the 8MiB obuf, so the
- * gate costs no meaningful throughput.
- */
-#define DPLANE_FPM_NL_MIN_WRITEABLE (DPLANE_FPM_NL_BUF_SIZE * 16)
-
-/*
  * Upper bound on carried-over DELNHGFIB ids before they are flushed as a batch
  * of their own, instead of waiting for the next context (or end of drain) to
  * carry them.
  *
  * pending_dels is the only term of a batch that grows across an entire drain
  * pass -- a churn burst freeing tens of thousands of NHGs would otherwise let a
- * later batch's head alone dwarf the admission window. Bounding it is what
- * makes the retry in fpm_process_queue() provably terminate: every term of
- * batch.total_len then has a ceiling.
+ * later, unrelated context's batch be dominated by a head it did not create.
+ * Bounding it is what makes the retry in fpm_process_queue() provably
+ * terminate: every term of batch.total_len then has a ceiling.
  *
  * A DEL frame costs well under 132 bytes on the wire, so this is ~135KiB.
  */
@@ -4651,22 +4632,14 @@ static void fpm_process_queue(struct event *t)
 
 	while (true) {
 		size_t writeable_amount;
-		size_t needed;
 		enum dplane_op_e ctx_op;
 
 		frr_with_mutex (&fnc->obuf_mutex) {
 			writeable_amount = STREAM_WRITEABLE(fnc->obuf);
 		}
 
-		/*
-		 * No space available yet. Legacy contexts write exactly one
-		 * frame, which one DPLANE_FPM_NL_BUF_SIZE of room already proves
-		 * will fit, so that threshold is left as it was. Only nhg-fib
-		 * contexts write batches and need the wider window.
-		 */
-		needed = fnc->use_nhg_fib ? DPLANE_FPM_NL_MIN_WRITEABLE
-					  : DPLANE_FPM_NL_BUF_SIZE;
-		if (writeable_amount < needed) {
+		/* No space available yet. */
+		if (writeable_amount < DPLANE_FPM_NL_BUF_SIZE) {
 			no_bufs = true;
 			break;
 		}
