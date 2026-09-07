@@ -4,7 +4,7 @@ SHELL = /bin/bash
 
 MAIN_TARGET = $(FRR)
 DERIVED_TARGET = $(FRR_PYTHONTOOLS) $(FRR_DBG) $(FRR_SNMP) $(FRR_SNMP_DBG)
-STG_PATCHED_BRANCH = $(FRR_TAG)-patched
+STG_PATCHED_BRANCH = $(FRR_BRANCH)-patched
 PATCHSET_SHA_FILE = ../.sonic-frr-patch-$(STG_PATCHED_BRANCH).sha1
 DPLANE_FPM_SONIC_MODULE = dplane_fpm_sonic/dplane_fpm_sonic.c
 
@@ -25,17 +25,17 @@ $(addprefix $(DEST)/, $(MAIN_TARGET)): $(DEST)/% :
 		patched_branch_exists=yes
 	fi
 	if [[ "$$patched_branch_exists" == "no" || "$$current_patch_hash" != "$$recorded_patch_hash" ]]; then
-		git fetch origin tag $(FRR_TAG)
-		# Create a branch out of tag as stg needs a branch.
-		# Prefix branch name with "build-" to avoid conflicts with tag name.
-		git checkout -B build-$(FRR_TAG) refs/tags/$(FRR_TAG)
+		git fetch origin $(FRR_BRANCH)
+		# Create a branch out of the FRR branch as stg needs a branch.
+		# Prefix branch name with "build-" to avoid conflicts with branch name.
+		git checkout -B build-$(FRR_BRANCH) origin/$(FRR_BRANCH)
 ifeq ($(CROSS_BUILD_ENVIRON), y)
 		git reset --hard
 endif
 		if [[ "$$patched_branch_exists" == "yes" ]]; then
 			stg branch --delete --force $(STG_PATCHED_BRANCH)
 		fi
-		stg branch --create $(STG_PATCHED_BRANCH) build-$(FRR_TAG)
+		stg branch --create $(STG_PATCHED_BRANCH) build-$(FRR_BRANCH)
 		stg import -s ../patch/series
 		gbp dch --ignore-branch --new-version=$(FRR_VERSION)-sonic-$(FRR_SUBVERSION) --dch-opt="--force-bad-version" --commit --git-author
 		echo "$$current_patch_hash" > $(PATCHSET_SHA_FILE)

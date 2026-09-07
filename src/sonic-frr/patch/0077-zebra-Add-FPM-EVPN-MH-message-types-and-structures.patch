@@ -1,7 +1,7 @@
-From a6d6ec4dd7645680884ea3303c0076ac896ec0ac Mon Sep 17 00:00:00 2001
+From eaee7e6c595e67bbcb0fc59425708de841b3ebc3 Mon Sep 17 00:00:00 2001
 From: "Barry Friedman (friedman)" <friedman@cisco.com>
 Date: Fri, 27 Mar 2026 15:21:35 -0700
-Subject: zebra: Add FPM EVPN MH message types and structures
+Subject: [PATCH] zebra: Add FPM EVPN MH message types and structures
 
 Add RTM_FPM message types for EVPN Multihoming bridge port attributes
 (Split Horizon List, Designated Forwarder, ES Backup NHG) and their
@@ -19,15 +19,18 @@ Ported from cisco_202405_dev commits:
 Signed-off-by: Ben Friedman <friedman@cisco.com>
 (cherry picked from commit ab89396461f57c3745d69628640b0f1cc67f37ff)
 Signed-off-by: Tamer Ahmed <tamerahmed@microsoft.com>
+---
+ zebra/kernel_netlink.h | 54 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
 
 diff --git a/zebra/kernel_netlink.h b/zebra/kernel_netlink.h
-index 723ea97dc..e1f7f917a 100644
+index d5c86bd544..c0a3334280 100644
 --- a/zebra/kernel_netlink.h
 +++ b/zebra/kernel_netlink.h
-@@ -30,8 +30,60 @@ struct zebra_ns;
+@@ -28,6 +28,60 @@ struct zebra_dplane_ctx;
+ struct zebra_dplane_info;
+ struct zebra_ns;
  
- #define RTM_NHA(h)                                                             \
- 	((struct rtattr *)(((char *)(h)) + NLMSG_ALIGN(sizeof(struct nhmsg))))
 +/* FPM-specific extension values, for messages and attributes */
 +
 +typedef enum {
@@ -74,17 +77,17 @@ index 723ea97dc..e1f7f917a 100644
 +	int ebnm_ifindex;
 +	int ebnm_backup_nhg_id;
 +};
- 
++
 +/* Attribute IDs for SHL Updates */
 +#define FPM_SHL_IPV4_ADDR	1
 +#define FPM_SHL_IPV6_ADDR	2
 +#define FPM_SHL_LAST		FPM_SHL_IPV6_ADDR
 +#define FPM_SHL_MAX		FPM_SHL_LAST
- 
++
 +/* End of FPM EVPN MH extensions */
  #define NL_RCV_PKT_BUF_SIZE     (34 * 1024)
  #define NL_PKT_BUF_SIZE         8192
  
 -- 
-2.43.0
+2.39.2 (Apple Git-143)
 
