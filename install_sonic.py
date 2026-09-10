@@ -35,12 +35,14 @@ def main():
     # select ONIE embed
     p.expect(grub_selection)
     p.send(KEY_DOWN)
-    p.sendline()
+    time.sleep(0.2)
+    p.send('\r')
+    p.expect(['ONIE: Embedding ONIE'], timeout=30)
 
     # select ONIE install
     p.expect(['ONIE: Install OS'])
     p.expect([grub_selection])
-    p.sendline()
+    p.send('\r')
 
     # wait for grub, and exit
     p.expect([grub_selection])
