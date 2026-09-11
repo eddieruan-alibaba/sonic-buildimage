@@ -35,7 +35,6 @@ def main():
     # select ONIE embed
     p.expect(r"The highlighted entry will be executed\s+automatically in \d+s")
     p.send(KEY_DOWN)
-    p.expect(r"\*ONIE: Embed ONIE")
     p.send('\r')
     p.expect(['ONIE: Embedding ONIE'], timeout=30)
 
