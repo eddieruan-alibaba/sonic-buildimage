@@ -27,6 +27,7 @@
 #include <string.h>
 
 #include "lib/zebra.h"
+#include "lib/netlink_parser.h"
 #include "lib/memory.h"
 #include "lib/sha256.h"
 #include "lib/jhash.h"

@@ -55,6 +55,7 @@
 #include "zebra/zebra_vxlan_private.h"
 #include "zebra/kernel_netlink.h"
 #include "zebra/rt_netlink.h"
+#include "lib/netlink_parser.h"
 #include "zebra/debug.h"
 #include "zebra/zebra_srv6.h"
 #include "zebra/fpm_nhg.h"
