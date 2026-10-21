@@ -4214,6 +4214,7 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	struct fpm_nhg_route_key key;
 	size_t nl_buf_len = 0, route_off;
 	bool encode_ok = true;
+	bool resolved_event, recovery;
 	struct nlmsghdr *n;
 	ssize_t rv;
 	int ret;
@@ -4230,6 +4231,18 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 
 	frr_mutex_lock_autounlock(&fnc->obuf_mutex);
 
+	old_top = fpm_nhg_route_get(&fnc->nhg_tables, &key);
+
+	/*
+	 * A resolve-via route event is due when this route appears or
+	 * disappears: an install of a route the plugin had not bound yet means
+	 * its resolution came back (undo the PIC fix-up), a delete means the
+	 * NHGs that resolved through it lose their resolution. An UPDATE
+	 * re-installs the route in the same context and is neither.
+	 */
+	recovery = (op != DPLANE_OP_ROUTE_DELETE) && (old_top == NULL);
+	resolved_event = (op == DPLANE_OP_ROUTE_DELETE) || recovery;
+
 	/*
 	 * Explicit removal: DELETE, and UPDATE when route replace semantics
 	 * are disabled (same message pair the legacy path emits).
@@ -4243,7 +4256,6 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 			 * this route currently references (0 when the plugin has
 			 * never seen it, e.g. after a reconnect flush).
 			 */
-			old_top = fpm_nhg_route_get(&fnc->nhg_tables, &key);
 			rv = netlink_vpn_route_msg_encode(RTM_DELROUTE, ctx, nl_buf,
 							  nl_buf_size,
 							  old_top ? old_top->dplane_id : 0,
@@ -4377,6 +4389,19 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 		fpm_nhg_frame_batch_add(&batch, nl_buf, nl_buf_len);
 
 	/*
+	 * The event rides after this context's route so the peer has already
+	 * applied the route change when it walks the affected NHGs.
+	 */
+	if (encode_ok && resolved_event) {
+		encode_ok = fpm_nhg_batch_add_resolved_events(
+			&fnc->nhg_tables, dplane_ctx_get_vrf(ctx),
+			dplane_ctx_get_dest(ctx), recovery, &batch);
+		if (!encode_ok)
+			zlog_err("%s: resolved event encode failed, dropping ctx",
+				 __func__);
+	}
+
+	/*
 	 * batch.total_len is now the EXACT byte count of the write, so this
 	 * single check is the whole reservation — no upper bound heuristic is
 	 * involved anymore. On failure nothing is emitted, no state moves, the
@@ -4412,6 +4437,11 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	/* One atomic write for the whole context. */
 	ret = fpm_frame_batch_write_locked(fnc, &batch, __func__);
 	fpm_nhg_frame_batch_free(&batch);
+
+	if (ret == 0 && resolved_event)
+		fpm_nhg_resolved_events_commit(
+			&fnc->nhg_tables, dplane_ctx_get_vrf(ctx),
+			dplane_ctx_get_dest(ctx), recovery);
 
 	/*
 	 * The carried-over DELs are on the wire (or a resync was forced, which

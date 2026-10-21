@@ -345,6 +345,7 @@ uint32_t fpm_nhg_count(struct fpm_nhg_tables *t);
 enum fpm_nhg_nlmsg_type {
 	RTM_NEWNHGFIB = 5000,
 	RTM_DELNHGFIB = 5001,
+	RTM_NEWRESOLVEDEVENT = 6000,
 };
 
 enum fpm_nhg_nlattr_type {
@@ -358,6 +359,26 @@ enum fpm_nhg_nlattr_type {
 ssize_t fpm_nhg_new_msg_encode(const struct fpm_dplane_nhg *obj, void *buf,
 			       size_t buflen);
 ssize_t fpm_nhg_del_msg_encode(uint32_t dplane_id, void *buf, size_t buflen);
+
+/*
+ * Emit one resolve-via route event per live object that resolved through
+ * (vrf_id, p): obj->nh is the nexthop that lost (recovery false) or regained
+ * (recovery true) its resolution, and obj->dplane_id is its dplane NHG.
+ * False if a frame could not be encoded or appended; the caller then emits
+ * nothing from this context.
+ */
+bool fpm_nhg_batch_add_resolved_events(struct fpm_nhg_tables *t,
+				       vrf_id_t vrf_id, const struct prefix *p,
+				       bool recovery,
+				       struct fpm_frame_batch *batch);
+
+/*
+ * Record a committed resolve-via event on its (vrf, prefix): a delete leaves
+ * the route marked withdrawn so a later install reports recovery, an install
+ * clears the mark. Returns without effect once the bucket is gone.
+ */
+void fpm_nhg_resolved_events_commit(struct fpm_nhg_tables *t, vrf_id_t vrf_id,
+				    const struct prefix *p, bool recovery);
 
 /*
  * Install `show fpm nhg-fib`. The pointed-to objects must outlive the daemon:

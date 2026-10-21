@@ -404,6 +404,12 @@ struct fpm_nhg_resolved_bucket {
 	struct prefix p;
 	struct fpm_dplane_nhg **objs;
 	uint32_t count, cap;
+	/*
+	 * Set once a delete of this route committed a resolve-via event: the
+	 * objects lived on and the peer may be carrying a PIC fix-up that only
+	 * an install of the same route undoes. Cleared again by that install.
+	 */
+	bool withdrawn;
 };
 
 /*
@@ -684,6 +690,142 @@ fpm_nhg_resolved_lookup(struct fpm_nhg_tables *t, vrf_id_t vrf_id,
 	ref.vrf_id = vrf_id;
 	ref.p = *p;
 	return hash_lookup(t->by_resolved, &ref);
+}
+
+/*
+ * The event carries the bare nexthop address, the form fpmsyncd's NHG
+ * entries hold in their nexthop field, not nexthop2str()'s
+ * "address if ifindex" form.
+ */
+static bool fpm_nhg_resolved_nh2str(const struct nexthop *nh, char *buf,
+				    size_t len)
+{
+	if (nh == NULL)
+		return false;
+
+	switch (nh->type) {
+	case NEXTHOP_TYPE_IPV4:
+	case NEXTHOP_TYPE_IPV4_IFINDEX:
+		snprintfrr(buf, len, "%pI4", &nh->gate.ipv4);
+		return true;
+	case NEXTHOP_TYPE_IPV6:
+	case NEXTHOP_TYPE_IPV6_IFINDEX:
+		snprintfrr(buf, len, "%pI6", &nh->gate.ipv6);
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
+ * Encode one RTM_NEWRESOLVEDEVENT for `obj`, the dplane NHG whose defining
+ * nexthop resolved through `p`. Field names match the NHT event payload
+ * fpmsyncd already understands: zero curr_resolved_nhg_id means withdrawn.
+ * Returns 0 when the object has no addressable nexthop (nothing to report).
+ */
+static ssize_t fpm_nhg_resolved_event_encode(const struct fpm_dplane_nhg *obj,
+					     const struct prefix *p,
+					     bool recovery, void *buf,
+					     size_t buflen)
+{
+	struct {
+		struct nlmsghdr n;
+		struct rtmsg rtm;
+		char buf[];
+	} *req = buf;
+	char nhbuf[NEXTHOP_STRLEN];
+	char pbuf[PREFIX_STRLEN];
+	char json[2 * PREFIX_STRLEN + 256];
+	uint32_t curr_id = recovery ? obj->dplane_id : 0;
+	const char *curr_pfx = recovery ? pbuf : "::/0";
+	ssize_t json_len;
+
+	if (buflen < sizeof(*req))
+		return -1;
+	if (!fpm_nhg_resolved_nh2str(obj->nh, nhbuf, sizeof(nhbuf)))
+		return 0;
+	prefix2str(p, pbuf, sizeof(pbuf));
+
+	json_len = snprintfrr(
+		json, sizeof(json),
+		"{\"rnh_prefix\":\"%s\",\"prev_resolved_prefix\":\"%s\",\"prev_resolved_nhg_id\":%u,"
+		"\"curr_resolved_prefix\":\"%s\",\"curr_resolved_nhg_id\":%u}",
+		nhbuf, pbuf, obj->dplane_id, curr_pfx, curr_id);
+	if (json_len < 0 || (size_t)json_len >= sizeof(json))
+		return -1;
+
+	memset(req, 0, sizeof(*req));
+	req->n.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+	req->n.nlmsg_flags = NLM_F_CREATE | NLM_F_REQUEST;
+	req->n.nlmsg_type = RTM_NEWRESOLVEDEVENT;
+	req->rtm.rtm_family = p->family;
+
+	if (!nl_attr_put(&req->n, buflen, FPM_NHA_JSON_STR, json,
+			 json_len + 1))
+		return -1;
+
+	if (IS_ZEBRA_DEBUG_FPM)
+		zlog_debug("%s: RTM_NEWRESOLVEDEVENT, dplane NHG %u via %pFX nh %s recovery %d",
+			   __func__, obj->dplane_id, p, nhbuf, recovery);
+
+	return NLMSG_ALIGN(req->n.nlmsg_len);
+}
+
+bool fpm_nhg_batch_add_resolved_events(struct fpm_nhg_tables *t,
+				       vrf_id_t vrf_id, const struct prefix *p,
+				       bool recovery,
+				       struct fpm_frame_batch *batch)
+{
+	const struct fpm_nhg_resolved_bucket *b;
+	uint8_t *buf;
+	uint32_t i;
+	ssize_t rv;
+
+	b = fpm_nhg_resolved_lookup(t, vrf_id, p);
+	if (b == NULL)
+		return true;
+
+	/*
+	 * Recovery only reverses a fix-up this plugin actually reported, so an
+	 * install that merely re-populates the index (initial replay) stays
+	 * silent.
+	 */
+	if (recovery && !b->withdrawn)
+		return true;
+
+	buf = XMALLOC(MTYPE_FPM_NHG, FPM_NHG_MSG_BUF_SIZE);
+	for (i = 0; i < b->count; i++) {
+		rv = fpm_nhg_resolved_event_encode(b->objs[i], p, recovery,
+						   buf, FPM_NHG_MSG_BUF_SIZE);
+		if (rv < 0) {
+			zlog_err("%s: cannot encode resolved event for dplane NHG %u via %pFX",
+				 __func__, b->objs[i]->dplane_id, p);
+			XFREE(MTYPE_FPM_NHG, buf);
+			return false;
+		}
+		if (rv > 0)
+			fpm_nhg_frame_batch_add(batch, buf, (size_t)rv);
+	}
+	XFREE(MTYPE_FPM_NHG, buf);
+
+	return true;
+}
+
+/*
+ * Record a committed resolve-via event on the bucket. Runs after the batch
+ * write so a retried context re-emits the same event.
+ */
+void fpm_nhg_resolved_events_commit(struct fpm_nhg_tables *t, vrf_id_t vrf_id,
+				    const struct prefix *p, bool recovery)
+{
+	struct fpm_nhg_resolved_bucket *b;
+
+	b = (struct fpm_nhg_resolved_bucket *)fpm_nhg_resolved_lookup(
+		t, vrf_id, p);
+	if (b == NULL || b->count == 0)
+		return;
+
+	b->withdrawn = !recovery;
 }
 
 
