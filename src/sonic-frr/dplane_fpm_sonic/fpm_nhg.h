@@ -20,6 +20,15 @@
 #ifndef _FPM_NHG_H
 #define _FPM_NHG_H
 
+/*
+ * The object model is pure C, but the unit tests are written against
+ * googletest (C++). Guard the declarations so the header can be included
+ * from both without a linkage mismatch.
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <pthread.h>
 #include <stdbool.h>
 #include <sys/types.h>
@@ -48,6 +57,19 @@ struct fpm_nhg_child {
 	uint16_t weight;
 };
 
+/*
+ * One (vrf, prefix) membership a leaf is indexed under in by_resolved. count
+ * is the number of committed routes whose tree currently resolves through
+ * (vrf, prefix) to this leaf; the membership exists exactly while count is
+ * non-zero, and fpm_nhg_leaf_member_release() drops it — and its index entry
+ * — when the last such route lets go.
+ */
+struct fpm_nhg_resolved_member {
+	vrf_id_t vrf_id;
+	struct prefix p;
+	uint32_t count;
+};
+
 struct fpm_dplane_nhg {
 	uint64_t hash;        /* internal Merkle dedupe key */
 	uint32_t dplane_id;   /* wire id: NHGFIB id / depends / RTA_NH_ID */
@@ -55,7 +77,13 @@ struct fpm_dplane_nhg {
 	uint8_t level;        /* enum fpm_nhg_level */
 	uint32_t nhg_flags;   /* RECEIVED / RECURSIVE subset for JSON */
 	struct nexthop *nh;   /* defining nexthop (dup'd) */
-	struct prefix resolved_prefix; /* resolving prefix, when known */
+	/*
+	 * Resolving prefix. On an L-B object it is part of identity and of
+	 * by_resolved. On a leaf it is the last-seen value for the
+	 * resolved-via view; the leaf's indexed memberships live in
+	 * res_members below.
+	 */
+	struct prefix resolved_prefix;
 	vrf_id_t vrf_id;
 	/*
 	 * Zebra NHG id this object resolved through (PR #19252 resolved_via).
@@ -77,6 +105,14 @@ struct fpm_dplane_nhg {
 	uint16_t rib_nhg_id_count, rib_nhg_id_cap;
 	uint16_t num_children;
 	struct fpm_nhg_child *children; /* sorted by obj->hash */
+	/*
+	 * Leaves only: the (vrf, prefix) memberships this leaf is currently
+	 * indexed under in by_resolved, each with its route count (see
+	 * struct fpm_nhg_resolved_member). Mirrored 1:1 by the index, so
+	 * fpm_nhg_remove() unindexes the leaf completely by walking this.
+	 */
+	struct fpm_nhg_resolved_member *res_members;
+	uint16_t res_member_count, res_member_cap;
 };
 
 /*
@@ -105,7 +141,13 @@ struct fpm_nhg_tables {
 	struct hash *by_id;
 	struct hash *route_map; /* fpm_nhg_route_key -> top (L-A) object */
 	struct hash *by_rib_id; /* zebra NHG id -> object (reverse index) */
-	/* (vrf, resolving prefix) -> a private bucket of resolved objects. */
+	/*
+	 * (vrf, resolving prefix) -> bucket of objects resolving through
+	 * it: the probe a route event uses to find its blast radius. L-B
+	 * entries are exact (the prefix is part of the group's identity);
+	 * leaf entries follow the per-route contribution counts and are
+	 * exact too — see fpm_nhg_leaf_member_acquire().
+	 */
 	struct hash *by_resolved;
 	uint32_t next_id;
 	uint32_t *free_ids;
@@ -179,6 +221,23 @@ struct fpm_frame_batch {
 	uint32_t nhgfib_count;
 };
 
+/*
+ * One resolution a route's build used: the leaf and the (vrf, prefix) it was
+ * reached through. A committed route stores the set its built tree produced;
+ * the next build's set is diffed against it to move the per-membership
+ * counts, so a membership is released exactly when its last route lets go.
+ *
+ * obj is a borrowed pointer: every entry names a leaf in the route's current
+ * top object tree, which the route's own reference keeps alive until the
+ * build replacing it has been committed (the diff runs before the old top is
+ * unreffed).
+ */
+struct fpm_nhg_contrib {
+	struct fpm_dplane_nhg *obj;
+	vrf_id_t vrf_id;
+	struct prefix p;
+};
+
 struct fpm_nhg_staging {
 	struct fpm_dplane_nhg **objs;  /* objects needing RTM_NEWNHGFIB, child-first order */
 	/*
@@ -190,6 +249,16 @@ struct fpm_nhg_staging {
 	 * would leave the uint32.
 	 */
 	uint32_t count, cap;
+	/*
+	 * Contributions collected by this build: the (leaf, vrf, prefix)
+	 * resolutions its tree used, deduped. Consumed by the commit that
+	 * installs the build, or freed with the staging when the build is
+	 * rolled back — a context that never reaches the wire moves no
+	 * count. Bounded by the leaf attachments of one route's nexthop
+	 * tree; same growth argument as count/cap above.
+	 */
+	struct fpm_nhg_contrib *contribs;
+	uint32_t contrib_count, contrib_cap;
 };
 
 void fpm_nhg_staging_free(struct fpm_nhg_staging *s);
@@ -246,10 +315,16 @@ bool fpm_nhg_batch_add_staging(const struct fpm_nhg_staging *s,
 
 struct fpm_dplane_nhg *fpm_nhg_route_get(struct fpm_nhg_tables *t,
 					 const struct fpm_nhg_route_key *k);
+/*
+ * Install `new_top` as the route's object. `newq` is the build that produced
+ * it: its contribution set is consumed here (the staging is left with none),
+ * so the caller must keep it alive until this call and free it after.
+ */
 void fpm_nhg_route_commit(struct fpm_nhg_tables *t,
 			  const struct fpm_nhg_route_key *k,
 			  struct fpm_dplane_nhg *new_top, uint32_t rib_id,
-			  struct fpm_nhg_del_queue *delq);
+			  struct fpm_nhg_del_queue *delq,
+			  struct fpm_nhg_staging *newq);
 void fpm_nhg_route_forget(struct fpm_nhg_tables *t,
 			  const struct fpm_nhg_route_key *k,
 			  struct fpm_nhg_del_queue *delq);
@@ -261,6 +336,20 @@ void fpm_nhg_route_forget(struct fpm_nhg_tables *t,
 void fpm_nhg_debug_resolved_route(struct fpm_nhg_tables *t, vrf_id_t vrf_id,
 				  const struct prefix *p, const char *op_name);
 uint32_t fpm_nhg_count(struct fpm_nhg_tables *t);
+
+/*
+ * NHGFIB-only extension message types and JSON payload attribute. Part of the
+ * wire contract the encoders below and their tests assert against; the types
+ * sit well beyond the kernel's RTM_ range.
+ */
+enum fpm_nhg_nlmsg_type {
+	RTM_NEWNHGFIB = 5000,
+	RTM_DELNHGFIB = 5001,
+};
+
+enum fpm_nhg_nlattr_type {
+	FPM_NHA_JSON_STR = 2,
+};
 
 /*
  * Encode raw NHGFIB netlink payloads for one derived dplane object. FPM frame
@@ -297,5 +386,9 @@ const char *fpm_nhg_fib_log_level_str(enum fib_log_level level);
  */
 void fpm_nhg_fib_log_register(void);
 void fpm_nhg_fib_log_init(enum fib_log_level *level);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _FPM_NHG_H */

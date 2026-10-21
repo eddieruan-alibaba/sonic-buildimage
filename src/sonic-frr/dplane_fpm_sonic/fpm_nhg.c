@@ -27,7 +27,6 @@
 #include <string.h>
 
 #include "lib/zebra.h"
-#include "lib/netlink_parser.h"
 #include "lib/memory.h"
 #include "lib/sha256.h"
 #include "lib/jhash.h"
@@ -38,6 +37,7 @@
 #include "lib/vty.h"
 #include "lib/vrf.h"
 #include "lib/frr_pthread.h" /* frr_with_mutex */
+#include "lib/netlink_parser.h" /* nl_attr_put()/32 */
 #include "zebra/rib.h" /* DECLARE_MGROUP(ZEBRA) */
 #include "zebra/debug.h" /* IS_ZEBRA_DEBUG_FPM */
 #include "zebra/zebra_srv6.h" /* zebra_srv6_get_default() */
@@ -56,16 +56,6 @@ DEFINE_MTYPE_STATIC(ZEBRA, FPM_NHG_FRAME, "FPM pending output frame");
 
 /* Scratch size for encoding one NHGFIB message before the framing guard. */
 #define FPM_NHG_MSG_BUF_SIZE 65536
-
-/* NHGFIB-only extension messages and JSON payload attribute. */
-enum fpm_nhg_nlmsg_type {
-	RTM_NEWNHGFIB = 5000,
-	RTM_DELNHGFIB = 5001,
-};
-
-enum fpm_nhg_nlattr_type {
-	FPM_NHA_JSON_STR = 2,
-};
 
 /*
  * All object lifecycle tracing goes through here so a single `debug zebra fpm`
@@ -335,6 +325,13 @@ struct fpm_nhg_route_entry {
 	 * known to be dead: the object itself may still serve other routes.
 	 */
 	uint32_t rib_id;
+	/*
+	 * The (leaf, vrf, prefix) resolutions this route's committed tree
+	 * used; the set the next build is diffed against. NULL until the
+	 * first commit.
+	 */
+	struct fpm_nhg_contrib *contribs;
+	uint32_t contrib_count;
 };
 
 static unsigned int fpm_nhg_route_key_hash(const void *data)
@@ -411,7 +408,20 @@ struct fpm_nhg_resolved_bucket {
 
 /*
  * by_resolved: (vrf, resolving prefix) -> bucket of objects resolving through
- * it.
+ * it — the probe a route event uses to find its blast radius, the dplane-side
+ * counterpart of zebra's NHT registration list.
+ *
+ * L-B entries are exact: the resolving prefix is part of the group's dedupe
+ * hash, so it can never change under the object.
+ *
+ * Leaf entries are exact too. A leaf's identity cannot include the prefix
+ * (the wire object is identical whatever it resolved through), so one shared
+ * leaf stands for every prefix its events carried — but the subscription is
+ * not an untracked union: each (leaf, vrf, prefix) membership carries a count
+ * of the committed routes resolving through it, moved only at the commit
+ * point (see fpm_nhg_leaf_member_acquire()). The index therefore tracks
+ * exactly the live resolutions — a stale candidate cannot outlive its last
+ * route, and a live one is never dropped early.
  */
 static unsigned int fpm_nhg_resolved_key(const void *data)
 {
@@ -448,21 +458,21 @@ static void fpm_nhg_resolved_bucket_free(void *data)
 }
 
 /*
- * Index `obj` under its current resolving prefix. A no-op for an object
- * without one, and idempotent: the same object is never listed twice, so a
- * refresh that does not actually move the resolution costs nothing.
+ * Index `obj` under the key (vrf_id, p). A no-op for an unnamed prefix, and
+ * idempotent: the same object is never listed twice under one key.
  */
-static void fpm_nhg_resolved_add(struct fpm_nhg_tables *t,
-				 struct fpm_dplane_nhg *obj)
+static void fpm_nhg_resolved_add_key(struct fpm_nhg_tables *t,
+				     struct fpm_dplane_nhg *obj, vrf_id_t vrf_id,
+				     const struct prefix *p)
 {
 	struct fpm_nhg_resolved_bucket ref = {}, *b;
 	uint32_t i;
 
-	if (obj->resolved_prefix.family == AF_UNSPEC)
+	if (p->family == AF_UNSPEC)
 		return;
 
-	ref.vrf_id = obj->vrf_id;
-	ref.p = obj->resolved_prefix;
+	ref.vrf_id = vrf_id;
+	ref.p = *p;
 	b = hash_get(t->by_resolved, &ref, fpm_nhg_resolved_alloc);
 
 	for (i = 0; i < b->count; i++)
@@ -477,8 +487,117 @@ static void fpm_nhg_resolved_add(struct fpm_nhg_tables *t,
 	b->objs[b->count++] = obj;
 
 	FPM_NHG_DEBUG("resolved-index add %pFX vrf %u -> dplane NHG %u (%s), bucket now %u",
-		      &obj->resolved_prefix, obj->vrf_id, obj->dplane_id,
+		      p, vrf_id, obj->dplane_id,
 		      fpm_nhg_level_str(obj->level), b->count);
+}
+
+/*
+ * Index an L-B object under its own resolving prefix — the prefix that is
+ * part of its identity, which is what keeps the entry exact (see by_resolved
+ * above).
+ */
+static void fpm_nhg_resolved_add(struct fpm_nhg_tables *t,
+				 struct fpm_dplane_nhg *obj)
+{
+	fpm_nhg_resolved_add_key(t, obj, obj->vrf_id, &obj->resolved_prefix);
+}
+
+/*
+ * One resolution a build used: collect (leaf, vrf_id, p) into the staging
+ * set, deduped. The membership itself is NOT created here — a build that
+ * fails and is rolled back must leave no trace — so memberships and their
+ * counts move only at the commit point (fpm_nhg_leaf_contrib_apply()).
+ */
+static void fpm_nhg_leaf_contrib_collect(struct fpm_nhg_staging *newq,
+					 struct fpm_dplane_nhg *obj,
+					 vrf_id_t vrf_id,
+					 const struct prefix *p)
+{
+	struct fpm_nhg_contrib *c;
+	uint32_t i;
+
+	if (p->family == AF_UNSPEC)
+		return;
+
+	for (i = 0; i < newq->contrib_count; i++) {
+		c = &newq->contribs[i];
+		if (c->obj == obj && c->vrf_id == vrf_id &&
+		    c->p.family == p->family &&
+		    c->p.prefixlen == p->prefixlen && prefix_same(&c->p, p))
+			return; /* this build already counts it */
+	}
+
+	if (newq->contrib_count == newq->contrib_cap) {
+		newq->contrib_cap = newq->contrib_cap
+					    ? newq->contrib_cap * 2
+					    : 4;
+		newq->contribs =
+			XREALLOC(MTYPE_FPM_NHG, newq->contribs,
+				 newq->contrib_cap *
+					 sizeof(*newq->contribs));
+	}
+	c = &newq->contribs[newq->contrib_count++];
+	c->obj = obj;
+	c->vrf_id = vrf_id;
+	c->p = *p;
+}
+
+static bool fpm_nhg_contrib_same(const struct fpm_nhg_contrib *a,
+				 const struct fpm_nhg_contrib *b)
+{
+	return a->obj == b->obj && a->vrf_id == b->vrf_id &&
+	       a->p.family == b->p.family && a->p.prefixlen == b->p.prefixlen &&
+	       prefix_same(&a->p, &b->p);
+}
+
+static struct fpm_nhg_resolved_member *
+fpm_nhg_leaf_member_find(struct fpm_dplane_nhg *obj, vrf_id_t vrf_id,
+			 const struct prefix *p)
+{
+	uint16_t i;
+
+	for (i = 0; i < obj->res_member_count; i++) {
+		struct fpm_nhg_resolved_member *m = &obj->res_members[i];
+
+		if (m->vrf_id == vrf_id && m->p.family == p->family &&
+		    m->p.prefixlen == p->prefixlen && prefix_same(&m->p, p))
+			return m;
+	}
+	return NULL;
+}
+
+/*
+ * One more route resolves through (vrf_id, p) to this leaf: count the
+ * membership, creating it — and its by_resolved entry — on the first route.
+ */
+static void fpm_nhg_leaf_member_acquire(struct fpm_nhg_tables *t,
+					struct fpm_dplane_nhg *obj,
+					vrf_id_t vrf_id,
+					const struct prefix *p)
+{
+	struct fpm_nhg_resolved_member *m;
+
+	m = fpm_nhg_leaf_member_find(obj, vrf_id, p);
+	if (m) {
+		m->count++;
+		return;
+	}
+
+	if (obj->res_member_count == obj->res_member_cap) {
+		obj->res_member_cap = obj->res_member_cap
+					      ? obj->res_member_cap * 2
+					      : 4;
+		obj->res_members =
+			XREALLOC(MTYPE_FPM_NHG, obj->res_members,
+				 obj->res_member_cap *
+					 sizeof(*obj->res_members));
+	}
+	m = &obj->res_members[obj->res_member_count++];
+	m->vrf_id = vrf_id;
+	m->p = *p;
+	m->count = 1;
+
+	fpm_nhg_resolved_add_key(t, obj, vrf_id, p);
 }
 
 /*
@@ -516,6 +635,41 @@ static void fpm_nhg_resolved_del_key(struct fpm_nhg_tables *t, vrf_id_t vrf_id,
 		hash_release(t->by_resolved, b);
 		fpm_nhg_resolved_bucket_free(b);
 	}
+}
+
+/*
+ * One fewer route resolves through (vrf_id, p) to this leaf: drop the
+ * membership — and its by_resolved entry — once the last route lets go.
+ *
+ * The member must exist: a contribution on a route entry exists exactly
+ * because a commit acquired it, and neither this object (kept alive by that
+ * route's reference) nor the other half of the count can have taken it away
+ * since.
+ */
+static void fpm_nhg_leaf_member_release(struct fpm_nhg_tables *t,
+					struct fpm_dplane_nhg *obj,
+					vrf_id_t vrf_id,
+					const struct prefix *p)
+{
+	struct fpm_nhg_resolved_member *m;
+	uint16_t idx;
+
+	m = fpm_nhg_leaf_member_find(obj, vrf_id, p);
+	assert(m != NULL);
+	assert(m->count > 0);
+	if (--m->count > 0)
+		return;
+
+	idx = (uint16_t)(m - obj->res_members);
+	memmove(&obj->res_members[idx], &obj->res_members[idx + 1],
+		(obj->res_member_count - idx - 1) * sizeof(*obj->res_members));
+	obj->res_member_count--;
+
+	FPM_NHG_DEBUG("release resolution %pFX vrf %u on dplane NHG %u (%s), %u member(s) left",
+		      p, vrf_id, obj->dplane_id,
+		      fpm_nhg_level_str(obj->level), obj->res_member_count);
+
+	fpm_nhg_resolved_del_key(t, vrf_id, p, obj);
 }
 
 static const struct fpm_nhg_resolved_bucket *
@@ -613,7 +767,25 @@ void fpm_nhg_insert(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj)
 
 void fpm_nhg_remove(struct fpm_nhg_tables *t, struct fpm_dplane_nhg *obj)
 {
-	fpm_nhg_resolved_del_key(t, obj->vrf_id, &obj->resolved_prefix, obj);
+	/*
+	 * Unindex from every key this object is listed under: an L-B has its
+	 * one resolving prefix (part of its identity), a leaf has each
+	 * (vrf, prefix) membership currently counted on it (see
+	 * fpm_nhg_leaf_member_acquire()). Both rollback and last-ref unref
+	 * route through here; flush() bypasses this path, which is why it
+	 * cleans the buckets before freeing the objects they borrow.
+	 */
+	if (obj->level == FPM_NHG_L_C) {
+		uint16_t i;
+
+		for (i = 0; i < obj->res_member_count; i++)
+			fpm_nhg_resolved_del_key(t,
+						 obj->res_members[i].vrf_id,
+						 &obj->res_members[i].p, obj);
+	} else {
+		fpm_nhg_resolved_del_key(t, obj->vrf_id, &obj->resolved_prefix,
+					 obj);
+	}
 	hash_release(t->by_hash, obj);
 	hash_release(t->by_id, obj);
 }
@@ -632,6 +804,7 @@ static void fpm_nhg_obj_free(void *data)
 		nexthop_free(obj->nh);
 	XFREE(MTYPE_FPM_NHG, obj->rib_nhg_ids);
 	XFREE(MTYPE_FPM_NHG, obj->children);
+	XFREE(MTYPE_FPM_NHG, obj->res_members);
 	XFREE(MTYPE_FPM_NHG, obj);
 }
 
@@ -666,6 +839,9 @@ static void fpm_nhg_rib_ids_purge(struct fpm_nhg_tables *t,
 
 static void fpm_nhg_route_entry_free(void *data)
 {
+	struct fpm_nhg_route_entry *e = data;
+
+	XFREE(MTYPE_FPM_NHG, e->contribs);
 	XFREE(MTYPE_FPM_NHG, data);
 }
 
@@ -741,8 +917,11 @@ static void fpm_nhg_staging_push(struct fpm_nhg_staging *s,
 void fpm_nhg_staging_free(struct fpm_nhg_staging *s)
 {
 	XFREE(MTYPE_FPM_NHG, s->objs);
+	XFREE(MTYPE_FPM_NHG, s->contribs);
 	s->count = 0;
 	s->cap = 0;
+	s->contrib_count = 0;
+	s->contrib_cap = 0;
 }
 
 /*
@@ -874,6 +1053,12 @@ static struct fpm_dplane_nhg *fpm_nhg_get_leaf(struct fpm_nhg_tables *t,
 		 * gate now covered by a less specific locator prefix). Identity
 		 * is untouched — neither field is in the leaf key — and neither
 		 * reaches the wire, so no message follows from the update.
+		 *
+		 * Only the display fields track the newest event. The counts
+		 * are not touched here: this build merely collects its
+		 * resolution, and the counts move at commit time, when the
+		 * diff against the route's previous set is applied — other
+		 * sharers keep their own counts meanwhile.
 		 */
 		if (resolved && resolved->family != AF_UNSPEC) {
 			if (obj->resolved_prefix.family != AF_UNSPEC &&
@@ -883,17 +1068,11 @@ static struct fpm_dplane_nhg *fpm_nhg_get_leaf(struct fpm_nhg_tables *t,
 					      obj->dplane_id,
 					      &obj->resolved_prefix, obj->vrf_id,
 					      resolved, resolved_vrf);
-			/*
-			 * The refresh can move this leaf to a different
-			 * resolving prefix, so the index entry moves with it.
-			 * Both calls are no-ops when nothing actually changed.
-			 */
-			fpm_nhg_resolved_del_key(t, obj->vrf_id,
-						 &obj->resolved_prefix, obj);
 			obj->resolved_prefix = *resolved;
 			obj->vrf_id = resolved_vrf;
 			obj->resolved_via = resolved_via;
-			fpm_nhg_resolved_add(t, obj);
+			fpm_nhg_leaf_contrib_collect(newq, obj, resolved_vrf,
+						     resolved);
 		}
 		return obj;
 	}
@@ -911,17 +1090,21 @@ static struct fpm_dplane_nhg *fpm_nhg_get_leaf(struct fpm_nhg_tables *t,
 		obj->nhg_flags = FPM_NHG_FLAG_RECEIVED;
 	/*
 	 * Resolving info for a leaf that stands in for a recursive nexthop
-	 * (the SRv6 top-level-only path): that nexthop still resolved through a
-	 * prefix, and the resolved-via view records which one. Set only on
-	 * creation, never patched onto a dedupe hit: the resolving prefix
-	 * follows from the gate, which the leaf key already digests, so every
-	 * sharer of this object resolved the same way.
+	 * (the SRv6 top-level-only path), or for a plain leaf zebra reached
+	 * through some covering prefix: the resolved-via view records which
+	 * one, and the resolution joins this build's contribution set, from
+	 * which by_resolved and the membership count are maintained at
+	 * commit.
+	 *
+	 * The fields are the last-seen value (kept current on reuse above);
+	 * the membership itself is created and counted only when this build
+	 * commits.
 	 */
 	if (resolved && resolved->family != AF_UNSPEC) {
 		obj->resolved_prefix = *resolved;
 		obj->vrf_id = resolved_vrf;
 		obj->resolved_via = resolved_via;
-		fpm_nhg_resolved_add(t, obj);
+		fpm_nhg_leaf_contrib_collect(newq, obj, resolved_vrf, resolved);
 	}
 	return obj;
 }
@@ -1489,9 +1672,75 @@ struct fpm_dplane_nhg *fpm_nhg_route_get(struct fpm_nhg_tables *t,
 	return e ? e->obj : NULL;
 }
 
+/*
+ * Move the per-membership counts from the route's previous contribution set
+ * to the build being committed: entries only in the old set release their
+ * membership, entries only in the new set acquire one, and the entry takes
+ * over the new set. Runs before the old top object is unreffed, so every
+ * leaf either set names is still alive.
+ */
+static void fpm_nhg_leaf_contrib_apply(struct fpm_nhg_tables *t,
+				       struct fpm_nhg_route_entry *e,
+				       struct fpm_nhg_staging *newq)
+{
+	const struct fpm_nhg_contrib *c;
+	uint32_t i, j, released = 0, acquired = 0;
+
+	for (i = 0; i < e->contrib_count; i++) {
+		c = &e->contribs[i];
+		for (j = 0; j < newq->contrib_count; j++)
+			if (fpm_nhg_contrib_same(c, &newq->contribs[j]))
+				break;
+		if (j == newq->contrib_count) {
+			fpm_nhg_leaf_member_release(t, c->obj, c->vrf_id,
+						    &c->p);
+			released++;
+		}
+	}
+
+	for (i = 0; i < newq->contrib_count; i++) {
+		c = &newq->contribs[i];
+		for (j = 0; j < e->contrib_count; j++)
+			if (fpm_nhg_contrib_same(c, &e->contribs[j]))
+				break;
+		if (j == e->contrib_count) {
+			fpm_nhg_leaf_member_acquire(t, c->obj, c->vrf_id,
+						    &c->p);
+			acquired++;
+		}
+	}
+
+	FPM_NHG_DEBUG("route %pFX table %u contributions: %u released, %u acquired, %u total",
+		      &e->key.p, e->key.table_id, released, acquired,
+		      newq->contrib_count);
+
+	XFREE(MTYPE_FPM_NHG, e->contribs);
+	e->contribs = newq->contribs;
+	e->contrib_count = newq->contrib_count;
+	newq->contribs = NULL;
+	newq->contrib_count = 0;
+	newq->contrib_cap = 0;
+}
+
+/*
+ * Release every membership this route held, before its entry goes away.
+ */
+static void fpm_nhg_leaf_contribs_drop(struct fpm_nhg_tables *t,
+				       struct fpm_nhg_route_entry *e)
+{
+	uint32_t i;
+
+	for (i = 0; i < e->contrib_count; i++)
+		fpm_nhg_leaf_member_release(t, e->contribs[i].obj,
+					    e->contribs[i].vrf_id,
+					    &e->contribs[i].p);
+	e->contrib_count = 0;
+}
+
 static void fpm_nhg_route_set(struct fpm_nhg_tables *t,
 			      const struct fpm_nhg_route_key *k,
-			      struct fpm_dplane_nhg *obj, uint32_t rib_id)
+			      struct fpm_dplane_nhg *obj, uint32_t rib_id,
+			      struct fpm_nhg_staging *newq)
 {
 	struct fpm_nhg_route_entry ref = { .key = *k }, *e;
 
@@ -1516,6 +1765,7 @@ static void fpm_nhg_route_set(struct fpm_nhg_tables *t,
 	e->obj = obj; /* replaces any previous object: caller unrefs the old */
 	e->rib_id = rib_id;
 	fpm_nhg_record_rib_id(t, obj, rib_id);
+	fpm_nhg_leaf_contrib_apply(t, e, newq);
 }
 
 static struct fpm_dplane_nhg *
@@ -1530,19 +1780,21 @@ fpm_nhg_route_pop(struct fpm_nhg_tables *t, const struct fpm_nhg_route_key *k)
 	obj = e->obj;
 	FPM_NHG_DEBUG("unbind route %pFX table %u from dplane NHG %u, rib nhg %u",
 		      &k->p, k->table_id, obj ? obj->dplane_id : 0, e->rib_id);
+	fpm_nhg_leaf_contribs_drop(t, e);
 	fpm_nhg_release_rib_id(t, obj, e->rib_id);
-	XFREE(MTYPE_FPM_NHG, e);
+	fpm_nhg_route_entry_free(e);
 	return obj;
 }
 
 void fpm_nhg_route_commit(struct fpm_nhg_tables *t,
 			  const struct fpm_nhg_route_key *k,
 			  struct fpm_dplane_nhg *new_top, uint32_t rib_id,
-			  struct fpm_nhg_del_queue *delq)
+			  struct fpm_nhg_del_queue *delq,
+			  struct fpm_nhg_staging *newq)
 {
 	struct fpm_dplane_nhg *old_top = fpm_nhg_route_get(t, k);
 
-	fpm_nhg_route_set(t, k, new_top, rib_id);
+	fpm_nhg_route_set(t, k, new_top, rib_id, newq);
 	fpm_nhg_ref(new_top);
 	if (old_top)
 		fpm_nhg_unref(t, old_top, delq);
@@ -1617,20 +1869,25 @@ static void fpm_nhg_record_rib_id(struct fpm_nhg_tables *t,
 	}
 
 	/*
-	 * Repoint unconditionally, including when the id was already known:
-	 * another object may have claimed it in between, and the recorder of
-	 * the route event just processed is the current mapping.
+	 * Steal the entry only when it has no live references: re-pointing a
+	 * referenced entry would drop its routes from the accounting, and the
+	 * reverse lookup would then forget a zebra NHG id that routes still
+	 * map. A live entry keeps its current owner until the owner's last
+	 * route releases it. This route's id still lands on its own object's
+	 * list above, so the object view keeps showing it.
 	 */
 	e = hash_get(t->by_rib_id, &ref, fpm_nhg_rib_entry_alloc);
 	if (e->obj != obj) {
+		if (e->refcount > 0) {
+			FPM_NHG_DEBUG("rib nhg %u keeps owner dplane NHG %u (%u live ref(s)), not re-pointed to dplane NHG %u",
+				      rib_id, e->obj->dplane_id, e->refcount,
+				      obj->dplane_id);
+			return;
+		}
 		if (e->obj)
 			FPM_NHG_DEBUG("rib nhg %u re-pointed: dplane NHG %u -> dplane NHG %u",
 				      rib_id, e->obj->dplane_id, obj->dplane_id);
-		/* re-pointed at a different object: the old one keeps the id in
-		 * its own list until its last route releases it below.
-		 */
 		e->obj = obj;
-		e->refcount = 0;
 	}
 	e->refcount++;
 }
@@ -1923,31 +2180,44 @@ static bool build_c_nhgfull_from_obj(struct C_NextHopGroupFull *c_nhg,
 			/* Get the default SRv6 context which contains seg6's src IP */
 			struct zebra_srv6 *srv6 = zebra_srv6_get_default();
 
-			c_nhg->nh_srv6 = malloc(sizeof(struct C_nexthop_srv6));
-			if (c_nhg->nh_srv6) {
-				/* field copy from nexthop_srv6 to C_nexthop_srv6 */
-				/* seg6local_action */
-				c_nhg->nh_srv6->seg6local_action =
-					(enum C_seg6local_action_t)nh->nh_srv6->seg6local_action;
+			/*
+			 * A failed allocation fails the whole encode: the caller
+			 * rolls the context back and zebra learns the route was
+			 * not programmed. Emitting the object without its SIDs
+			 * would instead make fpmsyncd program a broken SRv6 NHG
+			 * that no later event repairs.
+			 */
+			c_nhg->nh_srv6 = XCALLOC(MTYPE_FPM_NHG, sizeof(*c_nhg->nh_srv6));
+			if (c_nhg->nh_srv6 == NULL) {
+				zlog_err("%s: cannot allocate SRv6 info for dplane NHG %u",
+					 __func__, obj->dplane_id);
+				return false;
+			}
 
-				/* seg6local_ctx */
-				memcpy(&c_nhg->nh_srv6->seg6local_ctx, &nh->nh_srv6->seg6local_ctx,
-					sizeof(struct C_seg6local_context));
+			/* field copy from nexthop_srv6 to C_nexthop_srv6 */
+			/* seg6local_action */
+			c_nhg->nh_srv6->seg6local_action =
+				(enum C_seg6local_action_t)nh->nh_srv6->seg6local_action;
 
-				/* seg6_src */
-				c_nhg->nh_srv6->seg6_src = srv6->encap_src_addr;
+			/* seg6local_ctx */
+			memcpy(&c_nhg->nh_srv6->seg6local_ctx, &nh->nh_srv6->seg6local_ctx,
+				sizeof(struct C_seg6local_context));
 
-				/* seg6_segs */
-				c_nhg->nh_srv6->seg6_segs = NULL;  // clear the pointer to avoid pointing to old address
-				/* set nexthop_srv6 seg6_segs if present */
-				if (nh->nh_srv6->seg6_segs != NULL) {
-					size_t total_size = sizeof(struct C_seg6_seg_stack) +
-								nh->nh_srv6->seg6_segs->num_segs * sizeof(struct in6_addr);
-					c_nhg->nh_srv6->seg6_segs = malloc(total_size);
-					if (c_nhg->nh_srv6->seg6_segs) {
-						memcpy(c_nhg->nh_srv6->seg6_segs, nh->nh_srv6->seg6_segs, total_size);
-					}
+			/* seg6_src */
+			c_nhg->nh_srv6->seg6_src = srv6->encap_src_addr;
+
+			/* set nexthop_srv6 seg6_segs if present */
+			if (nh->nh_srv6->seg6_segs != NULL) {
+				size_t total_size = sizeof(struct C_seg6_seg_stack) +
+							nh->nh_srv6->seg6_segs->num_segs * sizeof(struct in6_addr);
+
+				c_nhg->nh_srv6->seg6_segs = XMALLOC(MTYPE_FPM_NHG, total_size);
+				if (c_nhg->nh_srv6->seg6_segs == NULL) {
+					zlog_err("%s: cannot allocate SRv6 segment list for dplane NHG %u",
+						 __func__, obj->dplane_id);
+					return false;
 				}
+				memcpy(c_nhg->nh_srv6->seg6_segs, nh->nh_srv6->seg6_segs, total_size);
 			}
 		}
 	}
@@ -1977,12 +2247,12 @@ static void free_c_nexthopgroupfull(struct C_NextHopGroupFull *c_nhg)
 	if (c_nhg->nh_srv6) {
 		/* Free seg6_segs if present */
 		if (c_nhg->nh_srv6->seg6_segs) {
-			free(c_nhg->nh_srv6->seg6_segs);
+			XFREE(MTYPE_FPM_NHG, c_nhg->nh_srv6->seg6_segs);
 			c_nhg->nh_srv6->seg6_segs = NULL;
 		}
 
 		/* Free nh_srv6 itself */
-		free(c_nhg->nh_srv6);
+		XFREE(MTYPE_FPM_NHG, c_nhg->nh_srv6);
 		c_nhg->nh_srv6 = NULL;
 	}
 }
@@ -2260,55 +2530,158 @@ struct fpm_nhg_show_args {
 /* Max zebra NHG ids printed per object in the text form of `show fpm nhg-fib`. */
 #define FPM_NHG_SHOW_RIB_IDS 8
 
-static void fpm_nhg_show_obj(const struct fpm_dplane_nhg *obj, void *arg)
+/* One child edge of a snapshot: the member's dplane id and its weight. */
+struct fpm_nhg_show_child {
+	uint32_t dplane_id;
+	uint16_t weight;
+};
+
+/*
+ * One object copied out of the tables for rendering.
+ *
+ * The tables are mutated — and objects freed — under obuf_mutex by the FPM
+ * pthread and the zebra main-thread resync walk, so a printer that read live
+ * objects would have to hold that lock for the whole dump and stall route
+ * programming. The commands instead copy everything they render into these
+ * plain values (child ids, not child pointers) under the lock and print after
+ * releasing it.
+ */
+struct fpm_nhg_show_snap {
+	uint64_t hash;
+	uint32_t dplane_id;
+	uint32_t nhg_flags;
+	uint32_t refcount;
+	uint8_t level;
+	vrf_id_t vrf_id;
+	struct prefix resolved_prefix;
+	uint32_t resolved_via;
+	struct fpm_nhg_show_child *children; /* num_children entries */
+	uint16_t num_children;
+	uint32_t *rib_ids; /* rib_id_count entries */
+	uint16_t rib_id_count;
+};
+
+struct fpm_nhg_show_list {
+	struct fpm_nhg_show_snap *snaps;
+	uint32_t count, cap;
+};
+
+/* Copy everything the printers need out of `obj`. Requires the tables lock. */
+static void fpm_nhg_snap_from_obj(const struct fpm_dplane_nhg *obj,
+				  struct fpm_nhg_show_snap *s)
 {
-	struct fpm_nhg_show_args *sa = arg;
+	uint16_t i;
+
+	s->hash = obj->hash;
+	s->dplane_id = obj->dplane_id;
+	s->nhg_flags = obj->nhg_flags;
+	s->refcount = obj->refcount;
+	s->level = obj->level;
+	s->vrf_id = obj->vrf_id;
+	s->resolved_prefix = obj->resolved_prefix;
+	s->resolved_via = obj->resolved_via;
+
+	s->num_children = obj->num_children;
+	s->children = NULL;
+	if (obj->num_children) {
+		s->children = XCALLOC(MTYPE_TMP, obj->num_children *
+						       sizeof(*s->children));
+		for (i = 0; i < obj->num_children; i++) {
+			s->children[i].dplane_id =
+				obj->children[i].obj->dplane_id;
+			s->children[i].weight = obj->children[i].weight;
+		}
+	}
+
+	s->rib_id_count = obj->rib_nhg_id_count;
+	s->rib_ids = NULL;
+	if (obj->rib_nhg_id_count) {
+		s->rib_ids = XMALLOC(MTYPE_TMP,
+				     obj->rib_nhg_id_count * sizeof(*s->rib_ids));
+		memcpy(s->rib_ids, obj->rib_nhg_ids,
+		       obj->rib_nhg_id_count * sizeof(*s->rib_ids));
+	}
+}
+
+/* Append one object's snapshot. Requires the tables lock. */
+static void fpm_nhg_show_list_push(struct fpm_nhg_show_list *l,
+				   const struct fpm_dplane_nhg *obj)
+{
+	if (l->count == l->cap) {
+		l->cap = l->cap ? l->cap * 2 : 16;
+		l->snaps = XREALLOC(MTYPE_TMP, l->snaps,
+				    l->cap * sizeof(*l->snaps));
+	}
+	fpm_nhg_snap_from_obj(obj, &l->snaps[l->count++]);
+}
+
+static void fpm_nhg_show_list_free(struct fpm_nhg_show_list *l)
+{
+	uint32_t i;
+
+	for (i = 0; i < l->count; i++) {
+		XFREE(MTYPE_TMP, l->snaps[i].children);
+		XFREE(MTYPE_TMP, l->snaps[i].rib_ids);
+	}
+	XFREE(MTYPE_TMP, l->snaps);
+}
+
+static void fpm_nhg_snap_collect_cb(const struct fpm_dplane_nhg *obj,
+				    void *arg)
+{
+	fpm_nhg_show_list_push(arg, obj);
+}
+
+/* Render one snapshot. Callers must have released the tables lock. */
+static void fpm_nhg_show_snap(const struct fpm_nhg_show_snap *s,
+			      const struct fpm_nhg_show_args *sa)
+{
 	struct vty *vty = sa->vty;
 	char hashbuf[32];
 	uint16_t i;
 
-	snprintfrr(hashbuf, sizeof(hashbuf), "0x%016" PRIx64, obj->hash);
+	snprintfrr(hashbuf, sizeof(hashbuf), "0x%016" PRIx64, s->hash);
 
 	if (sa->jarray) {
 		struct json_object *jo = json_object_new_object();
 		struct json_object *jchildren, *jrib;
 
-		json_object_int_add(jo, "dplaneId", obj->dplane_id);
+		json_object_int_add(jo, "dplaneId", s->dplane_id);
 		json_object_string_add(jo, "level",
-				       fpm_nhg_level_str(obj->level));
-		json_object_int_add(jo, "flags", obj->nhg_flags);
-		json_object_int_add(jo, "refcount", obj->refcount);
+				       fpm_nhg_level_str(s->level));
+		json_object_int_add(jo, "flags", s->nhg_flags);
+		json_object_int_add(jo, "refcount", s->refcount);
 		json_object_string_add(jo, "hash", hashbuf);
 
 		jchildren = json_object_new_array();
-		for (i = 0; i < obj->num_children; i++) {
+		for (i = 0; i < s->num_children; i++) {
 			struct json_object *jc = json_object_new_object();
 
 			json_object_int_add(jc, "id",
-					    obj->children[i].obj->dplane_id);
+					    s->children[i].dplane_id);
 			json_object_int_add(jc, "weight",
-					    obj->children[i].weight);
+					    s->children[i].weight);
 			json_object_array_add(jchildren, jc);
 		}
 		json_object_object_add(jo, "children", jchildren);
 
 		/* L-B only: omitted entirely when there is no resolving info. */
-		if (obj->resolved_prefix.family != AF_UNSPEC) {
+		if (s->resolved_prefix.family != AF_UNSPEC) {
 			char pbuf[PREFIX_STRLEN];
 
 			snprintfrr(pbuf, sizeof(pbuf), "%pFX",
-				   &obj->resolved_prefix);
+				   &s->resolved_prefix);
 			json_object_string_add(jo, "resolvedVia", pbuf);
 			json_object_int_add(jo, "resolvingRibNhgId",
-					    obj->resolved_via);
+					    s->resolved_via);
 		}
-		json_object_int_add(jo, "vrfId", obj->vrf_id);
+		json_object_int_add(jo, "vrfId", s->vrf_id);
 
 		jrib = json_object_new_array();
-		for (i = 0; i < obj->rib_nhg_id_count; i++)
+		for (i = 0; i < s->rib_id_count; i++)
 			json_object_array_add(
 				jrib,
-				json_object_new_int64(obj->rib_nhg_ids[i]));
+				json_object_new_int64(s->rib_ids[i]));
 		json_object_object_add(jo, "ribNhgIds", jrib);
 
 		json_object_array_add(sa->jarray, jo);
@@ -2316,37 +2689,35 @@ static void fpm_nhg_show_obj(const struct fpm_dplane_nhg *obj, void *arg)
 	}
 
 	vty_out(vty, "Dplane NHG %u (%s) flags 0x%04x refcount %u hash %s\n",
-		obj->dplane_id, fpm_nhg_level_str(obj->level), obj->nhg_flags,
-		obj->refcount, hashbuf);
+		s->dplane_id, fpm_nhg_level_str(s->level), s->nhg_flags,
+		s->refcount, hashbuf);
 
-	if (obj->resolved_prefix.family != AF_UNSPEC)
+	if (s->resolved_prefix.family != AF_UNSPEC)
 		vty_out(vty, "  resolved via %pFX vrf %u rib nhg %u\n",
-			&obj->resolved_prefix, obj->vrf_id, obj->resolved_via);
+			&s->resolved_prefix, s->vrf_id, s->resolved_via);
 
-	if (obj->num_children) {
+	if (s->num_children) {
 		vty_out(vty, "  children:");
-		for (i = 0; i < obj->num_children; i++)
+		for (i = 0; i < s->num_children; i++)
 			vty_out(vty, " %u(w%u)",
-				obj->children[i].obj->dplane_id,
-				obj->children[i].weight);
+				s->children[i].dplane_id,
+				s->children[i].weight);
 		vty_out(vty, "\n");
 	}
 
-	if (obj->rib_nhg_id_count) {
+	if (s->rib_id_count) {
 		/*
 		 * The id list is uncapped (a widely shared object can collect
 		 * many), so bound the text form to keep one object on one
 		 * line. The json form above stays complete.
 		 */
-		uint16_t shown = MIN(obj->rib_nhg_id_count,
-				     FPM_NHG_SHOW_RIB_IDS);
+		uint16_t shown = MIN(s->rib_id_count, FPM_NHG_SHOW_RIB_IDS);
 
 		vty_out(vty, "  rib nhg ids:");
 		for (i = 0; i < shown; i++)
-			vty_out(vty, " %u", obj->rib_nhg_ids[i]);
-		if (shown < obj->rib_nhg_id_count)
-			vty_out(vty, " +%u more",
-				obj->rib_nhg_id_count - shown);
+			vty_out(vty, " %u", s->rib_ids[i]);
+		if (shown < s->rib_id_count)
+			vty_out(vty, " +%u more", s->rib_id_count - shown);
 		vty_out(vty, "\n");
 	}
 }
@@ -2354,10 +2725,12 @@ static void fpm_nhg_show_obj(const struct fpm_dplane_nhg *obj, void *arg)
 /*
  * `show fpm nhg-fib resolved-via`: the inverted view of the resolving info.
  *
- * Only L-B objects carry a resolving prefix, and several of them can share one
- * (they differ in label stack or in resolved members), so the mapping is
- * prefix -> set of dplane NHG ids. That set is exactly what depends on the
- * prefix.
+ * Reports the display value each object carries: L-B objects always have one
+ * (several can share a prefix, differing in label stack or resolved members),
+ * a leaf shows the last prefix its sharers were seen with. It is a diagnostic
+ * view of what the objects hold now, last-writer-wins included; for the
+ * blast-radius-grade mapping see by_resolved instead (L-B and leaf
+ * memberships are both exact there).
  *
  * Derived by walking the object table rather than from a dedicated index: the
  * view is diagnostic, so a scan cannot go stale against the objects it reports.
@@ -2416,35 +2789,44 @@ static int fpm_nhg_rv_cmp(const void *a, const void *b)
 	return 0;
 }
 
-static void fpm_nhg_show_resolved_via(struct vty *vty,
-				      struct json_object *jarray)
+/* Collect the entries. Requires the tables lock. */
+static void fpm_nhg_rv_fill(struct fpm_nhg_rv_collect *c)
 {
-	struct fpm_nhg_rv_collect c = {};
+	fpm_nhg_walk(show_tables, fpm_nhg_rv_collect_cb, c);
+}
+
+/*
+ * Render the collected entries. Callers must have released the tables lock:
+ * the collect copies plain values only, so the sorting and formatting below
+ * cannot stall route programming.
+ */
+static void fpm_nhg_rv_print(struct vty *vty, struct json_object *jarray,
+			     struct fpm_nhg_rv_collect *c)
+{
 	char pbuf[PREFIX_STRLEN];
 	uint32_t i, j, k;
 
-	fpm_nhg_walk(show_tables, fpm_nhg_rv_collect_cb, &c);
-	if (c.count == 0) {
+	if (c->count == 0) {
 		if (!jarray)
 			vty_out(vty, "No resolving prefixes recorded\n");
 		return;
 	}
-	qsort(c.ents, c.count, sizeof(*c.ents), fpm_nhg_rv_cmp);
+	qsort(c->ents, c->count, sizeof(*c->ents), fpm_nhg_rv_cmp);
 
 	if (!jarray)
 		vty_out(vty, "%-40s %-4s %-12s %s\n", "Resolving prefix",
 			"VRF", "Resolved by", "Dplane NHG ids");
 
-	for (i = 0; i < c.count; i = j) {
+	for (i = 0; i < c->count; i = j) {
 		/* collapse the run of entries sharing this (vrf, prefix) */
-		for (j = i + 1; j < c.count; j++) {
-			if (c.ents[j].vrf_id != c.ents[i].vrf_id ||
-			    c.ents[j].resolved_via != c.ents[i].resolved_via ||
-			    prefix_cmp(&c.ents[j].p, &c.ents[i].p) != 0)
+		for (j = i + 1; j < c->count; j++) {
+			if (c->ents[j].vrf_id != c->ents[i].vrf_id ||
+			    c->ents[j].resolved_via != c->ents[i].resolved_via ||
+			    prefix_cmp(&c->ents[j].p, &c->ents[i].p) != 0)
 				break;
 		}
 
-		snprintfrr(pbuf, sizeof(pbuf), "%pFX", &c.ents[i].p);
+		snprintfrr(pbuf, sizeof(pbuf), "%pFX", &c->ents[i].p);
 
 		/*
 		 * Only the resolving zebra NHG id is reported. It deliberately
@@ -2460,31 +2842,31 @@ static void fpm_nhg_show_resolved_via(struct vty *vty,
 			struct json_object *jids = json_object_new_array();
 
 			json_object_string_add(jo, "resolvedVia", pbuf);
-			json_object_int_add(jo, "vrfId", c.ents[i].vrf_id);
+			json_object_int_add(jo, "vrfId", c->ents[i].vrf_id);
 			json_object_int_add(jo, "resolvingRibNhgId",
-					    c.ents[i].resolved_via);
+					    c->ents[i].resolved_via);
 			for (k = i; k < j; k++)
 				json_object_array_add(
 					jids,
 					json_object_new_int64(
-						c.ents[k].dplane_id));
+						c->ents[k].dplane_id));
 			json_object_object_add(jo, "dplaneIds", jids);
 			json_object_array_add(jarray, jo);
 		} else {
-			if (c.ents[i].resolved_via)
+			if (c->ents[i].resolved_via)
 				vty_out(vty, "%-40s %-4u rib %-8u", pbuf,
-					c.ents[i].vrf_id,
-					c.ents[i].resolved_via);
+					c->ents[i].vrf_id,
+					c->ents[i].resolved_via);
 			else
 				vty_out(vty, "%-40s %-4u %-12s", pbuf,
-					c.ents[i].vrf_id, "-");
+					c->ents[i].vrf_id, "-");
 			for (k = i; k < j; k++)
-				vty_out(vty, " %u", c.ents[k].dplane_id);
+				vty_out(vty, " %u", c->ents[k].dplane_id);
 			vty_out(vty, "\n");
 		}
 	}
 
-	XFREE(MTYPE_TMP, c.ents);
+	XFREE(MTYPE_TMP, c->ents);
 }
 
 /*
@@ -2503,9 +2885,9 @@ static void fpm_nhg_show_resolved_via(struct vty *vty,
  * VRF id.
  */
 static void fpm_nhg_show_route(struct vty *vty, struct json_object *jarray,
+			       struct fpm_nhg_show_list *list,
 			       const char *prefix_str, const char *vrf_name)
 {
-	struct fpm_nhg_show_args sa = { .vty = vty, .jarray = jarray };
 	const struct fpm_dplane_nhg *obj;
 	struct fpm_nhg_route_key key;
 	struct zebra_vrf *zvrf;
@@ -2538,7 +2920,7 @@ static void fpm_nhg_show_route(struct vty *vty, struct json_object *jarray,
 		return;
 	}
 
-	fpm_nhg_show_obj(obj, &sa);
+	fpm_nhg_show_list_push(list, obj);
 }
 
 DEFUN(fpm_show_nhg_fib, fpm_show_nhg_fib_cmd,
@@ -2558,6 +2940,8 @@ DEFUN(fpm_show_nhg_fib, fpm_show_nhg_fib_cmd,
       JSON_STR)
 {
 	struct fpm_nhg_show_args sa = {};
+	struct fpm_nhg_show_list list = {};
+	struct fpm_nhg_rv_collect rv = {};
 	bool json = false, filter = false, rib_filter = false;
 	bool resolved_via = false, found = true;
 	const char *route_str = NULL, *vrf_str = NULL;
@@ -2601,14 +2985,18 @@ DEFUN(fpm_show_nhg_fib, fpm_show_nhg_fib_cmd,
 	 * fpm_nl_enqueue() from the fpm_rib_send() resync walk — together with
 	 * the messages describing those mutations. A reader that skipped the
 	 * mutex could see half-built objects (children array swapped in, count
-	 * not yet bumped) or follow a child pointer an unref just freed, so the
-	 * whole walk stays inside the same critical section.
+	 * not yet bumped) or follow a child pointer an unref just freed, so
+	 * the collection — and only the collection — stays inside the same
+	 * critical section: everything is copied out as plain values and
+	 * rendered after the lock is released, so a full dump cannot stall the
+	 * route programming this mutex serializes.
 	 */
 	frr_with_mutex (show_lock) {
 		if (route_str) {
-			fpm_nhg_show_route(vty, sa.jarray, route_str, vrf_str);
+			fpm_nhg_show_route(vty, sa.jarray, &list, route_str,
+					   vrf_str);
 		} else if (resolved_via) {
-			fpm_nhg_show_resolved_via(vty, sa.jarray);
+			fpm_nhg_rv_fill(&rv);
 		} else if (filter || rib_filter) {
 			const struct fpm_dplane_nhg *obj;
 
@@ -2623,11 +3011,23 @@ DEFUN(fpm_show_nhg_fib, fpm_show_nhg_fib_cmd,
 			else
 				obj = fpm_nhg_lookup_id(show_tables, filter_id);
 			if (obj)
-				fpm_nhg_show_obj(obj, &sa);
+				fpm_nhg_show_list_push(&list, obj);
 			else
 				found = false;
 		} else
-			fpm_nhg_walk(show_tables, fpm_nhg_show_obj, &sa);
+			fpm_nhg_walk(show_tables, fpm_nhg_snap_collect_cb,
+				     &list);
+	}
+
+	/* Lock released: render what was copied. */
+	if (resolved_via) {
+		fpm_nhg_rv_print(vty, sa.jarray, &rv);
+	} else {
+		uint32_t k;
+
+		for (k = 0; k < list.count; k++)
+			fpm_nhg_show_snap(&list.snaps[k], &sa);
+		fpm_nhg_show_list_free(&list);
 	}
 
 	if (sa.jarray) {

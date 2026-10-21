@@ -1384,7 +1384,13 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 	req->r.rtm_family = p->family;
 	req->r.rtm_dst_len = p->prefixlen;
 	req->r.rtm_scope = RT_SCOPE_UNIVERSE;
-	req->r.rtm_type = RTN_UNICAST;
+	/*
+	 * rtm_type and the RTA_DST added below only serve fpmsyncd's
+	 * offload-ack parsing in nhg-fib mode; default and
+	 * use-next-hop-groups keep the historical localsid wire format.
+	 */
+	if (gfnc->use_nhg_fib)
+		req->r.rtm_type = RTN_UNICAST;
 
 	if (cmd == RTM_DELSRV6LOCALSID)
 		req->r.rtm_protocol = zebra2proto(dplane_ctx_get_old_type(ctx));
@@ -1395,11 +1401,12 @@ static ssize_t netlink_srv6_localsid_msg_encode(int cmd,
 		return 0;
 
 	/*
-	 * Also emit standard RTA_DST so fpmsyncd's offload-ack (which
-	 * rewrites nlmsg_type to RTM_NEWROUTE and echoes the body back)
-	 * can be parsed by zebra's regular route reader.
+	 * In nhg-fib mode, also emit standard RTA_DST so fpmsyncd's
+	 * offload-ack (which rewrites nlmsg_type to RTM_NEWROUTE and echoes
+	 * the body back) can be parsed by zebra's regular route reader.
 	 */
-	if (!nl_attr_put(&req->n, datalen, RTA_DST, &p->u.prefix, bytelen))
+	if (gfnc->use_nhg_fib &&
+	    !nl_attr_put(&req->n, datalen, RTA_DST, &p->u.prefix, bytelen))
 		return 0;
 
 	/* Table corresponding to this route. */
@@ -4183,10 +4190,10 @@ static void fpm_nhg_pending_dels_flush_locked(struct fpm_nl_ctx *fnc,
  *     caller can retry (or report the failure to zebra);
  *  4. write the batch in one piece and drop the carried-over DELs: they are
  *     on the wire now;
- *  5. only then mutate state (map upsert, ref of the new top, unref of the
- *     old one). The unref is what produces DEL ids, and it frees the objects
- *     as it goes — there is no undo past this point, which is exactly why it
- *     comes last: the write no longer depends on any of its results. The ids
+ *  5. only then mutate state (map upsert, membership diff, ref of the new
+ *     top, unref of the old one). The unref is what produces DEL ids, and it
+ *     frees the objects as it goes — there is no undo past this point, which
+ *     is exactly why it comes last: the write no longer depends on any of its results. The ids
  *     it produces are appended to fnc->pending_dels and ride out at the head
  *     of the next batch (or in the end-of-drain flush), which is where the
  *     need for any guessed DEL allowance disappears.
@@ -4405,7 +4412,6 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	/* One atomic write for the whole context. */
 	ret = fpm_frame_batch_write_locked(fnc, &batch, __func__);
 	fpm_nhg_frame_batch_free(&batch);
-	fpm_nhg_staging_free(&newq);
 
 	/*
 	 * The carried-over DELs are on the wire (or a resync was forced, which
@@ -4418,7 +4424,15 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 		fpm_nhg_route_forget(&fnc->nhg_tables, &key, &fnc->pending_dels);
 	else
 		fpm_nhg_route_commit(&fnc->nhg_tables, &key, new_top,
-				     dplane_ctx_get_nhe_id(ctx), &fnc->pending_dels);
+				     dplane_ctx_get_nhe_id(ctx),
+				     &fnc->pending_dels, &newq);
+
+	/*
+	 * The commit takes over the build's contribution set, so the staging
+	 * must outlive it and is dropped only now (on the delete path there is
+	 * no build and nothing to consume).
+	 */
+	fpm_nhg_staging_free(&newq);
 
 	/*
 	 * Keep the deferred DEL list bounded. Left alone it grows for as long as
