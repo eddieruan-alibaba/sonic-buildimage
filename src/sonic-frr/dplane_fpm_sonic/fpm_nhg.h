@@ -369,7 +369,7 @@ ssize_t fpm_nhg_del_msg_encode(uint32_t dplane_id, void *buf, size_t buflen);
  */
 bool fpm_nhg_batch_add_resolved_events(struct fpm_nhg_tables *t,
 				       vrf_id_t vrf_id, const struct prefix *p,
-				       bool recovery,
+				       bool recovery, uint8_t route_type,
 				       struct fpm_frame_batch *batch);
 
 /*
@@ -378,7 +378,8 @@ bool fpm_nhg_batch_add_resolved_events(struct fpm_nhg_tables *t,
  * clears the mark. Returns without effect once the bucket is gone.
  */
 void fpm_nhg_resolved_events_commit(struct fpm_nhg_tables *t, vrf_id_t vrf_id,
-				    const struct prefix *p, bool recovery);
+				    const struct prefix *p, bool recovery,
+				    uint8_t route_type);
 
 /*
  * Install `show fpm nhg-fib`. The pointed-to objects must outlive the daemon:

@@ -4214,7 +4214,7 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	struct fpm_nhg_route_key key;
 	size_t nl_buf_len = 0, route_off;
 	bool encode_ok = true;
-	bool resolved_event, recovery;
+	bool recovery;
 	struct nlmsghdr *n;
 	ssize_t rv;
 	int ret;
@@ -4234,14 +4234,12 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	old_top = fpm_nhg_route_get(&fnc->nhg_tables, &key);
 
 	/*
-	 * A resolve-via route event is due when this route appears or
-	 * disappears: an install of a route the plugin had not bound yet means
-	 * its resolution came back (undo the PIC fix-up), a delete means the
-	 * NHGs that resolved through it lose their resolution. An UPDATE
-	 * re-installs the route in the same context and is neither.
+	 * Every route context is a candidate resolve-via event: a delete
+	 * withdraws the resolutions of its prefix, any install of a route of
+	 * the same type is the recovery that undoes the fix-up. The
+	 * resolved-prefix index decides which of the two applies.
 	 */
-	recovery = (op != DPLANE_OP_ROUTE_DELETE) && (old_top == NULL);
-	resolved_event = (op == DPLANE_OP_ROUTE_DELETE) || recovery;
+	recovery = (op != DPLANE_OP_ROUTE_DELETE);
 
 	/*
 	 * Explicit removal: DELETE, and UPDATE when route replace semantics
@@ -4392,10 +4390,11 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	 * The event rides after this context's route so the peer has already
 	 * applied the route change when it walks the affected NHGs.
 	 */
-	if (encode_ok && resolved_event) {
+	if (encode_ok) {
 		encode_ok = fpm_nhg_batch_add_resolved_events(
 			&fnc->nhg_tables, dplane_ctx_get_vrf(ctx),
-			dplane_ctx_get_dest(ctx), recovery, &batch);
+			dplane_ctx_get_dest(ctx), recovery,
+			(uint8_t)dplane_ctx_get_type(ctx), &batch);
 		if (!encode_ok)
 			zlog_err("%s: resolved event encode failed, dropping ctx",
 				 __func__);
@@ -4438,10 +4437,11 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	ret = fpm_frame_batch_write_locked(fnc, &batch, __func__);
 	fpm_nhg_frame_batch_free(&batch);
 
-	if (ret == 0 && resolved_event)
+	if (ret == 0)
 		fpm_nhg_resolved_events_commit(
 			&fnc->nhg_tables, dplane_ctx_get_vrf(ctx),
-			dplane_ctx_get_dest(ctx), recovery);
+			dplane_ctx_get_dest(ctx), recovery,
+			(uint8_t)dplane_ctx_get_type(ctx));
 
 	/*
 	 * The carried-over DELs are on the wire (or a resync was forced, which

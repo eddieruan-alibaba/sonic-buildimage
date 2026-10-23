@@ -410,6 +410,7 @@ struct fpm_nhg_resolved_bucket {
 	 * an install of the same route undoes. Cleared again by that install.
 	 */
 	bool withdrawn;
+	uint8_t withdrawn_type;
 };
 
 /*
@@ -773,7 +774,7 @@ static ssize_t fpm_nhg_resolved_event_encode(const struct fpm_dplane_nhg *obj,
 
 bool fpm_nhg_batch_add_resolved_events(struct fpm_nhg_tables *t,
 				       vrf_id_t vrf_id, const struct prefix *p,
-				       bool recovery,
+				       bool recovery, uint8_t route_type,
 				       struct fpm_frame_batch *batch)
 {
 	const struct fpm_nhg_resolved_bucket *b;
@@ -786,11 +787,12 @@ bool fpm_nhg_batch_add_resolved_events(struct fpm_nhg_tables *t,
 		return true;
 
 	/*
-	 * Recovery only reverses a fix-up this plugin actually reported, so an
-	 * install that merely re-populates the index (initial replay) stays
-	 * silent.
+	 * Recovery only reverses a fix-up this plugin reported for the same
+	 * route, so an install that merely re-populates the index (initial
+	 * replay) or a different route for the same prefix stays silent.
 	 */
-	if (recovery && !b->withdrawn)
+	if (recovery &&
+	    (!b->withdrawn || b->withdrawn_type != route_type))
 		return true;
 
 	buf = XMALLOC(MTYPE_FPM_NHG, FPM_NHG_MSG_BUF_SIZE);
@@ -816,7 +818,8 @@ bool fpm_nhg_batch_add_resolved_events(struct fpm_nhg_tables *t,
  * write so a retried context re-emits the same event.
  */
 void fpm_nhg_resolved_events_commit(struct fpm_nhg_tables *t, vrf_id_t vrf_id,
-				    const struct prefix *p, bool recovery)
+				    const struct prefix *p, bool recovery,
+				    uint8_t route_type)
 {
 	struct fpm_nhg_resolved_bucket *b;
 
@@ -825,7 +828,14 @@ void fpm_nhg_resolved_events_commit(struct fpm_nhg_tables *t, vrf_id_t vrf_id,
 	if (b == NULL || b->count == 0)
 		return;
 
-	b->withdrawn = !recovery;
+	if (recovery) {
+		if (b->withdrawn && b->withdrawn_type == route_type)
+			b->withdrawn = false;
+		return;
+	}
+
+	b->withdrawn = true;
+	b->withdrawn_type = route_type;
 }
 
 
@@ -1404,6 +1414,19 @@ static int fpm_nhg_collect_children(struct fpm_nhg_tables *t,
 	uint16_t i = 0;
 
 	for (nh = chain; nh; nh = nh->next) {
+		/*
+		 * Only active nexthops are installable. A temporarily unresolved
+		 * nexthop stays in the route's list with ACTIVE cleared; deriving
+		 * an object from it would put a path the peer just fixed up back
+		 * into the derived NHG (and from there back into APP_DB).
+		 * SRv6 nexthops are exempt: their resolution happens in the SDK,
+		 * so zebra's activity flag does not describe the tunnel path and
+		 * the received object must keep its stable identity.
+		 */
+		if (!fpm_nhg_nh_has_srv6(nh) &&
+		    !CHECK_FLAG(nh->flags, NEXTHOP_FLAG_ACTIVE))
+			continue;
+
 		if (fpm_nhg_nh_has_srv6(nh)) {
 			/*
 			 * SRv6: derive the top level object only. The SID list
