@@ -166,5 +166,23 @@ module sonic-srv6 {
             }
         }
 
+        container SRV6_MY_SOURCE {
+            description "SRv6 encapsulation source address.";
+
+            list SRV6_MY_SOURCE_LIST {
+                key "name";
+
+                leaf name {
+                    type string;
+                    description "Source identifier";
+                }
+
+                leaf source-address {
+                    type inet:ipv6-address;
+                    description "IPv6 source address used for SRv6 encapsulation";
+                }
+            }
+        }
+
     }
 }

@@ -318,6 +318,16 @@ module sonic-bgp-global {
                     type uint16;
                     description "Global BGP hold time in seconds; session is reset if no keepalive is received within this period.";
                 }
+
+                leaf srv6_locator {
+                    type string;
+                    description "SRv6 locator used to allocate SIDs for this BGP instance.";
+                }
+
+                leaf sid_vpn_per_vrf_export_explicit {
+                    type inet:ipv6-address;
+                    description "Explicit SID used for per-VRF VPN export.";
+                }
             }
         }
 
@@ -392,6 +402,33 @@ module sonic-bgp-global {
                         path "/rmap:sonic-route-map/rmap:ROUTE_MAP_SET/rmap:ROUTE_MAP_SET_LIST/rmap:name";
                     }
                     description "Route map applied to redistributed static routes";
+                }
+
+                leaf export_vpn {
+                    type boolean;
+                    description "Export routes from the address family as VPN routes";
+                }
+
+                leaf import_vpn {
+                    type boolean;
+                    description "Import VPN routes into the address family";
+                }
+
+                leaf rd_vpn_export {
+                    type string;
+                    description "Route distinguisher used when exporting VPN routes";
+                }
+
+                leaf rt_vpn_both {
+                    type string;
+                    description "Route target used for both import and export of VPN routes";
+                }
+
+                leaf rmap_vpn_export {
+                    type leafref {
+                        path "/rmap:sonic-route-map/rmap:ROUTE_MAP_SET/rmap:ROUTE_MAP_SET_LIST/rmap:name";
+                    }
+                    description "Route map applied when exporting VPN routes";
                 }
 
                 leaf ebgp_route_distance {
