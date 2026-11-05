@@ -21,6 +21,10 @@
  *               (leaf, vrf, prefix) resolutions, the commit diff moves the
  *               counts, zero unindexes the membership, and rollback/retry
  *               move nothing
+ *   rib-id    - the reverse index counts routes, not route commits, and
+ *               re-points a reused zebra NHG id once its last route lets go
+ *   rib-list  - routes are indexed by rib id, and a rebind moves every one of
+ *               them onto the new top in one step
  */
 #include "config.h"
 
@@ -598,4 +602,148 @@ out:
 	chain_free(rc);
 	chain_free(rd);
 	chain_free(re);
+}
+
+/* -------------------------------------------------------------------------
+ * rib-id: the reverse index counts routes, not route commits
+ * ------------------------------------------------------------------------- */
+
+TEST_F(NhgTables, rib_id_accounting)
+{
+	struct fpm_nhg_staging newq = {};
+	struct fpm_nhg_del_queue delq = {};
+	struct nexthop *ra = leaf_nh4("192.168.1.1/32", 5);
+	struct nexthop *rb = leaf_nh4("192.168.1.1/32", 5);
+	struct nexthop *rd = leaf_nh4("192.168.1.2/32", 6);
+	struct fpm_dplane_nhg *topa, *topb;
+	struct fpm_nhg_route_key ka, kb, kc;
+
+	/* Two routes dedupe onto one object, each with its own zebra id. */
+	topa = fpm_nhg_build(&t, ra, &newq);
+	ASSERT_NE(topa, nullptr);
+	route_key(&ka, "172.16.1.0/24");
+	fpm_nhg_route_commit(&t, &ka, topa, 1000, &delq, &newq);
+	fpm_nhg_staging_free(&newq);
+	ASSERT_EQ(topa, fpm_nhg_lookup_rib_id(&t, 1000));
+
+	topb = fpm_nhg_build(&t, rb, &newq);
+	ASSERT_EQ(topa, topb) << "identical chain must dedupe";
+	route_key(&kb, "172.16.2.0/24");
+	fpm_nhg_route_commit(&t, &kb, topb, 2000, &delq, &newq);
+	fpm_nhg_staging_free(&newq);
+	ASSERT_EQ(topa, fpm_nhg_lookup_rib_id(&t, 2000));
+
+	/* Same route, same object, same zebra id: this re-commit changes no
+	 * mapping and must not add a second reference for the route.
+	 */
+	topb = fpm_nhg_build(&t, rb, &newq);
+	ASSERT_EQ(topa, topb);
+	fpm_nhg_route_commit(&t, &ka, topb, 1000, &delq, &newq);
+	fpm_nhg_staging_free(&newq);
+	EXPECT_EQ(topa, fpm_nhg_lookup_rib_id(&t, 1000));
+
+	fpm_nhg_route_forget(&t, &ka, &delq);
+	/* kb still holds topa, so the object stays alive and cannot purge a
+	 * leaked index entry on our behalf.
+	 */
+	EXPECT_EQ(nullptr, fpm_nhg_lookup_rib_id(&t, 1000))
+		<< "a no-op re-commit leaked a rib-id reference";
+
+	/* The released zebra id is reused for a different object: the index
+	 * must re-point instead of keeping the old owner.
+	 */
+	topb = fpm_nhg_build(&t, rd, &newq);
+	ASSERT_NE(topb, nullptr);
+	EXPECT_NE(topa, topb);
+	route_key(&kc, "172.16.3.0/24");
+	fpm_nhg_route_commit(&t, &kc, topb, 1000, &delq, &newq);
+	fpm_nhg_staging_free(&newq);
+	EXPECT_EQ(topb, fpm_nhg_lookup_rib_id(&t, 1000))
+		<< "a reused rib id must follow its new object";
+
+	fpm_nhg_route_forget(&t, &kc, &delq);
+	fpm_nhg_route_forget(&t, &kb, &delq);
+	EXPECT_EQ(t.obj_created, t.obj_deleted);
+
+	fpm_nhg_del_queue_free(&delq);
+	chain_free(ra);
+	chain_free(rb);
+	chain_free(rd);
+}
+
+/* -------------------------------------------------------------------------
+ * rib-list: routes indexed by rib id, and an NH rebuild re-points them all
+ * ------------------------------------------------------------------------- */
+
+TEST_F(NhgTables, rib_route_index)
+{
+	struct fpm_nhg_staging newq = {};
+	struct fpm_nhg_del_queue delq = {};
+	struct nexthop *ra = leaf_nh4("192.168.1.1/32", 5);
+	struct nexthop *rb = leaf_nh4("192.168.1.1/32", 5);
+	struct nexthop *rc = leaf_nh4("192.168.1.2/32", 6);
+	struct fpm_dplane_nhg *topa, *topb, *topc;
+	struct fpm_nhg_route_key ka, kb, kc;
+	struct fpm_nhg_route_key *keys = NULL;
+	uint32_t n;
+
+	/* Two routes dedupe onto one top and one rib id. */
+	topa = fpm_nhg_build(&t, ra, &newq);
+	ASSERT_NE(topa, nullptr);
+	route_key(&ka, "172.16.1.0/24");
+	fpm_nhg_route_commit(&t, &ka, topa, 1000, &delq, &newq);
+	fpm_nhg_staging_free(&newq);
+
+	topb = fpm_nhg_build(&t, rb, &newq);
+	ASSERT_EQ(topa, topb);
+	route_key(&kb, "172.16.2.0/24");
+	fpm_nhg_route_commit(&t, &kb, topb, 1000, &delq, &newq);
+	fpm_nhg_staging_free(&newq);
+
+	n = fpm_nhg_rib_route_keys(&t, 1000, &keys);
+	ASSERT_EQ(2u, n);
+	fpm_nhg_rib_route_keys_free(keys);
+
+	/* A different chain on a different rib id is a separate list. */
+	topc = fpm_nhg_build(&t, rc, &newq);
+	ASSERT_NE(topc, nullptr);
+	route_key(&kc, "172.16.3.0/24");
+	fpm_nhg_route_commit(&t, &kc, topc, 2000, &delq, &newq);
+	fpm_nhg_staging_free(&newq);
+
+	n = fpm_nhg_rib_route_keys(&t, 2000, &keys);
+	ASSERT_EQ(1u, n);
+	fpm_nhg_rib_route_keys_free(keys);
+
+	/* NH-driven rebuild of 1000: every route follows the new top. */
+	{
+		struct nexthop *rd = leaf_nh4("192.168.1.2/32", 6);
+		struct fpm_nhg_staging nq = {};
+		struct fpm_dplane_nhg *new_top = fpm_nhg_build(&t, rd, &nq);
+
+		ASSERT_NE(new_top, nullptr);
+		EXPECT_EQ(topc, new_top) << "equal chain must dedupe";
+		ASSERT_TRUE(fpm_nhg_rebind_rib(&t, 1000, new_top, &nq, &delq));
+		EXPECT_EQ(new_top, fpm_nhg_lookup_rib_id(&t, 1000));
+		EXPECT_EQ(new_top, fpm_nhg_route_get(&t, &ka));
+		EXPECT_EQ(new_top, fpm_nhg_route_get(&t, &kb));
+		EXPECT_FALSE(fpm_nhg_rebind_rib(&t, 9999, new_top, &nq, &delq));
+		fpm_nhg_staging_free(&nq);
+		chain_free(rd);
+	}
+
+	/* Releasing one route shrinks the list but keeps the other. */
+	fpm_nhg_route_forget(&t, &ka, &delq);
+	n = fpm_nhg_rib_route_keys(&t, 1000, &keys);
+	EXPECT_EQ(1u, n);
+	fpm_nhg_rib_route_keys_free(keys);
+
+	fpm_nhg_route_forget(&t, &kb, &delq);
+	fpm_nhg_route_forget(&t, &kc, &delq);
+	EXPECT_EQ(t.obj_created, t.obj_deleted);
+
+	fpm_nhg_del_queue_free(&delq);
+	chain_free(ra);
+	chain_free(rb);
+	chain_free(rc);
 }
