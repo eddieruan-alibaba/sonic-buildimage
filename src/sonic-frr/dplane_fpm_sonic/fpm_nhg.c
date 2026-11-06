@@ -395,6 +395,13 @@ struct fpm_nhg_rib_entry {
 	uint32_t refcount;
 	/* Those routes, linked through fpm_nhg_route_entry.rib_prev/next. */
 	struct fpm_nhg_route_entry *routes;
+	/*
+	 * Route-event generation: the tables' sequence value at the last route
+	 * install/removal that touched this id. A pending NH-driven rebuild
+	 * compares it against the current one and yields when the route path
+	 * has re-installed the routes.
+	 */
+	uint32_t gen;
 };
 
 static unsigned int fpm_nhg_rib_id_key(const void *data)
@@ -440,6 +447,14 @@ static void fpm_nhg_rib_route_unlink(struct fpm_nhg_route_entry *e)
 	e->rib = NULL;
 	e->rib_prev = NULL;
 	e->rib_next = NULL;
+}
+
+/* Stamp the rib entry as touched by the route path. */
+static void fpm_nhg_rib_touch(struct fpm_nhg_tables *t,
+			      struct fpm_nhg_rib_entry *rb)
+{
+	if (rb)
+		rb->gen = ++t->route_gen;
 }
 
 /*
@@ -2002,6 +2017,11 @@ static void fpm_nhg_route_set(struct fpm_nhg_tables *t,
 	 */
 	if (e->obj && changed) {
 		/*
+		 * Invalidate a pending NH rebuild for the old id first: the
+		 * route is moving off it, so the route path has won.
+		 */
+		fpm_nhg_rib_touch(t, e->rib);
+		/*
 		 * Unlink first: the release may drop the rib entry itself, and
 		 * a route must never be left on a freed list.
 		 */
@@ -2030,6 +2050,8 @@ static void fpm_nhg_route_set(struct fpm_nhg_tables *t,
 		if (rb)
 			fpm_nhg_rib_route_link(rb, e);
 	}
+	/* The route path owns the current mapping: stamp it for NH gating. */
+	fpm_nhg_rib_touch(t, e->rib);
 	fpm_nhg_leaf_contrib_apply(t, e, newq);
 }
 
@@ -2046,6 +2068,7 @@ fpm_nhg_route_pop(struct fpm_nhg_tables *t, const struct fpm_nhg_route_key *k)
 	FPM_NHG_DEBUG("unbind route %pFX table %u from dplane NHG %u, rib nhg %u",
 		      &k->p, k->table_id, obj ? obj->dplane_id : 0, e->rib_id);
 	fpm_nhg_leaf_contribs_drop(t, e);
+	fpm_nhg_rib_touch(t, e->rib);
 	fpm_nhg_rib_route_unlink(e);
 	fpm_nhg_release_rib_id(t, obj, e->rib_id);
 	fpm_nhg_route_entry_free(e);
@@ -2234,6 +2257,16 @@ struct fpm_dplane_nhg *fpm_nhg_lookup_rib_id(struct fpm_nhg_tables *t,
 		return NULL;
 	e = hash_lookup(t->by_rib_id, &ref);
 	return e ? e->obj : NULL;
+}
+
+uint32_t fpm_nhg_rib_generation(struct fpm_nhg_tables *t, uint32_t rib_id)
+{
+	struct fpm_nhg_rib_entry ref = { .rib_id = rib_id }, *e;
+
+	if (rib_id == 0)
+		return 0;
+	e = hash_lookup(t->by_rib_id, &ref);
+	return e ? e->gen : 0;
 }
 
 /*

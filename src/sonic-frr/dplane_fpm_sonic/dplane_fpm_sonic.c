@@ -192,6 +192,8 @@ DEFINE_MTYPE_STATIC(ZEBRA, FPM_NHG_REPOINT, "FPM pending NHG re-point");
 struct fpm_nhg_repoint {
 	struct fpm_nhg_repoint *next;
 	uint32_t rib_id;
+	/* Route-event generation captured when this entry was queued. */
+	uint32_t gen;
 	struct nexthop_group ng;
 };
 
@@ -2921,11 +2923,20 @@ static int fpm_nl_enqueue_nhg_repoint(struct fpm_nl_ctx *fnc,
 	const struct nexthop_group *ng = dplane_ctx_get_nhe_ng(ctx);
 	uint32_t rib_id = dplane_ctx_get_nhe_id(ctx);
 	struct fpm_nhg_repoint *p;
+	uint32_t gen;
 
 	if (rib_id == 0 || ng == NULL)
 		return 0;
 
 	frr_mutex_lock_autounlock(&fnc->obuf_mutex);
+
+	/*
+	 * An id the route path has not defined yet is a no-op: the first
+	 * reference still defines it, and the route build is authoritative.
+	 */
+	gen = fpm_nhg_rib_generation(&fnc->nhg_tables, rib_id);
+	if (gen == 0)
+		return 0;
 
 	for (p = fnc->nhg_repoints; p; p = p->next)
 		if (p->rib_id == rib_id)
@@ -2940,6 +2951,7 @@ static int fpm_nl_enqueue_nhg_repoint(struct fpm_nl_ctx *fnc,
 		fpm_nhg_repoint_ng_free(p);
 	}
 
+	p->gen = gen;
 	nexthop_group_copy(&p->ng, ng);
 
 	event_add_event(zrouter.master, fpm_nhg_repoint_event, fnc, 0,
@@ -4388,7 +4400,6 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	struct fpm_nhg_route_key key;
 	size_t nl_buf_len = 0, route_off;
 	bool encode_ok = true;
-	bool recovery;
 	ssize_t rv;
 	int ret;
 	/*
@@ -4405,14 +4416,6 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	frr_mutex_lock_autounlock(&fnc->obuf_mutex);
 
 	old_top = fpm_nhg_route_get(&fnc->nhg_tables, &key);
-
-	/*
-	 * Every route context is a candidate resolve-via event: a delete
-	 * withdraws the resolutions of its prefix, any install of a route of
-	 * the same type is the recovery that undoes the fix-up. The
-	 * resolved-prefix index decides which of the two applies.
-	 */
-	recovery = (op != DPLANE_OP_ROUTE_DELETE);
 
 	/*
 	 * Explicit removal: DELETE, and UPDATE when route replace semantics
@@ -4512,20 +4515,6 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 		fpm_nhg_frame_batch_add(&batch, nl_buf, nl_buf_len);
 
 	/*
-	 * The event rides after this context's route so the peer has already
-	 * applied the route change when it walks the affected NHGs.
-	 */
-	if (encode_ok) {
-		encode_ok = fpm_nhg_batch_add_resolved_events(
-			&fnc->nhg_tables, dplane_ctx_get_vrf(ctx),
-			dplane_ctx_get_dest(ctx), recovery,
-			(uint8_t)dplane_ctx_get_type(ctx), &batch);
-		if (!encode_ok)
-			zlog_err("%s: resolved event encode failed, dropping ctx",
-				 __func__);
-	}
-
-	/*
 	 * batch.total_len is now the EXACT byte count of the write, so this
 	 * single check is the whole reservation — no upper bound heuristic is
 	 * involved anymore. On failure nothing is emitted, no state moves, the
@@ -4561,12 +4550,6 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	/* One atomic write for the whole context. */
 	ret = fpm_frame_batch_write_locked(fnc, &batch, __func__);
 	fpm_nhg_frame_batch_free(&batch);
-
-	if (ret == 0)
-		fpm_nhg_resolved_events_commit(
-			&fnc->nhg_tables, dplane_ctx_get_vrf(ctx),
-			dplane_ctx_get_dest(ctx), recovery,
-			(uint8_t)dplane_ctx_get_type(ctx));
 
 	/*
 	 * The carried-over DELs are on the wire (or a resync was forced, which
@@ -4802,6 +4785,18 @@ static void fpm_nhg_repoint_event(struct event *t)
 
 	pp = &fnc->nhg_repoints;
 	while ((p = *pp) != NULL) {
+		/*
+		 * The route path wins: if a route install/removal touched this
+		 * rib id after the NH event was queued, it already produced the
+		 * authoritative mapping and this rebuild is stale.
+		 */
+		if (fpm_nhg_rib_generation(&fnc->nhg_tables, p->rib_id) !=
+		    p->gen) {
+			*pp = p->next;
+			fpm_nhg_repoint_ng_free(p);
+			XFREE(MTYPE_FPM_NHG_REPOINT, p);
+			continue;
+		}
 		if (fpm_nhg_repoint_one(fnc, p->rib_id, &p->ng) != 0) {
 			/* obuf full: retry the whole queue shortly */
 			event_add_timer(zrouter.master, fpm_nhg_repoint_event,
