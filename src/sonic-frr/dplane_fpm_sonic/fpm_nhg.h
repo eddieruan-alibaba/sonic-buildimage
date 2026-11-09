@@ -153,13 +153,6 @@ struct fpm_nhg_tables {
 	uint32_t *free_ids;
 	uint32_t free_id_count, free_id_cap;
 	/*
-	 * Monotonic route-event sequence. Every route install/removal stamps the
-	 * rib entry it touches with a new value, so a pending NH-driven rebuild
-	 * can tell that the route path has re-installed the routes meanwhile and
-	 * should win.
-	 */
-	uint32_t route_gen;
-	/*
 	 * counters (lifetime totals, never reset by a reconnect flush).
 	 * dedupe_hits is cumulative lookups incl. rolled-back builds: a
 	 * build that fails and rolls back keeps the hits it scored, so the
@@ -350,32 +343,6 @@ uint32_t fpm_nhg_count(struct fpm_nhg_tables *t);
  */
 struct fpm_dplane_nhg *fpm_nhg_lookup_rib_id(struct fpm_nhg_tables *t,
 					     uint32_t rib_id);
-
-/*
- * Route-event generation of the rib id: 0 when the id is unknown, otherwise
- * the value the last route install/removal stamped on it. A pending NH-driven
- * rebuild captures this and drops itself when it changed in the meantime.
- */
-uint32_t fpm_nhg_rib_generation(struct fpm_nhg_tables *t, uint32_t rib_id);
-
-/*
- * Re-point every route bound to rib_id onto new_top after the caller emitted
- * the replaces that carry the peer onto it. Contributions move to the build's
- * set, and the old top's DEL is queued once its last reference goes. False
- * when the id is unknown or already points at new_top.
- */
-bool fpm_nhg_rebind_rib(struct fpm_nhg_tables *t, uint32_t rib_id,
-			struct fpm_dplane_nhg *new_top,
-			struct fpm_nhg_staging *newq,
-			struct fpm_nhg_del_queue *delq);
-
-/*
- * Snapshot the route keys bound to rib_id. The caller owns the array and
- * frees it with XFREE(MTYPE_FPM_NHG, ...).
- */
-uint32_t fpm_nhg_rib_route_keys(struct fpm_nhg_tables *t, uint32_t rib_id,
-				struct fpm_nhg_route_key **keys);
-void fpm_nhg_rib_route_keys_free(struct fpm_nhg_route_key *keys);
 
 /*
  * NHGFIB-only extension message types and JSON payload attribute. Part of the
