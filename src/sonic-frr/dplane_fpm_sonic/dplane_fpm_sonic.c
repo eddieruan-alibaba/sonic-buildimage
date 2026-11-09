@@ -4227,6 +4227,7 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	struct fpm_nhg_route_key key;
 	size_t nl_buf_len = 0, route_off;
 	bool encode_ok = true;
+	bool recovery;
 	struct nlmsghdr *n;
 	ssize_t rv;
 	int ret;
@@ -4244,6 +4245,14 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	frr_mutex_lock_autounlock(&fnc->obuf_mutex);
 
 	old_top = fpm_nhg_route_get(&fnc->nhg_tables, &key);
+
+	/*
+	 * Every route context is a candidate resolve-via event: a delete
+	 * withdraws the resolutions of its prefix, any install of a route of
+	 * the same type is the recovery that undoes the fix-up. The
+	 * resolved-prefix index decides which of the two applies.
+	 */
+	recovery = (op != DPLANE_OP_ROUTE_DELETE);
 
 	/*
 	 * Explicit removal: DELETE, and UPDATE when route replace semantics
@@ -4391,6 +4400,20 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 		fpm_nhg_frame_batch_add(&batch, nl_buf, nl_buf_len);
 
 	/*
+	 * The event rides after this context's route so the peer has already
+	 * applied the route change when it walks the affected NHGs.
+	 */
+	if (encode_ok) {
+		encode_ok = fpm_nhg_batch_add_resolved_events(
+			&fnc->nhg_tables, dplane_ctx_get_vrf(ctx),
+			dplane_ctx_get_dest(ctx), recovery,
+			(uint8_t)dplane_ctx_get_type(ctx), &batch);
+		if (!encode_ok)
+			zlog_err("%s: resolved event encode failed, dropping ctx",
+				 __func__);
+	}
+
+	/*
 	 * batch.total_len is now the EXACT byte count of the write, so this
 	 * single check is the whole reservation — no upper bound heuristic is
 	 * involved anymore. On failure nothing is emitted, no state moves, the
@@ -4426,6 +4449,12 @@ static int fpm_nl_enqueue_route_nhg_fib(struct fpm_nl_ctx *fnc,
 	/* One atomic write for the whole context. */
 	ret = fpm_frame_batch_write_locked(fnc, &batch, __func__);
 	fpm_nhg_frame_batch_free(&batch);
+
+	if (ret == 0)
+		fpm_nhg_resolved_events_commit(
+			&fnc->nhg_tables, dplane_ctx_get_vrf(ctx),
+			dplane_ctx_get_dest(ctx), recovery,
+			(uint8_t)dplane_ctx_get_type(ctx));
 
 	/*
 	 * The carried-over DELs are on the wire (or a resync was forced, which
